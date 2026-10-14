@@ -1,0 +1,72 @@
+{
+  "name": "@heretek-ai/swarmos",
+  "version": "0.1.0",
+  "description": "Autonomous Multi-Agent Software Engineering Company & Visual UI Engine for OpenCode V2",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./standalone": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/swarmos.standalone.js",
+      "default": "./dist/swarmos.standalone.js"
+    }
+  },
+  "files": [
+    "dist",
+    "swarmos-plugin.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun run build:bundle && bun run build:types",
+    "build:bundle": "bun build src/index.ts --target bun --outfile dist/index.js && bun build src/index.ts --target bun --outfile dist/swarmos.standalone.js && cp dist/swarmos.standalone.js ./swarmos-plugin.ts",
+    "build:types": "tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test test/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Heretek-AI/SwarmOS.git"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "swarmos",
+    "multi-agent",
+    "autonomous-company",
+    "dom-geometry",
+    "ui-craft",
+    "muse",
+    "heretek"
+  ],
+  "author": "Heretek AI",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Heretek-AI/SwarmOS/issues"
+  },
+  "homepage": "https://github.com/Heretek-AI/SwarmOS#readme",
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.0",
+    "effect": ">=3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "effect": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
