@@ -21,7 +21,13 @@ export interface Contract {
   lockedBy?: string
 }
 
-export type TaskStatus = "pending" | "in_progress" | "ready_for_qa" | "qa_rejected" | "verified"
+export type TaskStatus =
+  | "pending"
+  | "in_progress"
+  | "ready_for_qa"
+  | "qa_rejected"
+  | "verified"
+  | "superseded"
 
 export interface QAReceipt {
   verdict: "PASS" | "REJECT"
@@ -37,10 +43,43 @@ export interface Task {
   owner: "staff-backend" | "staff-ui" | "architect" | string
   ownedPaths: string[]
   worktree?: string
+  tournamentId?: string
   status: TaskStatus
   qaReceipts: QAReceipt[]
   createdAt: string
   updatedAt: string
+}
+
+export interface TournamentCandidate {
+  label: string
+  taskId: string
+  worktree: string
+}
+
+export interface Tournament {
+  id: string
+  title: string
+  role: "staff-backend" | "staff-ui" | string
+  ownedPaths: string[]
+  candidates: TournamentCandidate[]
+  status: "active" | "resolved"
+  winningTaskId?: string
+  resolutionSummary?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ReleaseReadinessReport {
+  ready: boolean
+  hasCharter: boolean
+  lockedContractCount: number
+  verifiedTasks: string[]
+  unverifiedTasks: string[]
+  rejectedTasks: string[]
+  supersededTasks: string[]
+  activeTournaments: string[]
+  blockers: string[]
+  checkedAt: string
 }
 
 export interface OrgBoard {
@@ -48,6 +87,7 @@ export interface OrgBoard {
   project: ProjectCharter | null
   contracts: Contract[]
   tasks: Task[]
+  tournaments?: Tournament[]
 }
 
 export interface InitProjectInput {
@@ -70,6 +110,7 @@ export interface CreateTaskInput {
   owner: string
   ownedPaths: string[]
   worktree?: string
+  tournamentId?: string
 }
 
 export interface SubmitQAReceiptInput {
@@ -78,4 +119,18 @@ export interface SubmitQAReceiptInput {
   summary: string
   defects: string[]
   testCommand?: string
+}
+
+export interface PlanTournamentInput {
+  id: string
+  title: string
+  role: "staff-backend" | "staff-ui" | string
+  ownedPaths: string[]
+  candidates?: number
+}
+
+export interface ResolveTournamentInput {
+  tournamentId: string
+  winningTaskId: string
+  summary: string
 }

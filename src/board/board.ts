@@ -6,13 +6,18 @@ import type {
   InitProjectInput,
   LockContractInput,
   OrgBoard,
+  PlanTournamentInput,
   ProjectCharter,
+  ReleaseReadinessReport,
+  ResolveTournamentInput,
   SubmitQAReceiptInput,
   Task,
   TaskStatus,
+  Tournament,
+  TournamentCandidate,
 } from "./types.js"
 
-export const BOARD_VERSION = "4.0.0"
+export const BOARD_VERSION = "4.1.0"
 
 const boardLocks = new Map<string, Promise<unknown>>()
 
@@ -26,6 +31,7 @@ export function createEmptyBoard(): OrgBoard {
     project: null,
     contracts: [],
     tasks: [],
+    tournaments: [],
   }
 }
 
@@ -39,6 +45,7 @@ export async function loadBoard(rootDir: string): Promise<OrgBoard> {
       project: parsed.project ?? null,
       contracts: Array.isArray(parsed.contracts) ? parsed.contracts : [],
       tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
+      tournaments: Array.isArray(parsed.tournaments) ? parsed.tournaments : [],
     }
   } catch {
     return createEmptyBoard()
@@ -132,6 +139,7 @@ export async function createTask(rootDir: string, input: CreateTaskInput): Promi
       owner: input.owner,
       ownedPaths: input.ownedPaths,
       worktree: input.worktree,
+      ...(input.tournamentId ? { tournamentId: input.tournamentId } : {}),
       status: existing?.status ?? "pending",
       qaReceipts: existing?.qaReceipts ?? [],
       createdAt: existing?.createdAt ?? now,
@@ -179,4 +187,192 @@ export async function submitQAReceipt(rootDir: string, input: SubmitQAReceiptInp
     task.updatedAt = receipt.timestamp
     return task
   })
+}
+
+/**
+ * Provisions a Best-of-N Worktree Tournament with isolated candidate tasks and worktree paths.
+ */
+export async function planTournament(rootDir: string, input: PlanTournamentInput): Promise<Tournament> {
+  return withBoardLock(rootDir, (board) => {
+    if (!Array.isArray(board.tournaments)) {
+      board.tournaments = []
+    }
+    const count = Math.min(Math.max(input.candidates ?? 2, 2), 4)
+    const now = new Date().toISOString()
+    const candidates: TournamentCandidate[] = []
+
+    for (let i = 0; i < count; i++) {
+      const suffix = String.fromCharCode(97 + i) // 'a', 'b', 'c', 'd'
+      const label = `candidate-${suffix}`
+      const taskId = `${input.id}-${label}`
+      const worktree = `.worktrees/${taskId}`
+
+      candidates.push({ label, taskId, worktree })
+
+      const existingTask = board.tasks.find((t) => t.id === taskId)
+      const task: Task = {
+        id: taskId,
+        title: `[Tournament ${input.id} · ${label.toUpperCase()}] ${input.title}`,
+        owner: input.role,
+        ownedPaths: input.ownedPaths,
+        worktree,
+        tournamentId: input.id,
+        status: existingTask?.status ?? "pending",
+        qaReceipts: existingTask?.qaReceipts ?? [],
+        createdAt: existingTask?.createdAt ?? now,
+        updatedAt: now,
+      }
+      if (existingTask) {
+        Object.assign(existingTask, task)
+      } else {
+        board.tasks.push(task)
+      }
+    }
+
+    const tournament: Tournament = {
+      id: input.id,
+      title: input.title,
+      role: input.role,
+      ownedPaths: input.ownedPaths,
+      candidates,
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    }
+
+    const existingIdx = board.tournaments.findIndex((t) => t.id === input.id)
+    if (existingIdx >= 0) {
+      board.tournaments[existingIdx] = tournament
+    } else {
+      board.tournaments.push(tournament)
+    }
+
+    return tournament
+  })
+}
+
+/**
+ * Resolves an active Best-of-N Tournament by crowning a QA-verified winning candidate task
+ * and marking all competing candidate tasks as `superseded`.
+ */
+export async function resolveTournament(rootDir: string, input: ResolveTournamentInput): Promise<Tournament> {
+  return withBoardLock(rootDir, (board) => {
+    if (!Array.isArray(board.tournaments)) {
+      board.tournaments = []
+    }
+    const tournament = board.tournaments.find((t) => t.id === input.tournamentId)
+    if (!tournament) {
+      throw new Error(`SwarmOS Tournament not found: ${input.tournamentId}`)
+    }
+
+    const isCandidate = tournament.candidates.some((c) => c.taskId === input.winningTaskId)
+    if (!isCandidate) {
+      throw new Error(
+        `SwarmOS Tournament Guard: Task "${input.winningTaskId}" is not a registered candidate of tournament "${input.tournamentId}".`,
+      )
+    }
+
+    const winningTask = board.tasks.find((t) => t.id === input.winningTaskId)
+    const latestReceipt = winningTask?.qaReceipts[winningTask.qaReceipts.length - 1]
+    if (!winningTask || winningTask.status !== "verified" || latestReceipt?.verdict !== "PASS") {
+      throw new Error(
+        `SwarmOS Tournament Guard: Winning candidate task [${input.winningTaskId}] must have a verified PASS QA receipt before resolving the tournament.`,
+      )
+    }
+
+    const now = new Date().toISOString()
+    for (const candidate of tournament.candidates) {
+      if (candidate.taskId === input.winningTaskId) continue
+      const loser = board.tasks.find((t) => t.id === candidate.taskId)
+      if (loser) {
+        loser.status = "superseded"
+        loser.updatedAt = now
+      }
+    }
+
+    tournament.status = "resolved"
+    tournament.winningTaskId = input.winningTaskId
+    tournament.resolutionSummary = input.summary
+    tournament.updatedAt = now
+
+    return tournament
+  })
+}
+
+/**
+ * Evaluates whether the entire project board satisfies the SwarmOS 5-Gate Release Protocol.
+ */
+export async function verifyReleaseReady(rootDir: string): Promise<ReleaseReadinessReport> {
+  const board = await loadBoard(rootDir)
+  const hasCharter = board.project !== null
+  const lockedContractCount = board.contracts.length
+
+  const verifiedTasks: string[] = []
+  const unverifiedTasks: string[] = []
+  const rejectedTasks: string[] = []
+  const supersededTasks: string[] = []
+  const blockers: string[] = []
+
+  if (!hasCharter) {
+    blockers.push("Missing project charter: call `tools.org.init_project` before shipping.")
+  }
+
+  if (lockedContractCount === 0) {
+    blockers.push("Zero locked contracts: `architect` must lock at least one contract via `tools.org.lock_contract`.")
+  }
+
+  const activeTasks = board.tasks.filter((t) => t.status !== "superseded")
+  if (activeTasks.length === 0) {
+    blockers.push("Zero engineering tasks registered on the board.")
+  }
+
+  for (const task of board.tasks) {
+    if (task.status === "superseded") {
+      supersededTasks.push(task.id)
+      continue
+    }
+
+    const latestReceipt = task.qaReceipts[task.qaReceipts.length - 1]
+    if (
+      task.status === "verified" &&
+      latestReceipt?.verdict === "PASS" &&
+      Array.isArray(latestReceipt.defects) &&
+      latestReceipt.defects.length === 0
+    ) {
+      verifiedTasks.push(task.id)
+    } else if (task.status === "qa_rejected" || latestReceipt?.verdict === "REJECT") {
+      rejectedTasks.push(task.id)
+      blockers.push(`Task [${task.id}] (${task.owner}) was REJECTED by qa-adversary: ${latestReceipt?.summary ?? "defects unresolved"}.`)
+    } else {
+      unverifiedTasks.push(task.id)
+      blockers.push(`Task [${task.id}] (${task.owner}) is "${task.status}" and lacks a signed PASS receipt from qa-adversary.`)
+    }
+  }
+
+  const tournaments = Array.isArray(board.tournaments) ? board.tournaments : []
+  const activeTournaments = tournaments.filter((t) => t.status === "active").map((t) => t.id)
+  for (const tid of activeTournaments) {
+    blockers.push(`Tournament [${tid}] is still active: call \`tools.org.resolve_tournament\` after QA verification.`)
+  }
+
+  const ready =
+    hasCharter &&
+    lockedContractCount > 0 &&
+    activeTasks.length > 0 &&
+    unverifiedTasks.length === 0 &&
+    rejectedTasks.length === 0 &&
+    activeTournaments.length === 0
+
+  return {
+    ready,
+    hasCharter,
+    lockedContractCount,
+    verifiedTasks,
+    unverifiedTasks,
+    rejectedTasks,
+    supersededTasks,
+    activeTournaments,
+    blockers,
+    checkedAt: new Date().toISOString(),
+  }
 }

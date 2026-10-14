@@ -1,4 +1,4 @@
-import { loadBoard } from "../board/board.js"
+import { loadBoard, verifyReleaseReady } from "../board/board.js"
 
 export async function registerSwarmCommand(ctx: any, rootDir: string): Promise<void> {
   if (!ctx.command?.transform) return
@@ -6,16 +6,23 @@ export async function registerSwarmCommand(ctx: any, rootDir: string): Promise<v
   await ctx.command.transform((editor: any) => {
     editor.add({
       name: "swarm",
-      description: "Inspect SwarmOS multi-agent organizational status, active tasks, locked contracts, and QA receipts",
+      description:
+        "Inspect SwarmOS multi-agent organizational status, release readiness gate, tournaments, locked contracts, and QA receipts",
       execute: async (input: any) => {
-        const board = await loadBoard(rootDir)
+        const [board, readiness] = await Promise.all([loadBoard(rootDir), verifyReleaseReady(rootDir)])
+        const tournaments = Array.isArray(board.tournaments) ? board.tournaments : []
 
         const summary = [
-          "# SwarmOS Organizational Status",
+          "# SwarmOS Organizational Status (v0.3.0)",
           "",
           board.project
             ? `**Project**: ${board.project.name} (${board.project.aestheticArchetype})\n**Vision**: ${board.project.vision}`
             : "_No active project charter. Run `/ship <spec>` to initialize._",
+          "",
+          `### Release Gate: ${readiness.ready ? "READY TO SHIP" : `BLOCKED (${readiness.blockers.length} blocker(s))`}`,
+          ...(readiness.ready
+            ? [`- All ${readiness.verifiedTasks.length} active task(s) verified with signed QA PASS receipts.`]
+            : readiness.blockers.map((b) => `- [Blocker] ${b}`)),
           "",
           `### Locked Contracts (${board.contracts.length})`,
           board.contracts.length === 0
@@ -29,9 +36,21 @@ export async function registerSwarmCommand(ctx: any, rootDir: string): Promise<v
                 .map((t) => {
                   const latestReceipt = t.qaReceipts[t.qaReceipts.length - 1]
                   const receiptTag = latestReceipt ? ` [QA: ${latestReceipt.verdict}]` : " [QA: Unverified]"
-                  return `- **[${t.id}]** ${t.title} -> **${t.owner}** (${t.status})${receiptTag}`
+                  const pathsTag = t.ownedPaths.length > 0 ? ` — owns: \`${t.ownedPaths.join(", ")}\`` : ""
+                  return `- **[${t.id}]** ${t.title} -> **${t.owner}** (${t.status})${receiptTag}${pathsTag}`
                 })
                 .join("\n"),
+          ...(tournaments.length > 0
+            ? [
+                "",
+                `### Worktree Tournaments (${tournaments.length})`,
+                ...tournaments.map((tr) =>
+                  tr.status === "resolved"
+                    ? `- **[${tr.id}]** ${tr.title} (${tr.role}) -> **RESOLVED** (Winner: \`${tr.winningTaskId}\`)`
+                    : `- **[${tr.id}]** ${tr.title} (${tr.role}) -> **ACTIVE** (${tr.candidates.map((c) => c.taskId).join(" vs. ")})`,
+                ),
+              ]
+            : []),
         ].join("\n")
 
         if (ctx.session?.prompt) {

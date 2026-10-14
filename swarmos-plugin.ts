@@ -234,10 +234,13 @@ function registerSwarmOSAgents(editor) {
   }
 }
 
+// src/agents/guard.ts
+import * as path2 from "path";
+
 // src/board/board.ts
 import * as fs from "fs/promises";
 import * as path from "path";
-var BOARD_VERSION = "4.0.0";
+var BOARD_VERSION = "4.1.0";
 var boardLocks = new Map;
 function getBoardPath(rootDir) {
   return path.join(rootDir, ".opencode", "org", "board.json");
@@ -247,7 +250,8 @@ function createEmptyBoard() {
     version: BOARD_VERSION,
     project: null,
     contracts: [],
-    tasks: []
+    tasks: [],
+    tournaments: []
   };
 }
 async function loadBoard(rootDir) {
@@ -259,7 +263,8 @@ async function loadBoard(rootDir) {
       version: parsed.version ?? BOARD_VERSION,
       project: parsed.project ?? null,
       contracts: Array.isArray(parsed.contracts) ? parsed.contracts : [],
-      tasks: Array.isArray(parsed.tasks) ? parsed.tasks : []
+      tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
+      tournaments: Array.isArray(parsed.tournaments) ? parsed.tournaments : []
     };
   } catch {
     return createEmptyBoard();
@@ -337,6 +342,7 @@ async function createTask(rootDir, input) {
       owner: input.owner,
       ownedPaths: input.ownedPaths,
       worktree: input.worktree,
+      ...input.tournamentId ? { tournamentId: input.tournamentId } : {},
       status: existing?.status ?? "pending",
       qaReceipts: existing?.qaReceipts ?? [],
       createdAt: existing?.createdAt ?? now,
@@ -380,12 +386,282 @@ async function submitQAReceipt(rootDir, input) {
     return task;
   });
 }
+async function planTournament(rootDir, input) {
+  return withBoardLock(rootDir, (board) => {
+    if (!Array.isArray(board.tournaments)) {
+      board.tournaments = [];
+    }
+    const count = Math.min(Math.max(input.candidates ?? 2, 2), 4);
+    const now = new Date().toISOString();
+    const candidates = [];
+    for (let i = 0;i < count; i++) {
+      const suffix = String.fromCharCode(97 + i);
+      const label = `candidate-${suffix}`;
+      const taskId = `${input.id}-${label}`;
+      const worktree = `.worktrees/${taskId}`;
+      candidates.push({ label, taskId, worktree });
+      const existingTask = board.tasks.find((t) => t.id === taskId);
+      const task = {
+        id: taskId,
+        title: `[Tournament ${input.id} \xB7 ${label.toUpperCase()}] ${input.title}`,
+        owner: input.role,
+        ownedPaths: input.ownedPaths,
+        worktree,
+        tournamentId: input.id,
+        status: existingTask?.status ?? "pending",
+        qaReceipts: existingTask?.qaReceipts ?? [],
+        createdAt: existingTask?.createdAt ?? now,
+        updatedAt: now
+      };
+      if (existingTask) {
+        Object.assign(existingTask, task);
+      } else {
+        board.tasks.push(task);
+      }
+    }
+    const tournament = {
+      id: input.id,
+      title: input.title,
+      role: input.role,
+      ownedPaths: input.ownedPaths,
+      candidates,
+      status: "active",
+      createdAt: now,
+      updatedAt: now
+    };
+    const existingIdx = board.tournaments.findIndex((t) => t.id === input.id);
+    if (existingIdx >= 0) {
+      board.tournaments[existingIdx] = tournament;
+    } else {
+      board.tournaments.push(tournament);
+    }
+    return tournament;
+  });
+}
+async function resolveTournament(rootDir, input) {
+  return withBoardLock(rootDir, (board) => {
+    if (!Array.isArray(board.tournaments)) {
+      board.tournaments = [];
+    }
+    const tournament = board.tournaments.find((t) => t.id === input.tournamentId);
+    if (!tournament) {
+      throw new Error(`SwarmOS Tournament not found: ${input.tournamentId}`);
+    }
+    const isCandidate = tournament.candidates.some((c) => c.taskId === input.winningTaskId);
+    if (!isCandidate) {
+      throw new Error(`SwarmOS Tournament Guard: Task "${input.winningTaskId}" is not a registered candidate of tournament "${input.tournamentId}".`);
+    }
+    const winningTask = board.tasks.find((t) => t.id === input.winningTaskId);
+    const latestReceipt = winningTask?.qaReceipts[winningTask.qaReceipts.length - 1];
+    if (!winningTask || winningTask.status !== "verified" || latestReceipt?.verdict !== "PASS") {
+      throw new Error(`SwarmOS Tournament Guard: Winning candidate task [${input.winningTaskId}] must have a verified PASS QA receipt before resolving the tournament.`);
+    }
+    const now = new Date().toISOString();
+    for (const candidate of tournament.candidates) {
+      if (candidate.taskId === input.winningTaskId)
+        continue;
+      const loser = board.tasks.find((t) => t.id === candidate.taskId);
+      if (loser) {
+        loser.status = "superseded";
+        loser.updatedAt = now;
+      }
+    }
+    tournament.status = "resolved";
+    tournament.winningTaskId = input.winningTaskId;
+    tournament.resolutionSummary = input.summary;
+    tournament.updatedAt = now;
+    return tournament;
+  });
+}
+async function verifyReleaseReady(rootDir) {
+  const board = await loadBoard(rootDir);
+  const hasCharter = board.project !== null;
+  const lockedContractCount = board.contracts.length;
+  const verifiedTasks = [];
+  const unverifiedTasks = [];
+  const rejectedTasks = [];
+  const supersededTasks = [];
+  const blockers = [];
+  if (!hasCharter) {
+    blockers.push("Missing project charter: call `tools.org.init_project` before shipping.");
+  }
+  if (lockedContractCount === 0) {
+    blockers.push("Zero locked contracts: `architect` must lock at least one contract via `tools.org.lock_contract`.");
+  }
+  const activeTasks = board.tasks.filter((t) => t.status !== "superseded");
+  if (activeTasks.length === 0) {
+    blockers.push("Zero engineering tasks registered on the board.");
+  }
+  for (const task of board.tasks) {
+    if (task.status === "superseded") {
+      supersededTasks.push(task.id);
+      continue;
+    }
+    const latestReceipt = task.qaReceipts[task.qaReceipts.length - 1];
+    if (task.status === "verified" && latestReceipt?.verdict === "PASS" && Array.isArray(latestReceipt.defects) && latestReceipt.defects.length === 0) {
+      verifiedTasks.push(task.id);
+    } else if (task.status === "qa_rejected" || latestReceipt?.verdict === "REJECT") {
+      rejectedTasks.push(task.id);
+      blockers.push(`Task [${task.id}] (${task.owner}) was REJECTED by qa-adversary: ${latestReceipt?.summary ?? "defects unresolved"}.`);
+    } else {
+      unverifiedTasks.push(task.id);
+      blockers.push(`Task [${task.id}] (${task.owner}) is "${task.status}" and lacks a signed PASS receipt from qa-adversary.`);
+    }
+  }
+  const tournaments = Array.isArray(board.tournaments) ? board.tournaments : [];
+  const activeTournaments = tournaments.filter((t) => t.status === "active").map((t) => t.id);
+  for (const tid of activeTournaments) {
+    blockers.push(`Tournament [${tid}] is still active: call \`tools.org.resolve_tournament\` after QA verification.`);
+  }
+  const ready = hasCharter && lockedContractCount > 0 && activeTasks.length > 0 && unverifiedTasks.length === 0 && rejectedTasks.length === 0 && activeTournaments.length === 0;
+  return {
+    ready,
+    hasCharter,
+    lockedContractCount,
+    verifiedTasks,
+    unverifiedTasks,
+    rejectedTasks,
+    supersededTasks,
+    activeTournaments,
+    blockers,
+    checkedAt: new Date().toISOString()
+  };
+}
+
+// src/agents/guard.ts
+function normalizeResourcePath(rootDir, resource) {
+  const trimmed = resource.trim();
+  const absRoot = path2.resolve(rootDir);
+  const resolved = path2.isAbsolute(trimmed) ? path2.resolve(trimmed) : path2.resolve(absRoot, trimmed);
+  const rel = path2.relative(absRoot, resolved).split(path2.sep).join("/");
+  return rel.startsWith("./") ? rel.slice(2) : rel;
+}
+function matchesPathPattern(relPath, pattern) {
+  const normPath = relPath.replace(/^\/+/, "");
+  const normPattern = pattern.trim().replace(/^\.\//, "").replace(/^\/+/, "");
+  if (!normPattern)
+    return false;
+  if (normPath === normPattern)
+    return true;
+  if (!normPattern.includes("*") && !normPattern.includes("?")) {
+    const dirPrefix = normPattern.endsWith("/") ? normPattern : `${normPattern}/`;
+    if (normPath.startsWith(dirPrefix))
+      return true;
+    return false;
+  }
+  let res = "";
+  for (let i = 0;i < normPattern.length; i++) {
+    const ch = normPattern[i];
+    if (ch === "*") {
+      if (normPattern[i + 1] === "*") {
+        if (normPattern[i + 2] === "/") {
+          res += "(?:.+/)?";
+          i += 2;
+        } else {
+          res += ".*";
+          i++;
+        }
+      } else {
+        res += "[^/]*";
+      }
+    } else if (ch === "?") {
+      res += "[^/]";
+    } else if (/[.+^${}()|[\]\\]/.test(ch)) {
+      res += "\\" + ch;
+    } else {
+      res += ch;
+    }
+  }
+  const regex = new RegExp(`^${res}$`);
+  return regex.test(normPath);
+}
+var DESTRUCTIVE_GIT_RE = /\bgit\s+(?:reset\s+--hard|clean\s+-[a-zA-Z]*f|push\s+[^;|\n]*--force(?!-with-lease)|checkout\s+--\s+)/i;
+var LEADERSHIP_MUTATING_SHELL_RE = /(?:^|[;&|]\s*)(?:rm|mv|cp|chmod|chown|truncate|dd)\s+|\b(?:sed|perl)\s+-[a-zA-Z]*i\b|\bgit\s+(?:commit|merge|rebase|cherry-pick|am|apply|stash\s+pop)\b|(?:^|[^2>])>>?\s*(?!\/dev\/null\b)\S+/i;
+var QA_SOURCE_MUTATING_SHELL_RE = /\b(?:sed|perl)\s+-[a-zA-Z]*i\b|\bgit\s+(?:commit|merge|rebase|reset|checkout\s+--)\b|(?:^|[;&|]\s*)(?:rm|mv)\s+(?![^;&|\n]*(?:\.test\.|\.spec\.|\btest\/|\btests\/|\be2e\/|\/tmp\/))|(?:^|[^2>])>>?\s*(?!\/dev\/null\b)(?![^;&|\n]*(?:\.test\.|\.spec\.|\btest\/|\btests\/|\be2e\/|\/tmp\/))\S+/i;
+function evaluateBoardGuard(rootDir, board, event) {
+  const agent = (event.agent ?? "").toLowerCase();
+  const action = (event.action ?? "").toLowerCase();
+  const resources = Array.isArray(event.resources) ? event.resources : [];
+  if (action === "edit" || action === "write" || action === "patch") {
+    for (const rawResource of resources) {
+      if (typeof rawResource !== "string" || rawResource === "*")
+        continue;
+      const relPath = normalizeResourcePath(rootDir, rawResource);
+      if (agent && agent !== "architect") {
+        for (const contract of board.contracts) {
+          const hitsContract = contract.files.some((cf) => matchesPathPattern(relPath, cf));
+          if (hitsContract) {
+            return {
+              allowed: false,
+              reason: `SwarmOS Contract Guard: File "${relPath}" is locked under architectural contract [${contract.id}] ("${contract.title}"). Only the "architect" role may modify locked contract files.`
+            };
+          }
+        }
+      }
+      if (agent === "staff-backend" || agent === "staff-ui") {
+        const activeTasks = board.tasks.filter((t) => t.status === "pending" || t.status === "in_progress" || t.status === "ready_for_qa" || t.status === "qa_rejected");
+        const ownedBySelf = activeTasks.some((t) => t.owner === agent && t.ownedPaths.some((pattern) => matchesPathPattern(relPath, pattern)));
+        if (!ownedBySelf) {
+          const conflictingTask = activeTasks.find((t) => t.owner !== agent && t.ownedPaths.some((pattern) => matchesPathPattern(relPath, pattern)));
+          if (conflictingTask) {
+            return {
+              allowed: false,
+              reason: `SwarmOS Ownership Guard: File "${relPath}" is claimed by active task [${conflictingTask.id}] assigned to "${conflictingTask.owner}". Role "${agent}" cannot modify files outside its disjoint ownedPaths boundary.`
+            };
+          }
+        }
+      }
+    }
+  }
+  if (action === "shell" || action === "bash") {
+    for (const cmd of resources) {
+      if (typeof cmd !== "string")
+        continue;
+      if (DESTRUCTIVE_GIT_RE.test(cmd)) {
+        return {
+          allowed: false,
+          reason: `SwarmOS Git Safety Guard: Destructive git command "${cmd.slice(0, 80)}" is blocked across all SwarmOS roles.`
+        };
+      }
+      if ((agent === "director" || agent === "manager") && LEADERSHIP_MUTATING_SHELL_RE.test(cmd)) {
+        return {
+          allowed: false,
+          reason: `SwarmOS Separation-of-Powers Guard: Leadership role "${agent}" is read-only and cannot execute file-mutating or git-committing shell commands ("${cmd.slice(0, 80)}"). Delegate implementation to subagents.`
+        };
+      }
+      if (agent === "qa-adversary" && QA_SOURCE_MUTATING_SHELL_RE.test(cmd)) {
+        return {
+          allowed: false,
+          reason: `SwarmOS Red-Team Guard: "qa-adversary" is forbidden from mutating production source files or git history via shell ("${cmd.slice(0, 80)}").`
+        };
+      }
+    }
+  }
+  return { allowed: true };
+}
+async function evaluatePermissionGuard(rootDir, event) {
+  const board = await loadBoard(rootDir);
+  return evaluateBoardGuard(rootDir, board, event);
+}
+async function registerPermissionGuard(ctx, rootDir) {
+  if (ctx.permission?.hook) {
+    await ctx.permission.hook("evaluate", async (event) => {
+      if (event.effect === "deny")
+        return;
+      const decision = await evaluatePermissionGuard(rootDir, event);
+      if (!decision.allowed) {
+        event.effect = "deny";
+        event.message = decision.reason;
+      }
+    });
+  }
+}
 
 // src/codemode/fs-outline.ts
 import * as fs2 from "fs/promises";
-import * as path2 from "path";
+import * as path3 from "path";
 async function extractOutline(rootDir, targetPath) {
-  const abs = path2.resolve(rootDir, targetPath);
+  const abs = path3.resolve(rootDir, targetPath);
   const text = await fs2.readFile(abs, "utf8");
   const lines = text.split(`
 `);
@@ -439,11 +715,11 @@ function registerFSTools(editor, rootDir) {
 function registerOrgTools(editor, rootDir) {
   editor.namespace({
     name: "org",
-    description: "SwarmOS organizational blackboard for locking contracts, assigning tasks, and recording QA receipts."
+    description: "SwarmOS organizational blackboard for locking contracts, assigning tasks, running Best-of-N worktree tournaments, and verifying release readiness."
   });
   editor.add({
     name: "get_board",
-    description: "Read the current SwarmOS project charter, locked contracts, tasks, and QA receipts.",
+    description: "Read the current SwarmOS project charter, locked contracts, tasks, tournaments, and QA receipts.",
     options: { namespace: "org", codemode: true, pinned: true },
     input: { type: "object", properties: {} },
     output: { type: "object" },
@@ -518,7 +794,7 @@ function registerOrgTools(editor, rootDir) {
   });
   editor.add({
     name: "update_task",
-    description: "Transition an engineering task status ('pending' | 'in_progress' | 'ready_for_qa' | 'qa_rejected' | 'verified').",
+    description: "Transition an engineering task status ('pending' | 'in_progress' | 'ready_for_qa' | 'qa_rejected' | 'verified' | 'superseded').",
     options: { namespace: "org", codemode: true, pinned: true },
     input: {
       type: "object",
@@ -526,7 +802,7 @@ function registerOrgTools(editor, rootDir) {
         taskId: { type: "string", description: "Task ID to update" },
         status: {
           type: "string",
-          enum: ["pending", "in_progress", "ready_for_qa", "qa_rejected", "verified"],
+          enum: ["pending", "in_progress", "ready_for_qa", "qa_rejected", "verified", "superseded"],
           description: "New status for the task"
         }
       },
@@ -557,6 +833,66 @@ function registerOrgTools(editor, rootDir) {
     execute: async (input) => {
       const task = await submitQAReceipt(rootDir, input);
       return { output: task, content: `Recorded QA Receipt [${input.verdict}] for task [${input.taskId}]` };
+    }
+  });
+  editor.add({
+    name: "plan_tournament",
+    description: "Provision a Best-of-N Worktree Tournament that creates competing candidate tasks (e.g. candidate-a, candidate-b) with isolated Git worktree paths.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Tournament identifier (e.g. 'tourney-canvas-engine')" },
+        title: { type: "string", description: "Objective and evaluation criteria for the competing candidates" },
+        role: { type: "string", description: "Role competing in the tournament ('staff-ui' or 'staff-backend')" },
+        ownedPaths: { type: "array", items: { type: "string" }, description: "Target file paths for the feature" },
+        candidates: { type: "number", description: "Number of competing candidates (default 2, max 4)" }
+      },
+      required: ["id", "title", "role", "ownedPaths"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const tournament = await planTournament(rootDir, input);
+      return {
+        output: tournament,
+        content: `Planned Best-of-${tournament.candidates.length} tournament [${tournament.id}] (${tournament.candidates.map((c) => c.taskId).join(", ")})`
+      };
+    }
+  });
+  editor.add({
+    name: "resolve_tournament",
+    description: "Resolve a Best-of-N Worktree Tournament by selecting a QA-verified winning candidate task and marking competing candidate tasks as superseded.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        tournamentId: { type: "string", description: "Tournament ID to resolve" },
+        winningTaskId: { type: "string", description: "Winning candidate task ID (must have a PASS QA receipt)" },
+        summary: { type: "string", description: "Rationale for selecting the winning implementation" }
+      },
+      required: ["tournamentId", "winningTaskId", "summary"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const tournament = await resolveTournament(rootDir, input);
+      return {
+        output: tournament,
+        content: `Resolved tournament [${tournament.id}] -> winner: ${tournament.winningTaskId}`
+      };
+    }
+  });
+  editor.add({
+    name: "verify_release_ready",
+    description: "Audit the entire SwarmOS board to verify that a charter exists, contracts are locked, active tournaments are resolved, and every non-superseded task has a signed PASS receipt with zero defects.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const report = await verifyReleaseReady(rootDir);
+      return {
+        output: report,
+        content: JSON.stringify(report, null, 2)
+      };
     }
   });
 }
@@ -851,14 +1187,18 @@ async function registerSwarmCommand(ctx, rootDir) {
   await ctx.command.transform((editor) => {
     editor.add({
       name: "swarm",
-      description: "Inspect SwarmOS multi-agent organizational status, active tasks, locked contracts, and QA receipts",
+      description: "Inspect SwarmOS multi-agent organizational status, release readiness gate, tournaments, locked contracts, and QA receipts",
       execute: async (input) => {
-        const board = await loadBoard(rootDir);
+        const [board, readiness] = await Promise.all([loadBoard(rootDir), verifyReleaseReady(rootDir)]);
+        const tournaments = Array.isArray(board.tournaments) ? board.tournaments : [];
         const summary = [
-          "# SwarmOS Organizational Status",
+          "# SwarmOS Organizational Status (v0.3.0)",
           "",
           board.project ? `**Project**: ${board.project.name} (${board.project.aestheticArchetype})
 **Vision**: ${board.project.vision}` : "_No active project charter. Run `/ship <spec>` to initialize._",
+          "",
+          `### Release Gate: ${readiness.ready ? "READY TO SHIP" : `BLOCKED (${readiness.blockers.length} blocker(s))`}`,
+          ...readiness.ready ? [`- All ${readiness.verifiedTasks.length} active task(s) verified with signed QA PASS receipts.`] : readiness.blockers.map((b) => `- [Blocker] ${b}`),
           "",
           `### Locked Contracts (${board.contracts.length})`,
           board.contracts.length === 0 ? "- No contracts locked yet." : board.contracts.map((c) => `- **[${c.id}]** ${c.title} (${c.files.join(", ")})`).join(`
@@ -868,9 +1208,15 @@ async function registerSwarmCommand(ctx, rootDir) {
           board.tasks.length === 0 ? "- No tasks created yet." : board.tasks.map((t) => {
             const latestReceipt = t.qaReceipts[t.qaReceipts.length - 1];
             const receiptTag = latestReceipt ? ` [QA: ${latestReceipt.verdict}]` : " [QA: Unverified]";
-            return `- **[${t.id}]** ${t.title} -> **${t.owner}** (${t.status})${receiptTag}`;
+            const pathsTag = t.ownedPaths.length > 0 ? ` \u2014 owns: \`${t.ownedPaths.join(", ")}\`` : "";
+            return `- **[${t.id}]** ${t.title} -> **${t.owner}** (${t.status})${receiptTag}${pathsTag}`;
           }).join(`
-`)
+`),
+          ...tournaments.length > 0 ? [
+            "",
+            `### Worktree Tournaments (${tournaments.length})`,
+            ...tournaments.map((tr) => tr.status === "resolved" ? `- **[${tr.id}]** ${tr.title} (${tr.role}) -> **RESOLVED** (Winner: \`${tr.winningTaskId}\`)` : `- **[${tr.id}]** ${tr.title} (${tr.role}) -> **ACTIVE** (${tr.candidates.map((c) => c.taskId).join(" vs. ")})`)
+          ] : []
         ].join(`
 `);
         if (ctx.session?.prompt) {
@@ -887,12 +1233,12 @@ async function registerSwarmCommand(ctx, rootDir) {
 
 // src/diagnostics/runner.ts
 import { execFile } from "child_process";
-import * as path3 from "path";
+import * as path4 from "path";
 import { promisify } from "util";
 var execFileAsync = promisify(execFile);
 async function runQuickDiagnostics(rootDir, filePath, options = {}) {
-  const abs = path3.resolve(rootDir, filePath);
-  const ext = path3.extname(abs).toLowerCase();
+  const abs = path4.resolve(rootDir, filePath);
+  const ext = path4.extname(abs).toLowerCase();
   const timeout = options.timeoutMs ?? 6000;
   const maxLines = options.maxLines ?? 30;
   try {
@@ -1059,7 +1405,7 @@ async function registerMuseOverlay(ctx) {
 
 // src/skills/ui-craft/skill.ts
 import * as fs3 from "fs/promises";
-import * as path4 from "path";
+import * as path5 from "path";
 var UI_CRAFT_SKILL_ID = "ui-craft";
 var UI_CRAFT_SKILL_NAME = "UI Craft & Spatial Architecture";
 var EMBEDDED_UI_CRAFT_SKILL_MD = `---
@@ -1172,7 +1518,7 @@ Before handing off any UI milestone:
    - \`row-baseline-jitter\`: Align sibling card and button top edges to exact pixels.`;
 async function loadSkillContent(fallbackDir) {
   const targetDir = fallbackDir ?? process.cwd();
-  const candidate = path4.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
+  const candidate = path5.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
   try {
     return await fs3.readFile(candidate, "utf8");
   } catch {
@@ -1183,7 +1529,7 @@ async function registerUICraftSkill(ctx, rootDir) {
   if (!ctx.skill?.transform)
     return;
   const content = await loadSkillContent(rootDir);
-  const absoluteSkillPath = path4.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
+  const absoluteSkillPath = path5.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
   await ctx.skill.transform((editor) => {
     editor.add({
       id: UI_CRAFT_SKILL_ID,
@@ -1212,6 +1558,7 @@ async function setup(ctx) {
       registerFSTools(editor, rootDir);
     });
   }
+  await registerPermissionGuard(ctx, rootDir);
   await registerDiagnosticHook(ctx, rootDir);
   await registerUICraftSkill(ctx, rootDir);
   await registerMuseOverlay(ctx);
@@ -1227,8 +1574,10 @@ var SwarmOSPlugin = Object.assign(async function SwarmOSPlugin(ctx) {
 var src_default = SwarmOSPlugin;
 var plugin = SwarmOSPlugin;
 export {
+  BOARD_VERSION,
   DOM_GEOMETRY_AUDIT_SCRIPT,
   EMBEDDED_UI_CRAFT_SKILL_MD,
+  MUSE_SOTA_BASE_PROMPT,
   PROMPT_ARCHITECT,
   PROMPT_DIRECTOR,
   PROMPT_MANAGER,
@@ -1242,19 +1591,30 @@ export {
   SwarmOSPlugin,
   UI_CRAFT_SKILL_ID,
   UI_CRAFT_SKILL_NAME,
+  createEmptyBoard,
   createTask,
   src_default as default,
+  evaluateBoardGuard,
+  evaluatePermissionGuard,
   extractMutatedPaths,
+  extractOutline,
   getBoardPath,
   initProject,
   loadBoard,
   loadSkillContent,
   lockContract,
+  matchesPathPattern,
+  normalizeResourcePath,
+  planTournament,
   plugin,
+  registerMuseOverlay,
+  registerPermissionGuard,
+  resolveTournament,
   runQuickDiagnostics,
   saveBoard,
   setup,
   submitQAReceipt,
   updateTaskStatus,
+  verifyReleaseReady,
   withBoardLock
 };

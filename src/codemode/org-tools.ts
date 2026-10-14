@@ -3,13 +3,18 @@ import {
   initProject,
   loadBoard,
   lockContract,
+  planTournament,
+  resolveTournament,
   submitQAReceipt,
   updateTaskStatus,
+  verifyReleaseReady,
 } from "../board/board.js"
 import type {
   CreateTaskInput,
   InitProjectInput,
   LockContractInput,
+  PlanTournamentInput,
+  ResolveTournamentInput,
   SubmitQAReceiptInput,
   TaskStatus,
 } from "../board/types.js"
@@ -17,12 +22,13 @@ import type {
 export function registerOrgTools(editor: any, rootDir: string): void {
   editor.namespace({
     name: "org",
-    description: "SwarmOS organizational blackboard for locking contracts, assigning tasks, and recording QA receipts.",
+    description:
+      "SwarmOS organizational blackboard for locking contracts, assigning tasks, running Best-of-N worktree tournaments, and verifying release readiness.",
   })
 
   editor.add({
     name: "get_board",
-    description: "Read the current SwarmOS project charter, locked contracts, tasks, and QA receipts.",
+    description: "Read the current SwarmOS project charter, locked contracts, tasks, tournaments, and QA receipts.",
     options: { namespace: "org", codemode: true, pinned: true },
     input: { type: "object", properties: {} },
     output: { type: "object" },
@@ -102,7 +108,8 @@ export function registerOrgTools(editor: any, rootDir: string): void {
 
   editor.add({
     name: "update_task",
-    description: "Transition an engineering task status ('pending' | 'in_progress' | 'ready_for_qa' | 'qa_rejected' | 'verified').",
+    description:
+      "Transition an engineering task status ('pending' | 'in_progress' | 'ready_for_qa' | 'qa_rejected' | 'verified' | 'superseded').",
     options: { namespace: "org", codemode: true, pinned: true },
     input: {
       type: "object",
@@ -110,7 +117,7 @@ export function registerOrgTools(editor: any, rootDir: string): void {
         taskId: { type: "string", description: "Task ID to update" },
         status: {
           type: "string",
-          enum: ["pending", "in_progress", "ready_for_qa", "qa_rejected", "verified"],
+          enum: ["pending", "in_progress", "ready_for_qa", "qa_rejected", "verified", "superseded"],
           description: "New status for the task",
         },
       },
@@ -142,6 +149,72 @@ export function registerOrgTools(editor: any, rootDir: string): void {
     execute: async (input: SubmitQAReceiptInput) => {
       const task = await submitQAReceipt(rootDir, input)
       return { output: task, content: `Recorded QA Receipt [${input.verdict}] for task [${input.taskId}]` }
+    },
+  })
+
+  editor.add({
+    name: "plan_tournament",
+    description:
+      "Provision a Best-of-N Worktree Tournament that creates competing candidate tasks (e.g. candidate-a, candidate-b) with isolated Git worktree paths.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Tournament identifier (e.g. 'tourney-canvas-engine')" },
+        title: { type: "string", description: "Objective and evaluation criteria for the competing candidates" },
+        role: { type: "string", description: "Role competing in the tournament ('staff-ui' or 'staff-backend')" },
+        ownedPaths: { type: "array", items: { type: "string" }, description: "Target file paths for the feature" },
+        candidates: { type: "number", description: "Number of competing candidates (default 2, max 4)" },
+      },
+      required: ["id", "title", "role", "ownedPaths"],
+    },
+    output: { type: "object" },
+    execute: async (input: PlanTournamentInput) => {
+      const tournament = await planTournament(rootDir, input)
+      return {
+        output: tournament,
+        content: `Planned Best-of-${tournament.candidates.length} tournament [${tournament.id}] (${tournament.candidates.map((c) => c.taskId).join(", ")})`,
+      }
+    },
+  })
+
+  editor.add({
+    name: "resolve_tournament",
+    description:
+      "Resolve a Best-of-N Worktree Tournament by selecting a QA-verified winning candidate task and marking competing candidate tasks as superseded.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        tournamentId: { type: "string", description: "Tournament ID to resolve" },
+        winningTaskId: { type: "string", description: "Winning candidate task ID (must have a PASS QA receipt)" },
+        summary: { type: "string", description: "Rationale for selecting the winning implementation" },
+      },
+      required: ["tournamentId", "winningTaskId", "summary"],
+    },
+    output: { type: "object" },
+    execute: async (input: ResolveTournamentInput) => {
+      const tournament = await resolveTournament(rootDir, input)
+      return {
+        output: tournament,
+        content: `Resolved tournament [${tournament.id}] -> winner: ${tournament.winningTaskId}`,
+      }
+    },
+  })
+
+  editor.add({
+    name: "verify_release_ready",
+    description:
+      "Audit the entire SwarmOS board to verify that a charter exists, contracts are locked, active tournaments are resolved, and every non-superseded task has a signed PASS receipt with zero defects.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const report = await verifyReleaseReady(rootDir)
+      return {
+        output: report,
+        content: JSON.stringify(report, null, 2),
+      }
     },
   })
 }

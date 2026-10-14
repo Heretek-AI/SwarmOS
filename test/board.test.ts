@@ -3,14 +3,18 @@ import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import * as os from "node:os"
 import {
+  BOARD_VERSION,
   createEmptyBoard,
   createTask,
   initProject,
   loadBoard,
   lockContract,
   saveBoard,
+  planTournament,
+  resolveTournament,
   submitQAReceipt,
   updateTaskStatus,
+  verifyReleaseReady,
 } from "../src/board/board.js"
 
 describe("SwarmOS Board Persistence", () => {
@@ -26,7 +30,7 @@ describe("SwarmOS Board Persistence", () => {
 
   it("loads an empty board when no board.json exists", async () => {
     const board = await loadBoard(tmpDir)
-    expect(board.version).toBe("4.0.0")
+    expect(board.version).toBe(BOARD_VERSION)
     expect(board.project).toBeNull()
     expect(board.contracts).toEqual([])
     expect(board.tasks).toEqual([])
@@ -148,5 +152,93 @@ describe("SwarmOS Board Persistence", () => {
     )
     const loaded = await loadBoard(tmpDir)
     expect(loaded.tasks.length).toBe(10)
+  })
+
+  it("provisions Best-of-N worktree tournaments and enforces QA PASS before resolution", async () => {
+    const tourney = await planTournament(tmpDir, {
+      id: "tourney-dashboard",
+      title: "Build high-craft telemetry grid",
+      role: "staff-ui",
+      ownedPaths: ["src/ui/grid/**"],
+      candidates: 2,
+    })
+
+    expect(tourney.status).toBe("active")
+    expect(tourney.candidates.length).toBe(2)
+    expect(tourney.candidates[0].taskId).toBe("tourney-dashboard-candidate-a")
+    expect(tourney.candidates[0].worktree).toBe(".worktrees/tourney-dashboard-candidate-a")
+    expect(tourney.candidates[1].taskId).toBe("tourney-dashboard-candidate-b")
+
+    // Cannot resolve before winning candidate has a QA PASS receipt
+    expect(
+      resolveTournament(tmpDir, {
+        tournamentId: "tourney-dashboard",
+        winningTaskId: "tourney-dashboard-candidate-a",
+        summary: "Candidate A had cleaner grid alignment",
+      }),
+    ).rejects.toThrow("SwarmOS Tournament Guard")
+
+    // Submit QA PASS for Candidate A
+    await submitQAReceipt(tmpDir, {
+      taskId: "tourney-dashboard-candidate-a",
+      verdict: "PASS",
+      summary: "0 DOM defects across mobile, tablet, and desktop",
+      defects: [],
+    })
+
+    const resolved = await resolveTournament(tmpDir, {
+      tournamentId: "tourney-dashboard",
+      winningTaskId: "tourney-dashboard-candidate-a",
+      summary: "Candidate A passed all DOM geometry checks",
+    })
+    expect(resolved.status).toBe("resolved")
+    expect(resolved.winningTaskId).toBe("tourney-dashboard-candidate-a")
+
+    const board = await loadBoard(tmpDir)
+    const loser = board.tasks.find((t) => t.id === "tourney-dashboard-candidate-b")
+    expect(loser?.status).toBe("superseded")
+  })
+
+  it("computes release readiness accurately across charter, contracts, tasks, and tournaments", async () => {
+    // Empty board -> not ready
+    let report = await verifyReleaseReady(tmpDir)
+    expect(report.ready).toBe(false)
+    expect(report.hasCharter).toBe(false)
+
+    await initProject(tmpDir, {
+      name: "Release Gate App",
+      vision: "Ship with zero defects",
+      aestheticArchetype: "Swiss Grid / Data-Dense Workbench",
+    })
+    await lockContract(tmpDir, {
+      id: "contract-api",
+      title: "API Schema",
+      files: ["src/schema.ts"],
+      invariants: ["Strict types"],
+    })
+    await createTask(tmpDir, {
+      id: "task-1",
+      title: "Core feature",
+      owner: "staff-backend",
+      ownedPaths: ["src/core.ts"],
+    })
+
+    // Task still pending -> not ready
+    report = await verifyReleaseReady(tmpDir)
+    expect(report.ready).toBe(false)
+    expect(report.unverifiedTasks).toEqual(["task-1"])
+
+    // Submit PASS receipt -> ready!
+    await submitQAReceipt(tmpDir, {
+      taskId: "task-1",
+      verdict: "PASS",
+      summary: "All tests pass",
+      defects: [],
+    })
+
+    report = await verifyReleaseReady(tmpDir)
+    expect(report.ready).toBe(true)
+    expect(report.verifiedTasks).toEqual(["task-1"])
+    expect(report.blockers).toEqual([])
   })
 })
