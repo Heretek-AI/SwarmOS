@@ -35,6 +35,17 @@ export const DOM_GEOMETRY_AUDIT_SCRIPT = `(() => {
     return { r: +m[1], g: +m[2], b: +m[3], a: m[4] !== undefined ? +m[4] : 1 };
   }
 
+  function blend(fg, bg) {
+    const a = fg.a + bg.a * (1 - fg.a);
+    if (a <= 0) return { r: 255, g: 255, b: 255, a: 1 };
+    return {
+      r: (fg.r * fg.a + bg.r * bg.a * (1 - fg.a)) / a,
+      g: (fg.g * fg.a + bg.g * bg.a * (1 - fg.a)) / a,
+      b: (fg.b * fg.a + bg.b * bg.a * (1 - fg.a)) / a,
+      a
+    };
+  }
+
   function luminance({ r, g, b }) {
     const a = [r, g, b].map((v) => {
       v /= 255;
@@ -50,20 +61,31 @@ export const DOM_GEOMETRY_AUDIT_SCRIPT = `(() => {
   }
 
   function effectiveBg(el) {
+    const layers = [];
     let cur = el;
     while (cur && cur.nodeType === 1) {
       const bg = parseRgb(getComputedStyle(cur).backgroundColor);
-      if (bg && bg.a >= 0.85) return bg;
+      if (bg && bg.a > 0) {
+        layers.push(bg);
+        if (bg.a >= 0.99) break;
+      }
       cur = cur.parentElement;
     }
-    return { r: 255, g: 255, b: 255, a: 1 };
+    let composite = { r: 255, g: 255, b: 255, a: 1 };
+    for (let i = layers.length - 1; i >= 0; i--) {
+      composite = blend(layers[i], composite);
+    }
+    return composite;
   }
 
   function selector(el) {
     if (!el || !el.tagName) return 'unknown';
     const id = el.id ? '#' + el.id : '';
-    const cls = typeof el.className === 'string' && el.className.trim()
-      ? '.' + el.className.trim().split(/\\s+/).slice(0, 2).join('.')
+    const rawClass = typeof el.className === 'string'
+      ? el.className
+      : (el.className && typeof el.className.baseVal === 'string' ? el.className.baseVal : '');
+    const cls = rawClass.trim()
+      ? '.' + rawClass.trim().split(/\\s+/).slice(0, 2).join('.')
       : '';
     return el.tagName.toLowerCase() + id + cls;
   }
@@ -114,7 +136,8 @@ export const DOM_GEOMETRY_AUDIT_SCRIPT = `(() => {
       const fg = parseRgb(style.color);
       const bg = effectiveBg(el);
       if (fg && bg) {
-        const ratio = contrastRatio(fg, bg);
+        const compFg = fg.a < 1 ? blend(fg, bg) : fg;
+        const ratio = contrastRatio(compFg, bg);
         const fontSize = parseFloat(style.fontSize) || 14;
         const isBold = parseInt(style.fontWeight, 10) >= 700 || style.fontWeight === 'bold';
         const minRatio = fontSize >= 18.66 || (fontSize >= 14 && isBold) ? 3.0 : 4.5;
@@ -140,7 +163,13 @@ export const DOM_GEOMETRY_AUDIT_SCRIPT = `(() => {
     // 5. Check sibling bounding-box collisions and row baseline misalignments
     const children = Array.from(el.children).filter((c) => {
       const cs = getComputedStyle(c);
-      return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.position !== 'absolute' && cs.position !== 'fixed';
+      return (
+        cs.display !== 'none' &&
+        cs.visibility !== 'hidden' &&
+        cs.position !== 'absolute' &&
+        cs.position !== 'fixed' &&
+        cs.position !== 'sticky'
+      );
     });
     for (let i = 0; i < children.length; i++) {
       const r1 = children[i].getBoundingClientRect();

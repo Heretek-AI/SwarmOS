@@ -23,8 +23,8 @@ export const MUSE_SOTA_BASE_PROMPT = `You are OpenCode, an autonomous software e
    - After completing edits, run the narrowest relevant verification command via \`shell\` (check \`AGENTS.md\` and \`package.json\` first). Never claim a fix works without running verification.
 
 # Tool Guidance
-- Always prefer dedicated tools (\`read\`, \`edit\`, \`write\`, \`glob\`, \`grep\`) over \`shell\` equivalents (\`cat\`, \`sed\`, \`find\`, \`rg\`).
-- Use \`execute\` (Code Mode) to script multi-step calls to \`tools.opencode.*\`, \`tools.browser.*\`, \`tools.fs.*\`, or MCP tools using \`Promise.allSettled\`.
+- Always prefer dedicated tools (\`read\`, \`edit\`, \`write\`, \`patch\`, \`glob\`, \`grep\`) over \`shell\` equivalents (\`cat\`, \`sed\`, \`find\`, \`rg\`).
+- Use \`execute\` (Code Mode) to script multi-step calls to \`tools.opencode.*\`, \`tools.browser.*\`, \`tools.org.*\`, \`tools.ui.*\`, \`tools.fs.*\`, or MCP tools using \`Promise.allSettled\`.
 - Never poll \`background: true\` \`shell\` or \`subagent\` jobs; the harness notifies you automatically on completion.
 - Never run \`git commit\`, \`git push\`, \`git reset --hard\`, or \`git checkout --\` unless explicitly asked by the user.
 
@@ -32,7 +32,7 @@ export const MUSE_SOTA_BASE_PROMPT = `You are OpenCode, an autonomous software e
 - Keep intermediate commentary terse and high-signal (share root causes, tradeoffs, or blockers; never narrate routine reads or greps).
 - In your final answer, lead with the outcome and cite code locations as \`file_path:line_number\`.`
 
-export function registerMuseOverlay(ctx: any): void {
+export async function registerMuseOverlay(ctx: any): Promise<void> {
   if (!ctx.session?.hook) return
 
   const upgradePrompt = async (event: any) => {
@@ -52,10 +52,14 @@ export function registerMuseOverlay(ctx: any): void {
     if (!event.system?.[0]) return
 
     const modelName = event.model ? `${event.model.providerID}/${event.model.id}` : "Muse 1.3"
-    const rendered = MUSE_SOTA_BASE_PROMPT.replaceAll("{{MODEL_NAME}}", modelName)
+    let rendered = MUSE_SOTA_BASE_PROMPT.replaceAll("{{MODEL_NAME}}", modelName)
+    if (event.tools && typeof event.tools === "object" && "patch" in event.tools && !("edit" in event.tools)) {
+      rendered +=
+        "\n- **Atomic Patching (`patch`)**: In this model profile, `patch` replaces `edit` and `write`. Always read target sections before applying a `*** Begin Patch` envelope."
+    }
     event.system[0] = { ...event.system[0], text: rendered }
   }
 
-  ctx.session.hook("context", upgradePrompt)
-  ctx.session.hook("generate", upgradePrompt)
+  await ctx.session.hook("context", upgradePrompt)
+  await ctx.session.hook("generate", upgradePrompt)
 }

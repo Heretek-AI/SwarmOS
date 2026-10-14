@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from "bun:test"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import * as os from "node:os"
-import { runQuickDiagnostics } from "../src/diagnostics/runner.js"
+import { extractMutatedPaths, runQuickDiagnostics } from "../src/diagnostics/runner.js"
 
 describe("SwarmOS Diagnostics Runner", () => {
   let tmpDir: string
@@ -49,5 +49,22 @@ describe("SwarmOS Diagnostics Runner", () => {
 
     const result = await runQuickDiagnostics(tmpDir, "clean.py")
     expect(result).toBeUndefined()
+  })
+
+  it("extracts mutated paths from patch tool applied output", () => {
+    const paths = extractMutatedPaths({
+      tool: "patch",
+      input: { patchText: "*** Begin Patch..." },
+      result: {
+        output: {
+          applied: [
+            { type: "update", resource: "src/a.ts", target: "src/a.ts" },
+            { type: "add", resource: "src/b.ts" },
+            { type: "delete", resource: "src/old.ts" },
+          ],
+        },
+      },
+    })
+    expect(paths).toEqual(["src/a.ts", "src/b.ts"])
   })
 })

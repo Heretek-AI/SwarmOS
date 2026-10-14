@@ -115,4 +115,49 @@ describe("SwarmOS Visual & DOM Geometry Engine", () => {
     expect(tinyDefect).toBeDefined()
     expect(tinyDefect?.detail).toContain("18x18px")
   })
+
+  it("computes alpha-blended contrast accurately on translucent dark-mode surfaces", () => {
+    const mockWindow = { innerWidth: 1440, innerHeight: 900 }
+    const bodyEl: any = {
+      nodeType: 1,
+      tagName: "BODY",
+      parentElement: null,
+    }
+    const cardEl: any = {
+      nodeType: 1,
+      tagName: "DIV",
+      id: "glass-card",
+      className: "card",
+      parentElement: bodyEl,
+      matches: () => false,
+      childNodes: [{ nodeType: 3, textContent: "Light text on dark translucent card" }],
+      children: [],
+      scrollWidth: 200,
+      clientWidth: 200,
+      getBoundingClientRect: () => ({ width: 200, height: 60, top: 20, bottom: 80, left: 20, right: 220 }),
+    }
+    const mockDocument = {
+      documentElement: { scrollWidth: 1440 },
+      querySelectorAll: () => [cardEl],
+    }
+    const runner = new Function("window", "document", "getComputedStyle", `return ${DOM_GEOMETRY_AUDIT_SCRIPT}`)
+    const result = runner(mockWindow, mockDocument, (el: any) => {
+      if (el === bodyEl) {
+        return { backgroundColor: "rgb(13, 14, 17)" }
+      }
+      return {
+        display: "block",
+        visibility: "visible",
+        opacity: "1",
+        overflowX: "hidden",
+        color: "rgb(242, 243, 245)",
+        backgroundColor: "rgba(255, 255, 255, 0.06)",
+        fontSize: "14px",
+        fontWeight: "400",
+        lineHeight: "20px",
+      }
+    })
+    expect(result.passed).toBe(true)
+    expect(result.defects.find((d: any) => d.kind === "low-contrast")).toBeUndefined()
+  })
 })

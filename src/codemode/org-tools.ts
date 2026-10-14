@@ -4,12 +4,14 @@ import {
   loadBoard,
   lockContract,
   submitQAReceipt,
+  updateTaskStatus,
 } from "../board/board.js"
 import type {
   CreateTaskInput,
   InitProjectInput,
   LockContractInput,
   SubmitQAReceiptInput,
+  TaskStatus,
 } from "../board/types.js"
 
 export function registerOrgTools(editor: any, rootDir: string): void {
@@ -95,6 +97,29 @@ export function registerOrgTools(editor: any, rootDir: string): void {
     execute: async (input: CreateTaskInput) => {
       const task = await createTask(rootDir, input)
       return { output: task, content: `Registered task [${task.id}] assigned to ${task.owner}` }
+    },
+  })
+
+  editor.add({
+    name: "update_task",
+    description: "Transition an engineering task status ('pending' | 'in_progress' | 'ready_for_qa' | 'qa_rejected' | 'verified').",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task ID to update" },
+        status: {
+          type: "string",
+          enum: ["pending", "in_progress", "ready_for_qa", "qa_rejected", "verified"],
+          description: "New status for the task",
+        },
+      },
+      required: ["taskId", "status"],
+    },
+    output: { type: "object" },
+    execute: async (input: { taskId: string; status: TaskStatus }) => {
+      const task = await updateTaskStatus(rootDir, input.taskId, input.status)
+      return { output: task, content: `Updated task [${task.id}] status to ${task.status}` }
     },
   })
 

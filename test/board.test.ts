@@ -134,4 +134,19 @@ describe("SwarmOS Board Persistence", () => {
       }),
     ).rejects.toThrow("SwarmOS Task not found: does-not-exist")
   })
+
+  it("serializes concurrent parallel subagent updates without lost writes via withBoardLock", async () => {
+    await Promise.all(
+      Array.from({ length: 10 }, (_, idx) =>
+        createTask(tmpDir, {
+          id: `task-parallel-${idx}`,
+          title: `Parallel Task ${idx}`,
+          owner: idx % 2 === 0 ? "staff-backend" : "staff-ui",
+          ownedPaths: [`src/mod-${idx}.ts`],
+        }),
+      ),
+    )
+    const loaded = await loadBoard(tmpDir)
+    expect(loaded.tasks.length).toBe(10)
+  })
 })

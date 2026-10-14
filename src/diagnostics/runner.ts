@@ -83,19 +83,39 @@ export async function runQuickDiagnostics(
 }
 
 /**
+ * Extracts mutated file paths from `edit`, `write`, or `patch` tool events.
+ */
+export function extractMutatedPaths(event: any): string[] {
+  const paths: string[] = []
+  if (typeof event?.input?.path === "string") {
+    paths.push(event.input.path)
+  } else if (event?.tool === "patch" && Array.isArray(event?.result?.output?.applied)) {
+    for (const item of event.result.output.applied) {
+      if (!item || item.type === "delete") continue
+      const target = item.target ?? item.resource
+      if (typeof target === "string" && !paths.includes(target)) {
+        paths.push(target)
+      }
+    }
+  }
+  return paths
+}
+
+/**
  * Attaches the diagnostic hook to the OpenCode plugin tool domain.
  */
-export function registerDiagnosticHook(ctx: any, rootDir: string): void {
+export async function registerDiagnosticHook(ctx: any, rootDir: string): Promise<void> {
   if (!ctx.tool?.hook) return
 
-  ctx.tool.hook("execute.after", async (event: any) => {
+  await ctx.tool.hook("execute.after", async (event: any) => {
     if (event.status !== "completed") return
     if (event.tool !== "edit" && event.tool !== "write" && event.tool !== "patch") return
 
-    const targetPath = event.input?.path
-    if (typeof targetPath !== "string") return
+    const targetPaths = extractMutatedPaths(event)
+    if (targetPaths.length === 0) return
 
-    const diag = await runQuickDiagnostics(rootDir, targetPath)
+    const results = await Promise.all(targetPaths.map((p) => runQuickDiagnostics(rootDir, p)))
+    const diag = results.filter(Boolean).join("")
     if (!diag) return
 
     if (Array.isArray(event.result?.content)) {

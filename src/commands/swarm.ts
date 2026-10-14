@@ -1,9 +1,9 @@
 import { loadBoard } from "../board/board.js"
 
-export function registerSwarmCommand(ctx: any, rootDir: string): void {
+export async function registerSwarmCommand(ctx: any, rootDir: string): Promise<void> {
   if (!ctx.command?.transform) return
 
-  ctx.command.transform((editor: any) => {
+  await ctx.command.transform((editor: any) => {
     editor.add({
       name: "swarm",
       description: "Inspect SwarmOS multi-agent organizational status, active tasks, locked contracts, and QA receipts",

@@ -119,6 +119,11 @@ export const SWARMOS_ROLES: Record<string, AgentDefinition> = {
       { action: "write", resource: "*test*/*", effect: "allow" },
       { action: "write", resource: "*tests*/*", effect: "allow" },
       { action: "write", resource: "*e2e*/*", effect: "allow" },
+      { action: "patch", resource: "*.test.*", effect: "allow" },
+      { action: "patch", resource: "*.spec.*", effect: "allow" },
+      { action: "patch", resource: "*test*/*", effect: "allow" },
+      { action: "patch", resource: "*tests*/*", effect: "allow" },
+      { action: "patch", resource: "*e2e*/*", effect: "allow" },
     ],
   },
   "release-ops": {

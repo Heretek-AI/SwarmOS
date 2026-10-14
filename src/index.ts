@@ -17,6 +17,7 @@ import {
   saveBoard,
   submitQAReceipt,
   updateTaskStatus,
+  withBoardLock,
 } from "./board/board.js"
 import type {
   Contract,
@@ -35,11 +36,17 @@ import { registerOrgTools } from "./codemode/org-tools.js"
 import { registerUITools } from "./codemode/ui-tools.js"
 import { registerShipCommand } from "./commands/ship.js"
 import { registerSwarmCommand } from "./commands/swarm.js"
-import { registerDiagnosticHook, runQuickDiagnostics } from "./diagnostics/runner.js"
+import { extractMutatedPaths, registerDiagnosticHook, runQuickDiagnostics } from "./diagnostics/runner.js"
 import { DOM_GEOMETRY_AUDIT_SCRIPT, type DOMAuditResult, type DOMDefect } from "./geometry/audit-script.js"
 import { STANDARD_VIEWPORTS, type ViewportDefinition } from "./geometry/viewports.js"
 import { registerMuseOverlay } from "./muse/overlay.js"
-import { registerUICraftSkill, UI_CRAFT_SKILL_ID, UI_CRAFT_SKILL_NAME } from "./skills/ui-craft/skill.js"
+import {
+  EMBEDDED_UI_CRAFT_SKILL_MD,
+  loadSkillContent,
+  registerUICraftSkill,
+  UI_CRAFT_SKILL_ID,
+  UI_CRAFT_SKILL_NAME,
+} from "./skills/ui-craft/skill.js"
 
 export {
   // Agent roles and prompts
@@ -55,6 +62,7 @@ export {
   // Board operations
   loadBoard,
   saveBoard,
+  withBoardLock,
   initProject,
   lockContract,
   createTask,
@@ -68,10 +76,13 @@ export {
 
   // Diagnostics
   runQuickDiagnostics,
+  extractMutatedPaths,
 
   // Skills & Commands
   UI_CRAFT_SKILL_ID,
   UI_CRAFT_SKILL_NAME,
+  EMBEDDED_UI_CRAFT_SKILL_MD,
+  loadSkillContent,
 }
 
 export type {
@@ -90,13 +101,15 @@ export type {
   ViewportDefinition,
 }
 
+export const SWARMOS_PLUGIN_ID = "heretek.swarmos"
+
 /**
- * OpenCode SwarmOS Plugin Entrypoint.
+ * OpenCode SwarmOS Plugin Setup Function.
  *
  * Turns OpenCode V2 into an autonomous multi-agent software engineering company
  * and visual UI engine with hardware-enforced separation of powers.
  */
-export default async function SwarmOSPlugin(ctx: any): Promise<void> {
+export async function setup(ctx: any): Promise<void> {
   const rootDir = ctx.location?.directory ?? process.cwd()
 
   // 1. Register 7 Specialized Engineering Roles with strict permission matrices
@@ -116,17 +129,39 @@ export default async function SwarmOSPlugin(ctx: any): Promise<void> {
   }
 
   // 3. Register live post-mutation compiler & linter diagnostic feedback loop
-  registerDiagnosticHook(ctx, rootDir)
+  await registerDiagnosticHook(ctx, rootDir)
 
   // 4. Register Anti-Slop UI Craft & Spatial Architecture Skill
   await registerUICraftSkill(ctx, rootDir)
 
   // 5. Register Muse 1.3 / High-Context Model Overlay & Compaction Isolation
-  registerMuseOverlay(ctx)
+  await registerMuseOverlay(ctx)
 
   // 6. Register Slash Commands: /ship and /swarm
-  registerShipCommand(ctx)
-  registerSwarmCommand(ctx, rootDir)
+  await registerShipCommand(ctx)
+  await registerSwarmCommand(ctx, rootDir)
 }
 
+export interface SwarmOSPluginCallable {
+  (ctx: any): Promise<void>
+  readonly id: string
+  readonly setup: (ctx: any) => Promise<void>
+}
+
+/**
+ * Dual-compatible plugin export:
+ * 1. Satisfies OpenCode V2's `PluginModule.load` Effect Schema (`{ id: string, setup: (ctx) => Promise<void> }`)
+ * 2. Remains directly callable (`await SwarmOSPlugin(ctx)`) for existing unit tests and scripts.
+ */
+export const SwarmOSPlugin: SwarmOSPluginCallable = Object.assign(
+  async function SwarmOSPlugin(ctx: any): Promise<void> {
+    return setup(ctx)
+  },
+  {
+    id: SWARMOS_PLUGIN_ID,
+    setup,
+  },
+)
+
+export default SwarmOSPlugin
 export const plugin = SwarmOSPlugin

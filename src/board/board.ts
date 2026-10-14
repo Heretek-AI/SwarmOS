@@ -14,6 +14,8 @@ import type {
 
 export const BOARD_VERSION = "4.0.0"
 
+const boardLocks = new Map<string, Promise<unknown>>()
+
 export function getBoardPath(rootDir: string): string {
   return path.join(rootDir, ".opencode", "org", "board.json")
 }
@@ -55,96 +57,126 @@ export async function saveBoard(rootDir: string, board: OrgBoard): Promise<void>
   await fs.rename(tempFile, targetFile)
 }
 
-export async function initProject(rootDir: string, input: InitProjectInput): Promise<ProjectCharter> {
-  const board = await loadBoard(rootDir)
-  const charter: ProjectCharter = {
-    name: input.name,
-    vision: input.vision,
-    aestheticArchetype: input.aestheticArchetype,
-    updatedAt: new Date().toISOString(),
+/**
+ * Serializes concurrent read-modify-write board mutations per workspace root
+ * so parallel subagents (e.g., staff-backend and staff-ui) never clobber updates.
+ */
+export async function withBoardLock<T>(
+  rootDir: string,
+  mutator: (board: OrgBoard) => Promise<T> | T,
+): Promise<T> {
+  const key = path.resolve(rootDir)
+  const previous = boardLocks.get(key) ?? Promise.resolve()
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const current = previous.then(() => gate)
+  boardLocks.set(key, current)
+
+  await previous
+  try {
+    const board = await loadBoard(rootDir)
+    const result = await mutator(board)
+    await saveBoard(rootDir, board)
+    return result
+  } finally {
+    release()
+    if (boardLocks.get(key) === current) {
+      boardLocks.delete(key)
+    }
   }
-  board.project = charter
-  await saveBoard(rootDir, board)
-  return charter
+}
+
+export async function initProject(rootDir: string, input: InitProjectInput): Promise<ProjectCharter> {
+  return withBoardLock(rootDir, (board) => {
+    const charter: ProjectCharter = {
+      name: input.name,
+      vision: input.vision,
+      aestheticArchetype: input.aestheticArchetype,
+      updatedAt: new Date().toISOString(),
+    }
+    board.project = charter
+    return charter
+  })
 }
 
 export async function lockContract(rootDir: string, input: LockContractInput): Promise<Contract> {
-  const board = await loadBoard(rootDir)
-  const contract = {
-    id: input.id,
-    title: input.title,
-    files: input.files,
-    invariants: input.invariants,
-    lockedAt: new Date().toISOString(),
-    ...(input.lockedBy ? { lockedBy: input.lockedBy } : {}),
-  }
-  const idx = board.contracts.findIndex((c) => c.id === input.id)
-  if (idx >= 0) {
-    board.contracts[idx] = contract
-  } else {
-    board.contracts.push(contract)
-  }
-  await saveBoard(rootDir, board)
-  return contract
+  return withBoardLock(rootDir, (board) => {
+    const contract: Contract = {
+      id: input.id,
+      title: input.title,
+      files: input.files,
+      invariants: input.invariants,
+      lockedAt: new Date().toISOString(),
+      ...(input.lockedBy ? { lockedBy: input.lockedBy } : {}),
+    }
+    const idx = board.contracts.findIndex((c) => c.id === input.id)
+    if (idx >= 0) {
+      board.contracts[idx] = contract
+    } else {
+      board.contracts.push(contract)
+    }
+    return contract
+  })
 }
 
 export async function createTask(rootDir: string, input: CreateTaskInput): Promise<Task> {
-  const board = await loadBoard(rootDir)
-  const existing = board.tasks.find((t) => t.id === input.id)
-  const now = new Date().toISOString()
+  return withBoardLock(rootDir, (board) => {
+    const existing = board.tasks.find((t) => t.id === input.id)
+    const now = new Date().toISOString()
 
-  const task: Task = {
-    id: input.id,
-    title: input.title,
-    owner: input.owner,
-    ownedPaths: input.ownedPaths,
-    worktree: input.worktree,
-    status: existing?.status ?? "pending",
-    qaReceipts: existing?.qaReceipts ?? [],
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now,
-  }
+    const task: Task = {
+      id: input.id,
+      title: input.title,
+      owner: input.owner,
+      ownedPaths: input.ownedPaths,
+      worktree: input.worktree,
+      status: existing?.status ?? "pending",
+      qaReceipts: existing?.qaReceipts ?? [],
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    }
 
-  if (existing) {
-    Object.assign(existing, task)
-  } else {
-    board.tasks.push(task)
-  }
-  await saveBoard(rootDir, board)
-  return task
+    if (existing) {
+      Object.assign(existing, task)
+    } else {
+      board.tasks.push(task)
+    }
+    return task
+  })
 }
 
 export async function updateTaskStatus(rootDir: string, taskId: string, status: TaskStatus): Promise<Task> {
-  const board = await loadBoard(rootDir)
-  const task = board.tasks.find((t) => t.id === taskId)
-  if (!task) {
-    throw new Error(`SwarmOS Task not found: ${taskId}`)
-  }
-  task.status = status
-  task.updatedAt = new Date().toISOString()
-  await saveBoard(rootDir, board)
-  return task
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === taskId)
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${taskId}`)
+    }
+    task.status = status
+    task.updatedAt = new Date().toISOString()
+    return task
+  })
 }
 
 export async function submitQAReceipt(rootDir: string, input: SubmitQAReceiptInput): Promise<Task> {
-  const board = await loadBoard(rootDir)
-  const task = board.tasks.find((t) => t.id === input.taskId)
-  if (!task) {
-    throw new Error(`SwarmOS Task not found: ${input.taskId}`)
-  }
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === input.taskId)
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${input.taskId}`)
+    }
 
-  const receipt = {
-    verdict: input.verdict,
-    summary: input.summary,
-    defects: input.defects,
-    testCommand: input.testCommand,
-    timestamp: new Date().toISOString(),
-  }
+    const receipt = {
+      verdict: input.verdict,
+      summary: input.summary,
+      defects: input.defects,
+      testCommand: input.testCommand,
+      timestamp: new Date().toISOString(),
+    }
 
-  task.qaReceipts.push(receipt)
-  task.status = input.verdict === "PASS" ? "verified" : "qa_rejected"
-  task.updatedAt = receipt.timestamp
-
-  await saveBoard(rootDir, board)
-  return task
+    task.qaReceipts.push(receipt)
+    task.status = input.verdict === "PASS" ? "verified" : "qa_rejected"
+    task.updatedAt = receipt.timestamp
+    return task
+  })
 }

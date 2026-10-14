@@ -195,7 +195,12 @@ var SWARMOS_ROLES = {
       { action: "write", resource: "*.spec.*", effect: "allow" },
       { action: "write", resource: "*test*/*", effect: "allow" },
       { action: "write", resource: "*tests*/*", effect: "allow" },
-      { action: "write", resource: "*e2e*/*", effect: "allow" }
+      { action: "write", resource: "*e2e*/*", effect: "allow" },
+      { action: "patch", resource: "*.test.*", effect: "allow" },
+      { action: "patch", resource: "*.spec.*", effect: "allow" },
+      { action: "patch", resource: "*test*/*", effect: "allow" },
+      { action: "patch", resource: "*tests*/*", effect: "allow" },
+      { action: "patch", resource: "*e2e*/*", effect: "allow" }
     ]
   },
   "release-ops": {
@@ -233,6 +238,7 @@ function registerSwarmOSAgents(editor) {
 import * as fs from "fs/promises";
 import * as path from "path";
 var BOARD_VERSION = "4.0.0";
+var boardLocks = new Map;
 function getBoardPath(rootDir) {
   return path.join(rootDir, ".opencode", "org", "board.json");
 }
@@ -268,89 +274,111 @@ async function saveBoard(rootDir, board) {
   await fs.writeFile(tempFile, payload, "utf8");
   await fs.rename(tempFile, targetFile);
 }
+async function withBoardLock(rootDir, mutator) {
+  const key = path.resolve(rootDir);
+  const previous = boardLocks.get(key) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const current = previous.then(() => gate);
+  boardLocks.set(key, current);
+  await previous;
+  try {
+    const board = await loadBoard(rootDir);
+    const result = await mutator(board);
+    await saveBoard(rootDir, board);
+    return result;
+  } finally {
+    release();
+    if (boardLocks.get(key) === current) {
+      boardLocks.delete(key);
+    }
+  }
+}
 async function initProject(rootDir, input) {
-  const board = await loadBoard(rootDir);
-  const charter = {
-    name: input.name,
-    vision: input.vision,
-    aestheticArchetype: input.aestheticArchetype,
-    updatedAt: new Date().toISOString()
-  };
-  board.project = charter;
-  await saveBoard(rootDir, board);
-  return charter;
+  return withBoardLock(rootDir, (board) => {
+    const charter = {
+      name: input.name,
+      vision: input.vision,
+      aestheticArchetype: input.aestheticArchetype,
+      updatedAt: new Date().toISOString()
+    };
+    board.project = charter;
+    return charter;
+  });
 }
 async function lockContract(rootDir, input) {
-  const board = await loadBoard(rootDir);
-  const contract = {
-    id: input.id,
-    title: input.title,
-    files: input.files,
-    invariants: input.invariants,
-    lockedAt: new Date().toISOString(),
-    ...input.lockedBy ? { lockedBy: input.lockedBy } : {}
-  };
-  const idx = board.contracts.findIndex((c) => c.id === input.id);
-  if (idx >= 0) {
-    board.contracts[idx] = contract;
-  } else {
-    board.contracts.push(contract);
-  }
-  await saveBoard(rootDir, board);
-  return contract;
+  return withBoardLock(rootDir, (board) => {
+    const contract = {
+      id: input.id,
+      title: input.title,
+      files: input.files,
+      invariants: input.invariants,
+      lockedAt: new Date().toISOString(),
+      ...input.lockedBy ? { lockedBy: input.lockedBy } : {}
+    };
+    const idx = board.contracts.findIndex((c) => c.id === input.id);
+    if (idx >= 0) {
+      board.contracts[idx] = contract;
+    } else {
+      board.contracts.push(contract);
+    }
+    return contract;
+  });
 }
 async function createTask(rootDir, input) {
-  const board = await loadBoard(rootDir);
-  const existing = board.tasks.find((t) => t.id === input.id);
-  const now = new Date().toISOString();
-  const task = {
-    id: input.id,
-    title: input.title,
-    owner: input.owner,
-    ownedPaths: input.ownedPaths,
-    worktree: input.worktree,
-    status: existing?.status ?? "pending",
-    qaReceipts: existing?.qaReceipts ?? [],
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now
-  };
-  if (existing) {
-    Object.assign(existing, task);
-  } else {
-    board.tasks.push(task);
-  }
-  await saveBoard(rootDir, board);
-  return task;
+  return withBoardLock(rootDir, (board) => {
+    const existing = board.tasks.find((t) => t.id === input.id);
+    const now = new Date().toISOString();
+    const task = {
+      id: input.id,
+      title: input.title,
+      owner: input.owner,
+      ownedPaths: input.ownedPaths,
+      worktree: input.worktree,
+      status: existing?.status ?? "pending",
+      qaReceipts: existing?.qaReceipts ?? [],
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now
+    };
+    if (existing) {
+      Object.assign(existing, task);
+    } else {
+      board.tasks.push(task);
+    }
+    return task;
+  });
 }
 async function updateTaskStatus(rootDir, taskId, status) {
-  const board = await loadBoard(rootDir);
-  const task = board.tasks.find((t) => t.id === taskId);
-  if (!task) {
-    throw new Error(`SwarmOS Task not found: ${taskId}`);
-  }
-  task.status = status;
-  task.updatedAt = new Date().toISOString();
-  await saveBoard(rootDir, board);
-  return task;
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === taskId);
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${taskId}`);
+    }
+    task.status = status;
+    task.updatedAt = new Date().toISOString();
+    return task;
+  });
 }
 async function submitQAReceipt(rootDir, input) {
-  const board = await loadBoard(rootDir);
-  const task = board.tasks.find((t) => t.id === input.taskId);
-  if (!task) {
-    throw new Error(`SwarmOS Task not found: ${input.taskId}`);
-  }
-  const receipt = {
-    verdict: input.verdict,
-    summary: input.summary,
-    defects: input.defects,
-    testCommand: input.testCommand,
-    timestamp: new Date().toISOString()
-  };
-  task.qaReceipts.push(receipt);
-  task.status = input.verdict === "PASS" ? "verified" : "qa_rejected";
-  task.updatedAt = receipt.timestamp;
-  await saveBoard(rootDir, board);
-  return task;
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === input.taskId);
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${input.taskId}`);
+    }
+    const receipt = {
+      verdict: input.verdict,
+      summary: input.summary,
+      defects: input.defects,
+      testCommand: input.testCommand,
+      timestamp: new Date().toISOString()
+    };
+    task.qaReceipts.push(receipt);
+    task.status = input.verdict === "PASS" ? "verified" : "qa_rejected";
+    task.updatedAt = receipt.timestamp;
+    return task;
+  });
 }
 
 // src/codemode/fs-outline.ts
@@ -489,6 +517,28 @@ function registerOrgTools(editor, rootDir) {
     }
   });
   editor.add({
+    name: "update_task",
+    description: "Transition an engineering task status ('pending' | 'in_progress' | 'ready_for_qa' | 'qa_rejected' | 'verified').",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task ID to update" },
+        status: {
+          type: "string",
+          enum: ["pending", "in_progress", "ready_for_qa", "qa_rejected", "verified"],
+          description: "New status for the task"
+        }
+      },
+      required: ["taskId", "status"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const task = await updateTaskStatus(rootDir, input.taskId, input.status);
+      return { output: task, content: `Updated task [${task.id}] status to ${task.status}` };
+    }
+  });
+  editor.add({
     name: "submit_qa_receipt",
     description: "Record an adversarial QA PASS or REJECT receipt for a task. Only tasks with a PASS receipt can be released.",
     options: { namespace: "org", codemode: true, pinned: true },
@@ -524,6 +574,17 @@ var DOM_GEOMETRY_AUDIT_SCRIPT = `(() => {
     return { r: +m[1], g: +m[2], b: +m[3], a: m[4] !== undefined ? +m[4] : 1 };
   }
 
+  function blend(fg, bg) {
+    const a = fg.a + bg.a * (1 - fg.a);
+    if (a <= 0) return { r: 255, g: 255, b: 255, a: 1 };
+    return {
+      r: (fg.r * fg.a + bg.r * bg.a * (1 - fg.a)) / a,
+      g: (fg.g * fg.a + bg.g * bg.a * (1 - fg.a)) / a,
+      b: (fg.b * fg.a + bg.b * bg.a * (1 - fg.a)) / a,
+      a
+    };
+  }
+
   function luminance({ r, g, b }) {
     const a = [r, g, b].map((v) => {
       v /= 255;
@@ -539,20 +600,31 @@ var DOM_GEOMETRY_AUDIT_SCRIPT = `(() => {
   }
 
   function effectiveBg(el) {
+    const layers = [];
     let cur = el;
     while (cur && cur.nodeType === 1) {
       const bg = parseRgb(getComputedStyle(cur).backgroundColor);
-      if (bg && bg.a >= 0.85) return bg;
+      if (bg && bg.a > 0) {
+        layers.push(bg);
+        if (bg.a >= 0.99) break;
+      }
       cur = cur.parentElement;
     }
-    return { r: 255, g: 255, b: 255, a: 1 };
+    let composite = { r: 255, g: 255, b: 255, a: 1 };
+    for (let i = layers.length - 1; i >= 0; i--) {
+      composite = blend(layers[i], composite);
+    }
+    return composite;
   }
 
   function selector(el) {
     if (!el || !el.tagName) return 'unknown';
     const id = el.id ? '#' + el.id : '';
-    const cls = typeof el.className === 'string' && el.className.trim()
-      ? '.' + el.className.trim().split(/\\s+/).slice(0, 2).join('.')
+    const rawClass = typeof el.className === 'string'
+      ? el.className
+      : (el.className && typeof el.className.baseVal === 'string' ? el.className.baseVal : '');
+    const cls = rawClass.trim()
+      ? '.' + rawClass.trim().split(/\\s+/).slice(0, 2).join('.')
       : '';
     return el.tagName.toLowerCase() + id + cls;
   }
@@ -603,7 +675,8 @@ var DOM_GEOMETRY_AUDIT_SCRIPT = `(() => {
       const fg = parseRgb(style.color);
       const bg = effectiveBg(el);
       if (fg && bg) {
-        const ratio = contrastRatio(fg, bg);
+        const compFg = fg.a < 1 ? blend(fg, bg) : fg;
+        const ratio = contrastRatio(compFg, bg);
         const fontSize = parseFloat(style.fontSize) || 14;
         const isBold = parseInt(style.fontWeight, 10) >= 700 || style.fontWeight === 'bold';
         const minRatio = fontSize >= 18.66 || (fontSize >= 14 && isBold) ? 3.0 : 4.5;
@@ -629,7 +702,13 @@ var DOM_GEOMETRY_AUDIT_SCRIPT = `(() => {
     // 5. Check sibling bounding-box collisions and row baseline misalignments
     const children = Array.from(el.children).filter((c) => {
       const cs = getComputedStyle(c);
-      return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.position !== 'absolute' && cs.position !== 'fixed';
+      return (
+        cs.display !== 'none' &&
+        cs.visibility !== 'hidden' &&
+        cs.position !== 'absolute' &&
+        cs.position !== 'fixed' &&
+        cs.position !== 'sticky'
+      );
     });
     for (let i = 0; i < children.length; i++) {
       const r1 = children[i].getBoundingClientRect();
@@ -739,10 +818,10 @@ function registerUITools(editor) {
 }
 
 // src/commands/ship.ts
-function registerShipCommand(ctx) {
+async function registerShipCommand(ctx) {
   if (!ctx.command?.transform)
     return;
-  ctx.command.transform((editor) => {
+  await ctx.command.transform((editor) => {
     editor.add({
       name: "ship",
       description: "Switch to the SwarmOS Director and orchestrate Architect, Manager, Backend, UI, and QA agents to ship a product",
@@ -766,10 +845,10 @@ ${input.prompt?.text ?? input.prompt ?? ""}`,
 }
 
 // src/commands/swarm.ts
-function registerSwarmCommand(ctx, rootDir) {
+async function registerSwarmCommand(ctx, rootDir) {
   if (!ctx.command?.transform)
     return;
-  ctx.command.transform((editor) => {
+  await ctx.command.transform((editor) => {
     editor.add({
       name: "swarm",
       description: "Inspect SwarmOS multi-agent organizational status, active tasks, locked contracts, and QA receipts",
@@ -877,18 +956,35 @@ ${bounded}
   }
   return;
 }
-function registerDiagnosticHook(ctx, rootDir) {
+function extractMutatedPaths(event) {
+  const paths = [];
+  if (typeof event?.input?.path === "string") {
+    paths.push(event.input.path);
+  } else if (event?.tool === "patch" && Array.isArray(event?.result?.output?.applied)) {
+    for (const item of event.result.output.applied) {
+      if (!item || item.type === "delete")
+        continue;
+      const target = item.target ?? item.resource;
+      if (typeof target === "string" && !paths.includes(target)) {
+        paths.push(target);
+      }
+    }
+  }
+  return paths;
+}
+async function registerDiagnosticHook(ctx, rootDir) {
   if (!ctx.tool?.hook)
     return;
-  ctx.tool.hook("execute.after", async (event) => {
+  await ctx.tool.hook("execute.after", async (event) => {
     if (event.status !== "completed")
       return;
     if (event.tool !== "edit" && event.tool !== "write" && event.tool !== "patch")
       return;
-    const targetPath = event.input?.path;
-    if (typeof targetPath !== "string")
+    const targetPaths = extractMutatedPaths(event);
+    if (targetPaths.length === 0)
       return;
-    const diag = await runQuickDiagnostics(rootDir, targetPath);
+    const results = await Promise.all(targetPaths.map((p) => runQuickDiagnostics(rootDir, p)));
+    const diag = results.filter(Boolean).join("");
     if (!diag)
       return;
     if (Array.isArray(event.result?.content)) {
@@ -927,15 +1023,15 @@ var MUSE_SOTA_BASE_PROMPT = `You are OpenCode, an autonomous software engineerin
    - After completing edits, run the narrowest relevant verification command via \`shell\` (check \`AGENTS.md\` and \`package.json\` first). Never claim a fix works without running verification.
 
 # Tool Guidance
-- Always prefer dedicated tools (\`read\`, \`edit\`, \`write\`, \`glob\`, \`grep\`) over \`shell\` equivalents (\`cat\`, \`sed\`, \`find\`, \`rg\`).
-- Use \`execute\` (Code Mode) to script multi-step calls to \`tools.opencode.*\`, \`tools.browser.*\`, \`tools.fs.*\`, or MCP tools using \`Promise.allSettled\`.
+- Always prefer dedicated tools (\`read\`, \`edit\`, \`write\`, \`patch\`, \`glob\`, \`grep\`) over \`shell\` equivalents (\`cat\`, \`sed\`, \`find\`, \`rg\`).
+- Use \`execute\` (Code Mode) to script multi-step calls to \`tools.opencode.*\`, \`tools.browser.*\`, \`tools.org.*\`, \`tools.ui.*\`, \`tools.fs.*\`, or MCP tools using \`Promise.allSettled\`.
 - Never poll \`background: true\` \`shell\` or \`subagent\` jobs; the harness notifies you automatically on completion.
 - Never run \`git commit\`, \`git push\`, \`git reset --hard\`, or \`git checkout --\` unless explicitly asked by the user.
 
 # Communication
 - Keep intermediate commentary terse and high-signal (share root causes, tradeoffs, or blockers; never narrate routine reads or greps).
 - In your final answer, lead with the outcome and cite code locations as \`file_path:line_number\`.`;
-function registerMuseOverlay(ctx) {
+async function registerMuseOverlay(ctx) {
   if (!ctx.session?.hook)
     return;
   const upgradePrompt = async (event) => {
@@ -951,57 +1047,158 @@ function registerMuseOverlay(ctx) {
     if (!event.system?.[0])
       return;
     const modelName = event.model ? `${event.model.providerID}/${event.model.id}` : "Muse 1.3";
-    const rendered = MUSE_SOTA_BASE_PROMPT.replaceAll("{{MODEL_NAME}}", modelName);
+    let rendered = MUSE_SOTA_BASE_PROMPT.replaceAll("{{MODEL_NAME}}", modelName);
+    if (event.tools && typeof event.tools === "object" && "patch" in event.tools && !("edit" in event.tools)) {
+      rendered += "\n- **Atomic Patching (`patch`)**: In this model profile, `patch` replaces `edit` and `write`. Always read target sections before applying a `*** Begin Patch` envelope.";
+    }
     event.system[0] = { ...event.system[0], text: rendered };
   };
-  ctx.session.hook("context", upgradePrompt);
-  ctx.session.hook("generate", upgradePrompt);
+  await ctx.session.hook("context", upgradePrompt);
+  await ctx.session.hook("generate", upgradePrompt);
 }
 
 // src/skills/ui-craft/skill.ts
 import * as fs3 from "fs/promises";
 import * as path4 from "path";
-var __dirname = "/home/john/Projects/SwarmOS/src/skills/ui-craft";
 var UI_CRAFT_SKILL_ID = "ui-craft";
 var UI_CRAFT_SKILL_NAME = "UI Craft & Spatial Architecture";
+var EMBEDDED_UI_CRAFT_SKILL_MD = `---
+name: ui-craft
+description: Anti-Slop Aesthetic Contract, Intentional Design Archetypes & Deterministic Spatial Engineering for High-Craft UIs
+---
+
+# SwarmOS UI Craft & Spatial Architecture Contract
+
+You are bound by the **Anti-Slop Aesthetic Contract**. High-craft interfaces look intentional, disciplined, and bespoke\u2014like Linear, Stripe, Raycast, and Apple. AI coding models regress to the statistical mean of training data unless strictly constrained.
+
+---
+
+## 1. Hard Anti-Slop Bans (Zero Tolerance)
+
+1. **NO Neon Gradients**: Never use arbitrary purple-to-blue, indigo-to-pink, or cyan gradients unless explicitly specified in the project charter.
+2. **NO Generic Icon-in-Circle Feature Grids**: Avoid circular pastel badge icons atop centered cards with 3-bullet lists.
+3. **NO Arbitrary One-Off Spacing**: Every margin and padding value MUST adhere to an established geometric token scale (\`--space-1\` through \`--space-12\`). Never mix \`p-3\` and \`p-5\` on sibling cards.
+4. **NO Line-Height Descender Clipping**: Never set \`line-height: 1\` on body or subtitle text combined with \`overflow: hidden\`. Descenders (\`g\`, \`y\`, \`p\`, \`q\`, \`j\`) will be clipped. Minimum line-height is \`1.4\` for body and \`1.15\` for large display headings.
+5. **NO Blind JSX Authoring**: You must inspect your work in the attached Chromium browser using \`tools.ui.get_audit_script\` and \`tools.browser.screenshot\`.
+6. **NO Placeholder Text**: Never write \`"Lorem ipsum"\` or \`"Feature description goes here"\`. Author realistic, domain-accurate copy.
+
+---
+
+## 2. Four Intentional Aesthetic Archetypes
+
+Before authoring components, the project charter in \`tools.org\` records one chosen archetype:
+
+### Archetype A: High-Craft Technical Dark (Linear / Raycast / Vercel)
+- **Surfaces**: Layered dark slate / obsidian (\`--surface-0: #0D0E11\`, \`--surface-1: #16181D\`, \`--surface-2: #1F222A\`).
+- **Borders**: 1px crisp hairline borders with subtle transparency (\`border: 1px solid rgba(255, 255, 255, 0.08)\`).
+- **Elevation**: Subtle luminance stepping instead of heavy blur shadows.
+- **Typography**: Tabular numerals (\`font-variant-numeric: tabular-nums\`), crisp 13px / 20px control density, tight tracking on headings (\`letter-spacing: -0.02em\`).
+- **Focus Rings**: 2px high-contrast rings with 2px offset (\`ring-offset-2\`).
+
+### Archetype B: Warm Editorial Studio Light (Stripe / Notion / Read.cv)
+- **Surfaces**: Warm stone, alabaster, and paper (\`--surface-0: #FAF9F6\`, \`--surface-1: #FFFFFF\`, \`--surface-2: #F3F1EC\`).
+- **Borders**: Soft warm hairlines (\`rgba(0, 0, 0, 0.06)\`).
+- **Depth**: Delicate ambient occlusion shadows (\`box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 12px rgba(0, 0, 0, 0.02)\`).
+- **Typography**: Editorial serif or humanist sans, generous macro-whitespace, high contrast body ink (\`#1A1A1A\`).
+
+### Archetype C: Swiss Grid / Data-Dense Workbench (Bloomberg / Grafana / IDE)
+- **Surfaces**: Neutral gray chassis with zero wasted chrome.
+- **Borders**: Exposed structural grid hairlines (\`1px solid var(--border-subtle)\`).
+- **Layout**: Strict 4px/8px modular grid. Right-aligned numeric data columns with monospace numbers.
+- **Status Badges**: Semantic pill badges with subdued tint backgrounds (\`rgba(emerald, 0.12)\` + solid text).
+
+### Archetype D: Atmospheric Minimalist Product
+- **Hero**: Typographic focal point with choreographed subtle entrance transitions.
+- **Grid**: Asymmetrical bento layouts with proportional content weight.
+- **Interactions**: Smooth cubic-bezier physics (\`cubic-bezier(0.22, 1, 0.36, 1)\`).
+
+---
+
+## 3. Core Design Token Scale
+
+Every project must define root CSS tokens before building feature components:
+
+\`\`\`css
+:root {
+  /* Spacing Scale (4px base) */
+  --space-1: 0.25rem;  /* 4px */
+  --space-2: 0.5rem;   /* 8px */
+  --space-3: 0.75rem;  /* 12px */
+  --space-4: 1rem;     /* 16px */
+  --space-6: 1.5rem;   /* 24px */
+  --space-8: 2rem;     /* 32px */
+  --space-12: 3rem;    /* 48px */
+
+  /* Radii */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+  --radius-full: 9999px;
+
+  /* Typography */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+\`\`\`
+
+---
+
+## 4. Complete Interactive States
+
+Every button, input, tab, card, or menu item MUST implement seven distinct states:
+1. \`default\`: Rest state with appropriate visual weight.
+2. \`hover\`: Subdued brightness adjustment or hairline color shift (transition duration: 150ms).
+3. \`focus-visible\`: High-contrast keyboard focus outline (never \`outline: none\` without replacement).
+4. \`active\`: Subtle press depression (\`transform: scale(0.98)\` or deeper background).
+5. \`disabled\`: Reduced opacity (0.45) with \`cursor: not-allowed\` and pointer events disabled.
+6. \`loading\`: Inline spinner preserving control dimensions so layouts don't shift.
+7. \`empty / error\`: Intentional state handling with actionable remediation copy.
+
+---
+
+## 5. Live DOM Geometry & Aesthetic Verification Loop
+
+Before handing off any UI milestone:
+1. Open the dev server in attached Chromium: \`execute\` -> \`tools.browser.tabs.open\`.
+2. Retrieve the auditor script: \`execute\` -> \`tools.ui.get_audit_script\`.
+3. Evaluate script across viewports: \`execute\` -> \`tools.browser.evaluate({ tabID, script })\`.
+4. Capture visual screenshot: \`execute\` -> \`tools.browser.screenshot({ tabID })\`.
+5. Fix every defect:
+   - \`page-horizontal-overflow\`: Zero unwanted scroll on \`html\`/\`body\`.
+   - \`element-overflow-x\`: Fix overflowing children or add explicit scroll boundaries.
+   - \`sibling-collision\`: Eliminate overlapping bounding boxes.
+   - \`low-contrast\`: Ensure contrast ratio \`>= 4.5:1\` (body) or \`>= 3.0:1\` (large text).
+   - \`descender-clip-risk\`: Increase line-height or adjust padding.
+   - \`row-baseline-jitter\`: Align sibling card and button top edges to exact pixels.`;
 async function loadSkillContent(fallbackDir) {
-  const candidates = [
-    path4.join(__dirname, "SKILL.md"),
-    path4.join(process.cwd(), "src", "skills", "ui-craft", "SKILL.md"),
-    ...fallbackDir ? [path4.join(fallbackDir, "src", "skills", "ui-craft", "SKILL.md")] : []
-  ];
-  for (const candidate of candidates) {
-    try {
-      return await fs3.readFile(candidate, "utf8");
-    } catch {}
+  const targetDir = fallbackDir ?? process.cwd();
+  const candidate = path4.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
+  try {
+    return await fs3.readFile(candidate, "utf8");
+  } catch {
+    return EMBEDDED_UI_CRAFT_SKILL_MD;
   }
-  return `# SwarmOS UI Craft & Spatial Architecture Contract
-Bound by the Anti-Slop Aesthetic Contract. High-craft interfaces look intentional and disciplined.
-Choose an Archetype in tools.org:
-- High-Craft Technical Dark (Linear/Raycast style)
-- Warm Editorial Studio Light (Stripe/Notion style)
-- Swiss Grid / Data-Dense Workbench
-- Atmospheric Minimalist Product
-Banned: No neon gradients, no descender clipping, no mismatched padding, no blind JSX without browser DOM geometry audits.`;
 }
 async function registerUICraftSkill(ctx, rootDir) {
   if (!ctx.skill?.transform)
     return;
   const content = await loadSkillContent(rootDir);
+  const absoluteSkillPath = path4.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
   await ctx.skill.transform((editor) => {
     editor.add({
       id: UI_CRAFT_SKILL_ID,
       name: UI_CRAFT_SKILL_NAME,
       description: "Anti-Slop Aesthetic Contract, Intentional Design Archetypes & Deterministic Spatial Engineering for High-Craft UIs",
       autoinvoke: true,
-      path: path4.join(rootDir, ".opencode", "skills", "ui-craft"),
+      path: absoluteSkillPath,
       content
     });
   });
 }
 
 // src/index.ts
-async function SwarmOSPlugin(ctx) {
+var SWARMOS_PLUGIN_ID = "heretek.swarmos";
+async function setup(ctx) {
   const rootDir = ctx.location?.directory ?? process.cwd();
   if (ctx.agent?.transform) {
     await ctx.agent.transform((editor) => {
@@ -1015,15 +1212,23 @@ async function SwarmOSPlugin(ctx) {
       registerFSTools(editor, rootDir);
     });
   }
-  registerDiagnosticHook(ctx, rootDir);
+  await registerDiagnosticHook(ctx, rootDir);
   await registerUICraftSkill(ctx, rootDir);
-  registerMuseOverlay(ctx);
-  registerShipCommand(ctx);
-  registerSwarmCommand(ctx, rootDir);
+  await registerMuseOverlay(ctx);
+  await registerShipCommand(ctx);
+  await registerSwarmCommand(ctx, rootDir);
 }
+var SwarmOSPlugin = Object.assign(async function SwarmOSPlugin(ctx) {
+  return setup(ctx);
+}, {
+  id: SWARMOS_PLUGIN_ID,
+  setup
+});
+var src_default = SwarmOSPlugin;
 var plugin = SwarmOSPlugin;
 export {
   DOM_GEOMETRY_AUDIT_SCRIPT,
+  EMBEDDED_UI_CRAFT_SKILL_MD,
   PROMPT_ARCHITECT,
   PROMPT_DIRECTOR,
   PROMPT_MANAGER,
@@ -1032,18 +1237,24 @@ export {
   PROMPT_STAFF_BACKEND,
   PROMPT_STAFF_UI,
   STANDARD_VIEWPORTS,
+  SWARMOS_PLUGIN_ID,
   SWARMOS_ROLES,
+  SwarmOSPlugin,
   UI_CRAFT_SKILL_ID,
   UI_CRAFT_SKILL_NAME,
   createTask,
-  SwarmOSPlugin as default,
+  src_default as default,
+  extractMutatedPaths,
   getBoardPath,
   initProject,
   loadBoard,
+  loadSkillContent,
   lockContract,
   plugin,
   runQuickDiagnostics,
   saveBoard,
+  setup,
   submitQAReceipt,
-  updateTaskStatus
+  updateTaskStatus,
+  withBoardLock
 };

@@ -1,7 +1,7 @@
-export function registerShipCommand(ctx: any): void {
+export async function registerShipCommand(ctx: any): Promise<void> {
   if (!ctx.command?.transform) return
 
-  ctx.command.transform((editor: any) => {
+  await ctx.command.transform((editor: any) => {
     editor.add({
       name: "ship",
       description: "Switch to the SwarmOS Director and orchestrate Architect, Manager, Backend, UI, and QA agents to ship a product",
