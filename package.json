@@ -53,8 +53,7 @@
   },
   "homepage": "https://github.com/Heretek-AI/SwarmOS#readme",
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "peerDependencies": {
     "@opencode/plugin": ">=2.0.0",
