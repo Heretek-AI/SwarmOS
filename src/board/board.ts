@@ -2,7 +2,9 @@ import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { computeTreeFingerprint, loadLatestVerifyRun, loadVerifyRun } from "../omni/verify.js"
 import { git, isGitRepo, mergeTournamentWinner, provisionWorktree, type MergeResult } from "./worktrees.js"
+import { getSessionState } from "../host/session-state.js"
 import type {
+  ClaimTaskInput,
   Contract,
   CreateTaskInput,
   InitProjectInput,
@@ -12,9 +14,12 @@ import type {
   ProjectCharter,
   ReleaseReadinessReport,
   ResolveTournamentInput,
+  SetTaskBudgetInput,
   SubmitQAReceiptInput,
   Task,
+  TaskBudget,
   TaskStatus,
+  TaskUsage,
   Tournament,
   TournamentCandidate,
 } from "./types.js"
@@ -146,6 +151,9 @@ export async function createTask(rootDir: string, input: CreateTaskInput): Promi
       ownedPaths: input.ownedPaths,
       worktree: input.worktree,
       ...(input.tournamentId ? { tournamentId: input.tournamentId } : {}),
+      ...(existing?.claimedBySessionID ? { claimedBySessionID: existing.claimedBySessionID } : {}),
+      ...(input.budget ?? existing?.budget ? { budget: input.budget ?? existing?.budget } : {}),
+      usage: existing?.usage ?? { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 },
       status: existing?.status ?? "pending",
       qaReceipts: existing?.qaReceipts ?? [],
       createdAt: existing?.createdAt ?? now,
@@ -171,6 +179,69 @@ export async function updateTaskStatus(rootDir: string, taskId: string, status: 
     task.updatedAt = new Date().toISOString()
     return task
   })
+}
+
+
+/**
+ * Binds a session ID to a board task (`tools.org.claim_task`) and sets the task to `in_progress`
+ * if it is currently `pending`, so spend limits and `/doctor` track the active task.
+ */
+export async function claimTask(rootDir: string, input: ClaimTaskInput): Promise<Task> {
+  const sid = input.sessionID ?? "default"
+  const state = getSessionState(sid)
+  state.taskId = input.taskId
+
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === input.taskId)
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${input.taskId}`)
+    }
+    task.claimedBySessionID = sid
+    if (task.status === "pending") {
+      task.status = "in_progress"
+    }
+    task.usage ??= { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 }
+    task.updatedAt = new Date().toISOString()
+    return task
+  })
+}
+
+/**
+ * Updates or raises a task's spend/step budget (`tools.org.set_task_budget`) and clears `overBudget`
+ * if the new limits accommodate current usage (or if `resetUsage: true` is passed).
+ */
+export async function setTaskBudget(rootDir: string, input: SetTaskBudgetInput): Promise<Task> {
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === input.taskId)
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${input.taskId}`)
+    }
+    task.budget = { ...task.budget, ...input.budget }
+    if (input.resetUsage || !task.usage) {
+      task.usage = { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 }
+    } else {
+      const reason = evaluateTaskBudgetViolation(task.budget, task.usage)
+      task.usage.overBudget = Boolean(reason)
+      if (reason) task.usage.overBudgetReason = reason
+      else delete task.usage.overBudgetReason
+    }
+    task.updatedAt = new Date().toISOString()
+    return task
+  })
+}
+
+export function evaluateTaskBudgetViolation(budget: TaskBudget | undefined, usage: TaskUsage | undefined): string | undefined {
+  if (!budget || !usage) return undefined
+  if (budget.maxTokens !== undefined && usage.tokensUsed > budget.maxTokens) {
+    return `tokensUsed (${usage.tokensUsed}) > maxTokens (${budget.maxTokens})`
+  }
+  if (budget.maxTurns !== undefined && usage.turnsUsed > budget.maxTurns) {
+    return `turnsUsed (${usage.turnsUsed}) > maxTurns (${budget.maxTurns})`
+  }
+  if (budget.maxToolCalls !== undefined && usage.toolCallsUsed > budget.maxToolCalls) {
+    return `toolCallsUsed (${usage.toolCallsUsed}) > maxToolCalls (${budget.maxToolCalls})`
+  }
+  return undefined
 }
 
 /** Directory a task's code lives in: its worktree when it has one, else the workspace root. */

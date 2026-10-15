@@ -1,20 +1,24 @@
 import {
+  claimTask,
   createTask,
   initProject,
   loadBoard,
   lockContract,
   planTournament,
   resolveTournament,
+  setTaskBudget,
   submitQAReceipt,
   updateTaskStatus,
   verifyReleaseReady,
 } from "../board/board.js"
 import type {
+  ClaimTaskInput,
   CreateTaskInput,
   InitProjectInput,
   LockContractInput,
   PlanTournamentInput,
   ResolveTournamentInput,
+  SetTaskBudgetInput,
   SubmitQAReceiptInput,
   TaskStatus,
 } from "../board/types.js"
@@ -97,6 +101,15 @@ export function registerOrgTools(editor: any, rootDir: string): void {
         owner: { type: "string", description: "Responsible role: 'staff-backend' | 'staff-ui' | 'architect'" },
         ownedPaths: { type: "array", items: { type: "string" }, description: "Disjoint file paths owned by this task" },
         worktree: { type: "string", description: "Optional isolated Git worktree path" },
+        budget: {
+          type: "object",
+          description: "Optional spend/step budget ceiling for this task",
+          properties: {
+            maxTokens: { type: "number" },
+            maxTurns: { type: "number" },
+            maxToolCalls: { type: "number" },
+          },
+        },
       },
       required: ["id", "title", "owner", "ownedPaths"],
     },
@@ -104,6 +117,58 @@ export function registerOrgTools(editor: any, rootDir: string): void {
     execute: async (input: CreateTaskInput) => {
       const task = await createTask(rootDir, input)
       return { output: task, content: `Registered task [${task.id}] assigned to ${task.owner}` }
+    },
+  })
+
+
+  editor.add({
+    name: "claim_task",
+    description:
+      "Bind the current subagent session to a board task (`taskId`) and transition it to `in_progress` so per-task spend limits and `/doctor` track it.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task ID being claimed by this session" },
+        sessionID: { type: "string", description: "Optional session ID (defaults to active session)" },
+      },
+      required: ["taskId"],
+    },
+    output: { type: "object" },
+    execute: async (input: ClaimTaskInput, context?: any) => {
+      const task = await claimTask(rootDir, {
+        taskId: input.taskId,
+        sessionID: input.sessionID ?? context?.sessionID,
+      })
+      return { output: task, content: `Claimed task [${task.id}] for session ${task.claimedBySessionID}` }
+    },
+  })
+
+  editor.add({
+    name: "set_task_budget",
+    description:
+      "Set or raise the spend/step budget (`maxTokens`, `maxTurns`, `maxToolCalls`) for a board task, optionally resetting accumulated usage counters.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task ID to configure" },
+        budget: {
+          type: "object",
+          properties: {
+            maxTokens: { type: "number" },
+            maxTurns: { type: "number" },
+            maxToolCalls: { type: "number" },
+          },
+        },
+        resetUsage: { type: "boolean", description: "Reset accumulated usage counters to 0" },
+      },
+      required: ["taskId", "budget"],
+    },
+    output: { type: "object" },
+    execute: async (input: SetTaskBudgetInput) => {
+      const task = await setTaskBudget(rootDir, input)
+      return { output: task, content: `Updated budget for task [${task.id}]: ${JSON.stringify(task.budget)}` }
     },
   })
 

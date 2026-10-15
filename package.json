@@ -1,6 +1,6 @@
 {
   "name": "@heretek-ai/swarmos",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Omni-Harness & Autonomous Multi-Agent Software Company, GUI Studio, Deep Research & Office Suite for OpenCode V2",
   "type": "module",
   "main": "./dist/index.js",

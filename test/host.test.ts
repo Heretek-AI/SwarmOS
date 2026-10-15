@@ -136,8 +136,9 @@ describe("SwarmOS v0.6.0 host contract, /doctor & telemetry", () => {
     expect(report.capabilities.find((c) => c.id === "tool.hook")?.ok).toBe(true)
   })
 
-  it.skipIf(!process.env.OPENCODE_V2_SRC)("matches the real OpenCode V2 source in OPENCODE_V2_SRC", async () => {
-    const report = await checkHostContract(process.env.OPENCODE_V2_SRC!)
+  it("matches the pinned OpenCode V2 (v2.0.26) host contract source", async () => {
+    const targetSrc = process.env.OPENCODE_V2_SRC ?? path.resolve(import.meta.dir, "fixtures/opencode-v2-ref")
+    const report = await checkHostContract(targetSrc)
     const failures = report.capabilities.filter((c) => c.required && !c.ok).map((c) => c.id)
     expect(failures).toEqual([])
     expect(HOST_CONTRACT.length).toBeGreaterThan(0)

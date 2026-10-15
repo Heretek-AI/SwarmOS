@@ -1426,6 +1426,57 @@ async function cleanupTournamentWorktrees(rootDir, tournament) {
   return { removedWorktrees, deletedBranches };
 }
 
+// src/host/session-state.ts
+var sessions = new Map;
+var MAX_TOUCHED = 50;
+function getSessionState(sessionID) {
+  const sid = sessionID ?? "default";
+  let state = sessions.get(sid);
+  if (!state) {
+    state = {
+      sessionID: sid,
+      startedAt: Date.now(),
+      toolCalls: 0,
+      toolFailures: 0,
+      breakerFires: 0,
+      turns: 0,
+      touchedFiles: [],
+      taint: [],
+      openIncidents: [],
+      injectedLessons: new Set
+    };
+    sessions.set(sid, state);
+  }
+  return state;
+}
+function listSessionStates() {
+  return Array.from(sessions.values());
+}
+function resetSessionStates() {
+  sessions.clear();
+}
+function touchFile(state, file) {
+  const idx = state.touchedFiles.indexOf(file);
+  if (idx >= 0)
+    state.touchedFiles.splice(idx, 1);
+  state.touchedFiles.push(file);
+  if (state.touchedFiles.length > MAX_TOUCHED)
+    state.touchedFiles.shift();
+}
+function eventTargetPath(event) {
+  const input = event?.input;
+  if (!input || typeof input !== "object")
+    return;
+  for (const key of ["path", "filePath", "file", "target"]) {
+    if (typeof input[key] === "string" && input[key])
+      return input[key];
+  }
+  return;
+}
+function isFailedEvent(event) {
+  return event?.status === "error";
+}
+
 // src/board/board.ts
 var BOARD_VERSION = "4.1.0";
 var boardLocks = new Map;
@@ -1534,6 +1585,9 @@ async function createTask(rootDir, input) {
       ownedPaths: input.ownedPaths,
       worktree: input.worktree,
       ...input.tournamentId ? { tournamentId: input.tournamentId } : {},
+      ...existing?.claimedBySessionID ? { claimedBySessionID: existing.claimedBySessionID } : {},
+      ...input.budget ?? existing?.budget ? { budget: input.budget ?? existing?.budget } : {},
+      usage: existing?.usage ?? { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 },
       status: existing?.status ?? "pending",
       qaReceipts: existing?.qaReceipts ?? [],
       createdAt: existing?.createdAt ?? now,
@@ -1557,6 +1611,59 @@ async function updateTaskStatus(rootDir, taskId, status) {
     task.updatedAt = new Date().toISOString();
     return task;
   });
+}
+async function claimTask(rootDir, input) {
+  const sid = input.sessionID ?? "default";
+  const state = getSessionState(sid);
+  state.taskId = input.taskId;
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === input.taskId);
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${input.taskId}`);
+    }
+    task.claimedBySessionID = sid;
+    if (task.status === "pending") {
+      task.status = "in_progress";
+    }
+    task.usage ??= { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 };
+    task.updatedAt = new Date().toISOString();
+    return task;
+  });
+}
+async function setTaskBudget(rootDir, input) {
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === input.taskId);
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${input.taskId}`);
+    }
+    task.budget = { ...task.budget, ...input.budget };
+    if (input.resetUsage || !task.usage) {
+      task.usage = { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 };
+    } else {
+      const reason = evaluateTaskBudgetViolation(task.budget, task.usage);
+      task.usage.overBudget = Boolean(reason);
+      if (reason)
+        task.usage.overBudgetReason = reason;
+      else
+        delete task.usage.overBudgetReason;
+    }
+    task.updatedAt = new Date().toISOString();
+    return task;
+  });
+}
+function evaluateTaskBudgetViolation(budget, usage) {
+  if (!budget || !usage)
+    return;
+  if (budget.maxTokens !== undefined && usage.tokensUsed > budget.maxTokens) {
+    return `tokensUsed (${usage.tokensUsed}) > maxTokens (${budget.maxTokens})`;
+  }
+  if (budget.maxTurns !== undefined && usage.turnsUsed > budget.maxTurns) {
+    return `turnsUsed (${usage.turnsUsed}) > maxTurns (${budget.maxTurns})`;
+  }
+  if (budget.maxToolCalls !== undefined && usage.toolCallsUsed > budget.maxToolCalls) {
+    return `toolCallsUsed (${usage.toolCallsUsed}) > maxToolCalls (${budget.maxToolCalls})`;
+  }
+  return;
 }
 function taskWorkdir(rootDir, task) {
   return task.worktree ? path4.resolve(rootDir, task.worktree) : path4.resolve(rootDir);
@@ -2994,7 +3101,16 @@ function registerOrgTools(editor, rootDir) {
         title: { type: "string", description: "Task summary and acceptance criteria" },
         owner: { type: "string", description: "Responsible role: 'staff-backend' | 'staff-ui' | 'architect'" },
         ownedPaths: { type: "array", items: { type: "string" }, description: "Disjoint file paths owned by this task" },
-        worktree: { type: "string", description: "Optional isolated Git worktree path" }
+        worktree: { type: "string", description: "Optional isolated Git worktree path" },
+        budget: {
+          type: "object",
+          description: "Optional spend/step budget ceiling for this task",
+          properties: {
+            maxTokens: { type: "number" },
+            maxTurns: { type: "number" },
+            maxToolCalls: { type: "number" }
+          }
+        }
       },
       required: ["id", "title", "owner", "ownedPaths"]
     },
@@ -3002,6 +3118,53 @@ function registerOrgTools(editor, rootDir) {
     execute: async (input) => {
       const task = await createTask(rootDir, input);
       return { output: task, content: `Registered task [${task.id}] assigned to ${task.owner}` };
+    }
+  });
+  editor.add({
+    name: "claim_task",
+    description: "Bind the current subagent session to a board task (`taskId`) and transition it to `in_progress` so per-task spend limits and `/doctor` track it.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task ID being claimed by this session" },
+        sessionID: { type: "string", description: "Optional session ID (defaults to active session)" }
+      },
+      required: ["taskId"]
+    },
+    output: { type: "object" },
+    execute: async (input, context) => {
+      const task = await claimTask(rootDir, {
+        taskId: input.taskId,
+        sessionID: input.sessionID ?? context?.sessionID
+      });
+      return { output: task, content: `Claimed task [${task.id}] for session ${task.claimedBySessionID}` };
+    }
+  });
+  editor.add({
+    name: "set_task_budget",
+    description: "Set or raise the spend/step budget (`maxTokens`, `maxTurns`, `maxToolCalls`) for a board task, optionally resetting accumulated usage counters.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task ID to configure" },
+        budget: {
+          type: "object",
+          properties: {
+            maxTokens: { type: "number" },
+            maxTurns: { type: "number" },
+            maxToolCalls: { type: "number" }
+          }
+        },
+        resetUsage: { type: "boolean", description: "Reset accumulated usage counters to 0" }
+      },
+      required: ["taskId", "budget"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const task = await setTaskBudget(rootDir, input);
+      return { output: task, content: `Updated budget for task [${task.id}]: ${JSON.stringify(task.budget)}` };
     }
   });
   editor.add({
@@ -3399,7 +3562,7 @@ function registerUITools(editor) {
 }
 
 // src/version.ts
-var SWARMOS_VERSION = "0.8.0";
+var SWARMOS_VERSION = "0.9.0";
 
 // src/omni/artifacts.ts
 import * as fs6 from "fs/promises";
@@ -3675,59 +3838,6 @@ function registerCheckpointTools(editor, rootDir) {
 // src/omni/memory.ts
 import * as fs8 from "fs/promises";
 import * as path9 from "path";
-
-// src/host/session-state.ts
-var sessions = new Map;
-var MAX_TOUCHED = 50;
-function getSessionState(sessionID) {
-  const sid = sessionID ?? "default";
-  let state = sessions.get(sid);
-  if (!state) {
-    state = {
-      sessionID: sid,
-      startedAt: Date.now(),
-      toolCalls: 0,
-      toolFailures: 0,
-      breakerFires: 0,
-      turns: 0,
-      touchedFiles: [],
-      taint: [],
-      openIncidents: [],
-      injectedLessons: new Set
-    };
-    sessions.set(sid, state);
-  }
-  return state;
-}
-function listSessionStates() {
-  return Array.from(sessions.values());
-}
-function resetSessionStates() {
-  sessions.clear();
-}
-function touchFile(state, file) {
-  const idx = state.touchedFiles.indexOf(file);
-  if (idx >= 0)
-    state.touchedFiles.splice(idx, 1);
-  state.touchedFiles.push(file);
-  if (state.touchedFiles.length > MAX_TOUCHED)
-    state.touchedFiles.shift();
-}
-function eventTargetPath(event) {
-  const input = event?.input;
-  if (!input || typeof input !== "object")
-    return;
-  for (const key of ["path", "filePath", "file", "target"]) {
-    if (typeof input[key] === "string" && input[key])
-      return input[key];
-  }
-  return;
-}
-function isFailedEvent(event) {
-  return event?.status === "error";
-}
-
-// src/omni/memory.ts
 function getMemoryFilePath(rootDir) {
   return path9.join(rootDir, ".opencode", "memory", "lessons.json");
 }
@@ -4676,8 +4786,8 @@ _SwarmOS setup has not run in this workspace._`;
 var ROLE_NAMESPACES = {
   director: ["org", "repo", "memory", "artifacts", "swarmos"],
   architect: ["org", "repo", "fs", "checkpoints"],
-  manager: ["org", "repo", "verify", "artifacts"],
-  "staff-backend": ["fs", "repo", "verify", "checkpoints", "memory", "artifacts"],
+  manager: ["org", "repo", "verify", "artifacts", "replay"],
+  "staff-backend": ["fs", "repo", "lsp", "verify", "checkpoints", "memory", "artifacts"],
   "staff-ui": ["fs", "ui", "verify", "checkpoints", "artifacts", "gui"],
   "qa-adversary": ["verify", "org", "repo", "ui", "fs"],
   "release-ops": ["verify", "org", "repo"],
@@ -5488,12 +5598,243 @@ async function registerUntaintCommand(ctx) {
 
 // src/diagnostics/runner.ts
 import { execFile as execFile4 } from "child_process";
-import * as path16 from "path";
+import * as path17 from "path";
 import { promisify as promisify4 } from "util";
+
+// src/diagnostics/warm-lsp.ts
+import * as fs13 from "fs/promises";
+import * as path16 from "path";
+var diagCache = new Map;
+var warmDiagnosticStats = {
+  cacheHits: 0,
+  cacheMisses: 0,
+  parallelBatches: 0,
+  warmTsServerQueries: 0
+};
+function clearDiagnosticCache() {
+  diagCache.clear();
+  Object.assign(warmDiagnosticStats, {
+    cacheHits: 0,
+    cacheMisses: 0,
+    parallelBatches: 0,
+    warmTsServerQueries: 0
+  });
+}
+async function getCachedDiagnostic(absPath, compute) {
+  try {
+    const st = await fs13.stat(absPath);
+    const cached = diagCache.get(absPath);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+      warmDiagnosticStats.cacheHits++;
+      return cached.diagnostic;
+    }
+    warmDiagnosticStats.cacheMisses++;
+    const diagnostic = await compute();
+    diagCache.set(absPath, {
+      mtimeMs: st.mtimeMs,
+      size: st.size,
+      diagnostic,
+      checkedAt: Date.now()
+    });
+    return diagnostic;
+  } catch {
+    warmDiagnosticStats.cacheMisses++;
+    return compute();
+  }
+}
+async function runParallelDiagnostics(rootDir, filePaths, runner, concurrency = 4) {
+  if (filePaths.length === 0)
+    return [];
+  warmDiagnosticStats.parallelBatches++;
+  const unique = [...new Set(filePaths)];
+  const results = new Array(unique.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, unique.length) }, async () => {
+    while (cursor < unique.length) {
+      const idx = cursor++;
+      const rel = unique[idx];
+      const abs = path16.resolve(rootDir, rel);
+      results[idx] = await getCachedDiagnostic(abs, () => runner(rootDir, rel));
+    }
+  });
+  await Promise.all(workers);
+  return results.filter((r) => Boolean(r));
+}
+var warmServers = new Map;
+function shutdownWarmLspServers() {
+  for (const [, srv] of warmServers) {
+    if (srv.idleTimer)
+      clearTimeout(srv.idleTimer);
+    try {
+      srv.proc.kill();
+    } catch {}
+  }
+  warmServers.clear();
+}
+function getWarmLspStatus(rootDir) {
+  return {
+    rootDir: path16.resolve(rootDir),
+    activeDaemons: warmServers.size,
+    cachedFiles: diagCache.size,
+    stats: { ...warmDiagnosticStats }
+  };
+}
+async function walkWorkspaceFiles(dir, rootDir, acc = [], max = 600) {
+  if (acc.length >= max)
+    return acc;
+  let entries = [];
+  try {
+    entries = await fs13.readdir(dir, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const e of entries) {
+    if (acc.length >= max)
+      break;
+    if (e.name.startsWith(".") || ["node_modules", "dist", "build", ".opencode", ".worktrees", "target"].includes(e.name))
+      continue;
+    const full = path16.join(dir, e.name);
+    if (e.isDirectory())
+      await walkWorkspaceFiles(full, rootDir, acc, max);
+    else if (e.isFile() && /\.(?:[cm]?[jt]sx?|py|go|rs)$/.test(e.name)) {
+      acc.push(path16.relative(rootDir, full).split(path16.sep).join("/"));
+    }
+  }
+  return acc;
+}
+async function findSymbolDefinitions(rootDir, symbolName) {
+  const files = await walkWorkspaceFiles(rootDir, rootDir);
+  const escaped = symbolName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const defRe = new RegExp(`(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?(?:function\\*?\\s+|class\\s+|interface\\s+|type\\s+|const\\s+|let\\s+|var\\s+|enum\\s+|def\\s+|fn\\s+|struct\\s+|trait\\s+|func\\s+(?:\\([^)]*\\)\\s*)?)(${escaped})\\b`);
+  const hits = [];
+  for (const rel of files) {
+    if (hits.length >= 25)
+      break;
+    try {
+      const raw = await fs13.readFile(path16.resolve(rootDir, rel), "utf8");
+      const lines = raw.split(`
+`);
+      for (let i = 0;i < lines.length; i++) {
+        const m = defRe.exec(lines[i]);
+        if (m) {
+          hits.push({
+            file: rel,
+            line: i + 1,
+            col: Math.max(1, lines[i].indexOf(symbolName) + 1),
+            preview: lines[i].trim().slice(0, 140)
+          });
+        }
+      }
+    } catch {}
+  }
+  return hits;
+}
+async function findSymbolReferences(rootDir, symbolName) {
+  const files = await walkWorkspaceFiles(rootDir, rootDir);
+  const escaped = symbolName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const refRe = new RegExp(`\\b${escaped}\\b`);
+  const hits = [];
+  for (const rel of files) {
+    if (hits.length >= 60)
+      break;
+    try {
+      const raw = await fs13.readFile(path16.resolve(rootDir, rel), "utf8");
+      const lines = raw.split(`
+`);
+      for (let i = 0;i < lines.length; i++) {
+        if (refRe.test(lines[i])) {
+          hits.push({
+            file: rel,
+            line: i + 1,
+            col: Math.max(1, lines[i].indexOf(symbolName) + 1),
+            preview: lines[i].trim().slice(0, 140)
+          });
+          if (hits.length >= 60)
+            break;
+        }
+      }
+    } catch {}
+  }
+  return hits;
+}
+function registerLspTools(editor, rootDir, runner) {
+  editor.namespace({
+    name: "lsp",
+    description: "Warm Persistent Diagnostics & Symbol Intelligence (`tools.lsp.*`): parallel cached file diagnostics, symbol definitions, and workspace-wide references."
+  });
+  editor.add({
+    name: "diagnostics",
+    description: "Run parallel warm-cached syntax and type diagnostics across one or more files.",
+    options: { namespace: "lsp", codemode: true, pinned: false },
+    input: {
+      type: "object",
+      properties: {
+        paths: { type: "array", items: { type: "string" }, description: "File paths to check" }
+      },
+      required: ["paths"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const diagnostics = await runParallelDiagnostics(rootDir, input.paths ?? [], runner);
+      return {
+        output: { clean: diagnostics.length === 0, diagnostics, stats: getWarmLspStatus(rootDir).stats },
+        content: diagnostics.length === 0 ? "All checked files are clean (0 diagnostics)." : diagnostics.join(`
+`)
+      };
+    }
+  });
+  editor.add({
+    name: "definitions",
+    description: "Locate definition sites (`file:line:col`) for a function, class, interface, type, or struct symbol across the workspace.",
+    options: { namespace: "lsp", codemode: true, pinned: false },
+    input: {
+      type: "object",
+      properties: {
+        symbol: { type: "string", description: "Exact symbol name to locate" }
+      },
+      required: ["symbol"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const locations = await findSymbolDefinitions(rootDir, input.symbol);
+      return { output: { symbol: input.symbol, locations }, content: JSON.stringify(locations, null, 2) };
+    }
+  });
+  editor.add({
+    name: "references",
+    description: "Find all references and call sites (`file:line:col`) of `symbol` across the repository.",
+    options: { namespace: "lsp", codemode: true, pinned: false },
+    input: {
+      type: "object",
+      properties: {
+        symbol: { type: "string", description: "Exact symbol name to search for" }
+      },
+      required: ["symbol"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const locations = await findSymbolReferences(rootDir, input.symbol);
+      return { output: { symbol: input.symbol, locations }, content: JSON.stringify(locations, null, 2) };
+    }
+  });
+  editor.add({
+    name: "status",
+    description: "Inspect warm diagnostic cache hit/miss counters and active language daemon status.",
+    options: { namespace: "lsp", codemode: true, pinned: false },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const status = getWarmLspStatus(rootDir);
+      return { output: status, content: JSON.stringify(status, null, 2) };
+    }
+  });
+}
+
+// src/diagnostics/runner.ts
 var execFileAsync4 = promisify4(execFile4);
 async function runQuickDiagnostics(rootDir, filePath, options = {}) {
-  const abs = path16.resolve(rootDir, filePath);
-  const ext = path16.extname(abs).toLowerCase();
+  const abs = path17.resolve(rootDir, filePath);
+  const ext = path17.extname(abs).toLowerCase();
   const timeout = options.timeoutMs ?? 6000;
   const maxLines = options.maxLines ?? 30;
   try {
@@ -5584,8 +5925,8 @@ async function registerDiagnosticHook(ctx, rootDir) {
     const targetPaths = extractMutatedPaths(event);
     if (targetPaths.length === 0)
       return;
-    const results = await Promise.all(targetPaths.map((p) => runQuickDiagnostics(rootDir, p)));
-    const diag = results.filter(Boolean).join("");
+    const results = await runParallelDiagnostics(rootDir, targetPaths, (r, p) => runQuickDiagnostics(r, p));
+    const diag = results.join("");
     if (!diag)
       return;
     if (Array.isArray(event.result?.content)) {
@@ -5595,6 +5936,366 @@ async function registerDiagnosticHook(ctx, rootDir) {
     } else if (event.result && typeof event.result === "object") {
       event.result.diagnostics = diag;
     }
+  });
+}
+
+// src/omni/budget.ts
+var BLOCKED_WHEN_OVER_BUDGET = new Set(["edit", "write", "patch", "multiedit", "apply_patch", "shell", "bash", "subagent"]);
+function resolveSessionTask(board, sessionID, agent) {
+  const sid = sessionID ?? "default";
+  const state = getSessionState(sid);
+  if (state.taskId) {
+    const byId = board.tasks.find((t) => t.id === state.taskId);
+    if (byId)
+      return byId;
+  }
+  const byClaim = board.tasks.find((t) => t.claimedBySessionID === sid && t.status !== "superseded" && t.status !== "verified");
+  if (byClaim)
+    return byClaim;
+  if (agent) {
+    const activeForRole = board.tasks.filter((t) => t.owner === agent && (t.status === "in_progress" || t.status === "pending" || t.status === "qa_rejected"));
+    if (activeForRole.length === 1)
+      return activeForRole[0];
+  }
+  return;
+}
+async function recordTaskSpend(rootDir, input) {
+  return withBoardLock(rootDir, (board) => {
+    const task = resolveSessionTask(board, input.sessionID, input.agent);
+    if (!task)
+      return;
+    task.usage ??= { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 };
+    if (input.tokensDelta)
+      task.usage.tokensUsed += Math.max(0, input.tokensDelta);
+    if (input.turnsDelta)
+      task.usage.turnsUsed += Math.max(0, input.turnsDelta);
+    if (input.toolCallsDelta)
+      task.usage.toolCallsUsed += Math.max(0, input.toolCallsDelta);
+    task.usage.updatedAt = new Date().toISOString();
+    const reason = evaluateTaskBudgetViolation(task.budget, task.usage);
+    if (reason) {
+      task.usage.overBudget = true;
+      task.usage.overBudgetReason = reason;
+    } else {
+      task.usage.overBudget = false;
+      delete task.usage.overBudgetReason;
+    }
+    return task;
+  });
+}
+function createTaskBudgetEvaluator() {
+  return (event, board) => {
+    const agent = (event.agent ?? "").toLowerCase();
+    if (agent === "director" || agent === "manager")
+      return;
+    const action = (event.action ?? "").toLowerCase();
+    if (!BLOCKED_WHEN_OVER_BUDGET.has(action))
+      return;
+    const task = resolveSessionTask(board, event.sessionID, agent);
+    if (!task || !task.budget)
+      return;
+    const reason = task.usage?.overBudgetReason ?? evaluateTaskBudgetViolation(task.budget, task.usage);
+    if (!reason && !task.usage?.overBudget)
+      return;
+    return {
+      allowed: false,
+      reason: `SwarmOS Task Budget Guard: Task [${task.id}] ("${task.title}") exceeded its spend/step limit (${reason ?? "over budget"}). Stop execution immediately and report your current state back to "manager" so they can raise the budget via \`tools.org.set_task_budget\` or re-scope the task.`
+    };
+  };
+}
+async function registerTaskBudgetHooks(ctx, rootDir) {
+  if (ctx.tool?.hook) {
+    await ctx.tool.hook("execute.after", async (event) => {
+      const task = await recordTaskSpend(rootDir, {
+        sessionID: event?.sessionID,
+        agent: event?.agent,
+        toolCallsDelta: 1
+      });
+      if (task?.usage?.overBudget) {
+        const notice = `
+
+<task-budget-exceeded task="${task.id}">
+` + `SWARMOS TASK BUDGET LIMIT REACHED: Task [${task.id}] exceeded its budget (${task.usage.overBudgetReason}). ` + `Further file edits and shell commands are locked for this task. Summarize your progress and return to "manager".
+` + `</task-budget-exceeded>`;
+        if (event.status === "completed" && event.result) {
+          if (Array.isArray(event.result.content)) {
+            event.result.content = [...event.result.content, { type: "text", text: notice }];
+          } else if (typeof event.result.content === "string" && !event.result.content.includes("<task-budget-exceeded")) {
+            event.result.content += notice;
+          }
+        }
+      }
+    });
+  }
+  if (ctx.session?.hook) {
+    await ctx.session.hook("generate", async (event) => {
+      if (event?.agent === "compaction" || event?.kind === "compaction")
+        return;
+      const u = event?.usage ?? event?.tokens ?? event?.result?.usage;
+      const tok = u && typeof u === "object" ? (Number(u.input ?? u.inputTokens ?? u.prompt_tokens ?? 0) || 0) + (Number(u.output ?? u.outputTokens ?? u.completion_tokens ?? 0) || 0) + (Number(u.cacheRead ?? u.cache?.read ?? u.cache_read_input_tokens ?? 0) || 0) : 0;
+      await recordTaskSpend(rootDir, {
+        sessionID: event?.sessionID,
+        agent: event?.agent,
+        turnsDelta: 1,
+        tokensDelta: tok
+      });
+    });
+  }
+}
+
+// src/omni/replay.ts
+import * as fs14 from "fs/promises";
+import * as path18 from "path";
+var COPY_IGNORE = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  ".opencode",
+  ".worktrees",
+  "coverage",
+  "__pycache__",
+  "target",
+  "bench"
+]);
+async function copyWorkspaceSnapshot(srcDir, destDir) {
+  await fs14.mkdir(destDir, { recursive: true });
+  let entries = [];
+  try {
+    entries = await fs14.readdir(srcDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (COPY_IGNORE.has(entry.name))
+      continue;
+    const s = path18.join(srcDir, entry.name);
+    const d = path18.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      await copyWorkspaceSnapshot(s, d);
+    } else if (entry.isFile()) {
+      await fs14.copyFile(s, d);
+    }
+  }
+}
+async function listReplayableSessions(rootDir) {
+  const files = await listTelemetryFiles(rootDir);
+  const results = [];
+  for (const file of files) {
+    const records = await readTelemetryFile(file);
+    if (records.length === 0)
+      continue;
+    const summary = summarizeTelemetry(records);
+    results.push({
+      ...summary,
+      file,
+      hasFailures: summary.toolFailures > 0 || summary.breakerFires > 0
+    });
+  }
+  return results.sort((a, b) => Number(b.hasFailures) - Number(a.hasFailures) || b.toolFailures - a.toolFailures);
+}
+async function loadSessionTelemetry(rootDir, sessionID) {
+  const safe = `${sessionID.replace(/[^A-Za-z0-9_.-]/g, "_") || "default"}.jsonl`;
+  const direct = path18.join(getTelemetryDir(rootDir), safe);
+  try {
+    return await readTelemetryFile(direct);
+  } catch {
+    const files = await listTelemetryFiles(rootDir);
+    for (const f of files) {
+      const records = await readTelemetryFile(f);
+      if (records.some((r) => r.sessionID === sessionID))
+        return records;
+    }
+    return [];
+  }
+}
+async function exportSessionToBenchmark(rootDir, input) {
+  const records = await loadSessionTelemetry(rootDir, input.sessionID);
+  if (records.length === 0) {
+    throw new Error(`SwarmOS Replay: no telemetry records found for session "${input.sessionID}".`);
+  }
+  const summary = summarizeTelemetry(records);
+  const slug = (input.taskId ?? `replay-${input.sessionID}`).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  const outTasksDir = input.outTasksDir ? path18.resolve(rootDir, input.outTasksDir) : path18.join(rootDir, "bench", "tasks");
+  const taskDir = path18.join(outTasksDir, slug);
+  const repoDir = path18.join(taskDir, "repo");
+  const solutionDir = path18.join(taskDir, "solution");
+  await fs14.rm(taskDir, { recursive: true, force: true });
+  await copyWorkspaceSnapshot(rootDir, repoDir);
+  await copyWorkspaceSnapshot(rootDir, solutionDir);
+  let verifyCommand = input.verifyCommand;
+  if (!verifyCommand) {
+    const checks = await discoverChecks(rootDir);
+    const testCheck = checks.find((c) => c.kind === "test") ?? checks[0];
+    verifyCommand = testCheck?.command ?? "bun test";
+  }
+  const prompt = input.prompt ?? summary.prompt ?? `Resolve the regression reproduced from session ${input.sessionID} (${summary.toolFailures} tool failure(s), ${summary.breakerFires} circuit-breaker intervention(s)).`;
+  const taskMeta = {
+    id: slug,
+    category: input.category ?? "regression",
+    title: input.title ?? `Session Replay Regression (${input.sessionID})`,
+    prompt,
+    verify: verifyCommand,
+    timeoutSec: input.timeoutSec ?? 300,
+    sourceSessionID: input.sessionID,
+    ...summary.gitHead ? { gitHead: summary.gitHead } : {}
+  };
+  const taskJsonPath = path18.join(taskDir, "task.json");
+  const tracePath = path18.join(taskDir, "replay-trace.json");
+  await fs14.writeFile(taskJsonPath, JSON.stringify(taskMeta, null, 2), "utf8");
+  await fs14.writeFile(tracePath, JSON.stringify(records, null, 2), "utf8");
+  return {
+    taskId: slug,
+    taskDir,
+    taskJsonPath,
+    tracePath,
+    sourceSessionID: input.sessionID,
+    recordCount: records.length,
+    verifyCommand
+  };
+}
+async function replaySessionTrace(records, stepExecutor) {
+  const sessionID = records[0]?.sessionID ?? "replay";
+  const toolRecords = records.filter((r) => r.kind === "tool");
+  const steps = [];
+  let reproducedFailures = 0;
+  let breakerTriggered = 0;
+  for (let idx = 0;idx < toolRecords.length; idx++) {
+    const rec = toolRecords[idx];
+    const recordedStatus = rec.status === "error" ? "error" : "completed";
+    let replayedStatus = recordedStatus;
+    let error = rec.error;
+    if (stepExecutor) {
+      const outcome = await stepExecutor(rec, idx);
+      replayedStatus = outcome.status;
+      error = outcome.error ?? error;
+    }
+    if (replayedStatus === "error")
+      reproducedFailures++;
+    if (rec.breaker)
+      breakerTriggered++;
+    steps.push({
+      index: idx + 1,
+      tool: rec.tool ?? "unknown",
+      ...rec.target ? { target: rec.target } : {},
+      recordedStatus,
+      replayedStatus,
+      breaker: Boolean(rec.breaker),
+      ...error ? { error } : {}
+    });
+  }
+  return {
+    sessionID,
+    totalSteps: steps.length,
+    reproducedFailures,
+    breakerTriggered,
+    steps
+  };
+}
+function registerReplayTools(editor, rootDir) {
+  editor.namespace({
+    name: "replay",
+    description: "Session Replay & Regression Benchmark Exporter: inspect recorded telemetry sessions, replay tool traces, and convert failures into `bench/tasks/` regression tests."
+  });
+  editor.add({
+    name: "list_sessions",
+    description: "List recorded telemetry sessions in `.opencode/telemetry/`, sorted with failed/circuit-breaker sessions first.",
+    options: { namespace: "replay", codemode: true, pinned: false },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const sessions = await listReplayableSessions(rootDir);
+      return { output: { sessions }, content: JSON.stringify(sessions, null, 2) };
+    }
+  });
+  editor.add({
+    name: "export_benchmark",
+    description: "Export a recorded telemetry session into a reproducible benchmark regression task under `bench/tasks/<taskId>/` (`task.json`, `repo/`, `replay-trace.json`).",
+    options: { namespace: "replay", codemode: true, pinned: false },
+    input: {
+      type: "object",
+      properties: {
+        sessionID: { type: "string", description: "Recorded session ID to export" },
+        taskId: { type: "string", description: "Optional benchmark task ID (default 'replay-<sessionID>')" },
+        category: { type: "string", description: "Benchmark category (default 'regression')" },
+        title: { type: "string", description: "Human-readable title" },
+        prompt: { type: "string", description: "Override task prompt" },
+        verifyCommand: { type: "string", description: "Override verification command" },
+        outTasksDir: { type: "string", description: "Optional output directory relative to rootDir (default 'bench/tasks')" }
+      },
+      required: ["sessionID"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const exported = await exportSessionToBenchmark(rootDir, input);
+      return {
+        output: exported,
+        content: `Exported session [${exported.sourceSessionID}] (${exported.recordCount} record(s)) to benchmark task [${exported.taskId}] at ${exported.taskDir}`
+      };
+    }
+  });
+  editor.add({
+    name: "replay_session",
+    description: "Replay a recorded session's tool-call timeline and return its step-by-step failure and circuit-breaker report.",
+    options: { namespace: "replay", codemode: true, pinned: false },
+    input: {
+      type: "object",
+      properties: {
+        sessionID: { type: "string", description: "Recorded session ID to replay" }
+      },
+      required: ["sessionID"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const records = await loadSessionTelemetry(rootDir, input.sessionID);
+      if (records.length === 0)
+        throw new Error(`SwarmOS Replay: session "${input.sessionID}" not found`);
+      const report = await replaySessionTrace(records);
+      return { output: report, content: JSON.stringify(report, null, 2) };
+    }
+  });
+}
+async function registerReplayCommand(ctx, rootDir) {
+  if (!ctx.command?.transform)
+    return;
+  await ctx.command.transform((editor) => {
+    editor.add({
+      name: "replay",
+      description: "List recorded telemetry sessions (highlighting failures/breaker fires) or export a session into bench/tasks/",
+      execute: async (input) => {
+        const arg = String(input?.prompt?.text ?? input?.prompt ?? "").trim();
+        if (arg) {
+          const exported = await exportSessionToBenchmark(rootDir, { sessionID: arg });
+          if (ctx.session?.prompt) {
+            await ctx.session.prompt({
+              sessionID: input.sessionID,
+              text: `Exported session \`${exported.sourceSessionID}\` to regression benchmark task \`${exported.taskId}\` (\`${exported.taskDir}\`).`,
+              delivery: "steer"
+            });
+          }
+          return;
+        }
+        const sessions = await listReplayableSessions(rootDir);
+        const lines = [
+          "# SwarmOS Recorded Sessions & Replay Candidates",
+          "",
+          sessions.length === 0 ? "_No recorded telemetry sessions in `.opencode/telemetry/`._" : "| Session | Turns | Tool calls | Failures | Breaker fires | Prompt |",
+          ...sessions.length > 0 ? [
+            "| :--- | ---: | ---: | ---: | ---: | :--- |",
+            ...sessions.map((s) => `| \`${s.sessionID}\` | ${s.turns} | ${s.toolCalls} | ${s.toolFailures} | ${s.breakerFires} | ${(s.prompt ?? "-").slice(0, 60).replace(/\n/g, " ")} |`),
+            "",
+            "Run `/replay <sessionID>` or `tools.replay.export_benchmark({ sessionID })` to turn a session into a regression benchmark task."
+          ] : []
+        ];
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input.sessionID,
+            text: lines.join(`
+`),
+            delivery: "steer"
+          });
+        }
+      }
+    });
   });
 }
 
@@ -5737,8 +6438,8 @@ async function registerCircuitBreakerHook(ctx) {
 
 // src/omni/gui-studio.ts
 import { execFile as execFile5 } from "child_process";
-import * as fs13 from "fs/promises";
-import * as path17 from "path";
+import * as fs15 from "fs/promises";
+import * as path19 from "path";
 import { promisify as promisify5 } from "util";
 var execFileAsync5 = promisify5(execFile5);
 var VISUAL_QUALITY_CHECKLIST = {
@@ -5762,9 +6463,9 @@ var VISUAL_QUALITY_CHECKLIST = {
   ]
 };
 async function captureDesktopWindow(rootDir, outputName = "desktop_gui_preview.png") {
-  const previewDir = path17.join(rootDir, ".opencode", "artifacts", "previews");
-  await fs13.mkdir(previewDir, { recursive: true });
-  const outPath = path17.join(previewDir, path17.basename(outputName));
+  const previewDir = path19.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs15.mkdir(previewDir, { recursive: true });
+  const outPath = path19.join(previewDir, path19.basename(outputName));
   const platform = process.platform;
   if (platform === "darwin") {
     await execFileAsync5("screencapture", ["-x", outPath], { cwd: rootDir, timeout: 1e4 });
@@ -5821,8 +6522,8 @@ function registerGuiStudioTools(editor, rootDir) {
 }
 
 // src/omni/hashline.ts
-import * as fs14 from "fs/promises";
-import * as path18 from "path";
+import * as fs16 from "fs/promises";
+import * as path20 from "path";
 function computeLineHash(line) {
   const trimmed = line.trim();
   if (trimmed.length === 0)
@@ -5835,8 +6536,8 @@ function computeLineHash(line) {
   return (hash >>> 0 & 255).toString(16).padStart(2, "0");
 }
 async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
-  const abs = path18.resolve(rootDir, targetPath);
-  const raw = await fs14.readFile(abs, "utf8");
+  const abs = path20.resolve(rootDir, targetPath);
+  const raw = await fs16.readFile(abs, "utf8");
   const lines = raw.replace(/\r\n/g, `
 `).split(`
 `);
@@ -5857,8 +6558,8 @@ async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
   };
 }
 async function hashEditFile(rootDir, targetPath, hunks) {
-  const abs = path18.resolve(rootDir, targetPath);
-  const raw = await fs14.readFile(abs, "utf8");
+  const abs = path20.resolve(rootDir, targetPath);
+  const raw = await fs16.readFile(abs, "utf8");
   const hasCrlf = raw.includes(`\r
 `);
   const lines = raw.replace(/\r\n/g, `
@@ -5913,7 +6614,7 @@ async function hashEditFile(rootDir, targetPath, hunks) {
   const outputText = lines.join(hasCrlf ? `\r
 ` : `
 `);
-  await fs14.writeFile(abs, outputText, "utf8");
+  await fs16.writeFile(abs, outputText, "utf8");
   const diagnostics = await runQuickDiagnostics(rootDir, targetPath);
   return {
     path: targetPath,
@@ -5978,8 +6679,8 @@ function registerHashlineTools(editor, rootDir) {
 
 // src/omni/office.ts
 import { execFile as execFile6 } from "child_process";
-import * as fs15 from "fs/promises";
-import * as path19 from "path";
+import * as fs17 from "fs/promises";
+import * as path21 from "path";
 import { promisify as promisify6 } from "util";
 var execFileAsync6 = promisify6(execFile6);
 var SUPPORTED_OFFICE_EXTENSIONS = new Set([
@@ -6087,8 +6788,8 @@ elif ext in (".sqlite", ".sqlite3", ".db"):
     print(NL.join(out))
 `;
 async function extractOfficeOrDataFile(rootDir, targetPath) {
-  const abs = path19.resolve(rootDir, targetPath);
-  const ext = path19.extname(abs).toLowerCase();
+  const abs = path21.resolve(rootDir, targetPath);
+  const ext = path21.extname(abs).toLowerCase();
   if (!SUPPORTED_OFFICE_EXTENSIONS.has(ext))
     return;
   const { stdout } = await execFileAsync6("python3", ["-c", PYTHON_UNIVERSAL_EXTRACTOR, abs], {
@@ -6098,17 +6799,17 @@ async function extractOfficeOrDataFile(rootDir, targetPath) {
   return stdout.trim();
 }
 async function renderDocumentPreviews(rootDir, targetPath) {
-  const abs = path19.resolve(rootDir, targetPath);
-  const ext = path19.extname(abs).toLowerCase();
-  const previewDir = path19.join(rootDir, ".opencode", "artifacts", "previews");
-  await fs15.mkdir(previewDir, { recursive: true });
+  const abs = path21.resolve(rootDir, targetPath);
+  const ext = path21.extname(abs).toLowerCase();
+  const previewDir = path21.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs17.mkdir(previewDir, { recursive: true });
   let pdfPath = abs;
   if ([".docx", ".pptx", ".xlsx"].includes(ext)) {
     await execFileAsync6("libreoffice", ["--headless", "--nologo", "--nolockcheck", "--norestore", "--convert-to", "pdf", "--outdir", previewDir, abs], { cwd: rootDir, timeout: 30000 });
-    const stem = path19.basename(abs, ext);
-    pdfPath = path19.join(previewDir, `${stem}.pdf`);
+    const stem = path21.basename(abs, ext);
+    pdfPath = path21.join(previewDir, `${stem}.pdf`);
   }
-  const stem = path19.basename(pdfPath, ".pdf");
+  const stem = path21.basename(pdfPath, ".pdf");
   const pyRender = `
 import sys, os, json, pypdfium2 as pdfium
 pdf_path, out_dir, stem = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -6184,7 +6885,7 @@ ${res.previewPngs.join(`
         const origExecute = tool.execute;
         tool.execute = async (input, context) => {
           if (typeof input?.path === "string") {
-            const ext = path19.extname(input.path).toLowerCase();
+            const ext = path21.extname(input.path).toLowerCase();
             if ([".docx", ".xlsx", ".xls", ".pptx", ".sqlite", ".sqlite3", ".db"].includes(ext)) {
               const extracted = await extractOfficeOrDataFile(rootDir, input.path);
               if (extracted !== undefined) {
@@ -6203,8 +6904,8 @@ ${res.previewPngs.join(`
 }
 
 // src/omni/pty-tap.ts
-import * as fs16 from "fs/promises";
-import * as path20 from "path";
+import * as fs18 from "fs/promises";
+import * as path22 from "path";
 var ERROR_LINE_RE = /\b(?:error|exception|fatal|panic|uncaught|failed|syntaxerror|typeerror|referenceerror|enoent|eaddrinuse)\b/i;
 async function readDevServerLogs(ctx, rootDir, input = {}) {
   const maxLines = Math.min(Math.max(input.lines ?? 80, 10), 500);
@@ -6219,14 +6920,14 @@ async function readDevServerLogs(ctx, rootDir, input = {}) {
   }
   if (!rawText) {
     const candidateFiles = [
-      ...input.logFile ? [path20.resolve(rootDir, input.logFile)] : [],
-      path20.join(rootDir, ".opencode", "artifacts", "devserver.log"),
-      path20.join(rootDir, "dev.log")
+      ...input.logFile ? [path22.resolve(rootDir, input.logFile)] : [],
+      path22.join(rootDir, ".opencode", "artifacts", "devserver.log"),
+      path22.join(rootDir, "dev.log")
     ];
     for (const file of candidateFiles) {
       try {
-        rawText = await fs16.readFile(file, "utf8");
-        source = path20.relative(rootDir, file).split(path20.sep).join("/");
+        rawText = await fs18.readFile(file, "utf8");
+        source = path22.relative(rootDir, file).split(path22.sep).join("/");
         break;
       } catch {}
     }
@@ -6273,8 +6974,8 @@ function registerPtyTapTools(editor, ctx, rootDir) {
 }
 
 // src/skills/ui-craft/skill.ts
-import * as fs17 from "fs/promises";
-import * as path21 from "path";
+import * as fs19 from "fs/promises";
+import * as path23 from "path";
 var UI_CRAFT_SKILL_ID = "ui-craft";
 var UI_CRAFT_SKILL_NAME = "UI Craft & Spatial Architecture";
 var EMBEDDED_UI_CRAFT_SKILL_MD = `---
@@ -6387,9 +7088,9 @@ Before handing off any UI milestone:
    - \`row-baseline-jitter\`: Align sibling card and button top edges to exact pixels.`;
 async function loadSkillContent(fallbackDir) {
   const targetDir = fallbackDir ?? process.cwd();
-  const candidate = path21.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
+  const candidate = path23.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
   try {
-    return await fs17.readFile(candidate, "utf8");
+    return await fs19.readFile(candidate, "utf8");
   } catch {
     return EMBEDDED_UI_CRAFT_SKILL_MD;
   }
@@ -6398,7 +7099,7 @@ async function registerUICraftSkill(ctx, rootDir) {
   if (!ctx.skill?.transform)
     return;
   const content = await loadSkillContent(rootDir);
-  const absoluteSkillPath = path21.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
+  const absoluteSkillPath = path23.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
   await ctx.skill.transform((editor) => {
     editor.add({
       id: UI_CRAFT_SKILL_ID,
@@ -6432,7 +7133,11 @@ function buildSetupModules(rootDir, config) {
   if (config.mode === "observe")
     return observe;
   return [
-    { id: "agents", requires: ["agent.transform"], run: (c) => c.agent.transform((editor) => registerSwarmOSAgents(editor)) },
+    {
+      id: "agents",
+      requires: ["agent.transform"],
+      run: (c) => c.agent.transform((editor) => registerSwarmOSAgents(editor))
+    },
     {
       id: "codemode-tools",
       requires: ["tool.transform"],
@@ -6451,14 +7156,25 @@ function buildSetupModules(rootDir, config) {
         registerMemoryTools(editor, rootDir);
         registerPtyTapTools(editor, c, rootDir);
         registerVerifyTools(editor, rootDir);
+        registerReplayTools(editor, rootDir);
+        registerLspTools(editor, rootDir, (r, p) => runQuickDiagnostics(r, p));
       })
     },
     {
       id: "permission-guard",
       requires: ["permission.hook"],
-      run: (c) => registerPermissionGuard(c, rootDir, config.taintTracking ? [createTaintEvaluator(rootDir)] : [])
+      run: (c) => registerPermissionGuard(c, rootDir, [
+        ...config.taintTracking ? [createTaintEvaluator(rootDir)] : [],
+        createTaskBudgetEvaluator()
+      ])
     },
-    ...config.autoTransactions ? [{ id: "transactions", requires: ["tool.hook"], run: (c) => registerTransactionHooks(c, rootDir) }] : [],
+    ...config.autoTransactions ? [
+      {
+        id: "transactions",
+        requires: ["tool.hook"],
+        run: (c) => registerTransactionHooks(c, rootDir)
+      }
+    ] : [],
     ...config.taintTracking ? [
       {
         id: "taint-tracking",
@@ -6469,11 +7185,36 @@ function buildSetupModules(rootDir, config) {
         }
       }
     ] : [],
-    { id: "diagnostics", requires: ["tool.hook"], run: (c) => registerDiagnosticHook(c, rootDir) },
-    { id: "circuit-breaker", requires: ["tool.hook"], run: (c) => registerCircuitBreakerHook(c) },
-    { id: "memory-upkeep", requires: ["tool.hook"], run: (c) => registerMemoryUpkeepHooks(c, rootDir) },
-    { id: "ui-craft-skill", requires: ["skill.transform"], run: (c) => registerUICraftSkill(c, rootDir) },
-    { id: "muse-overlay", requires: ["session.hook"], run: (c) => registerMuseOverlay(c) },
+    {
+      id: "diagnostics",
+      requires: ["tool.hook"],
+      run: (c) => registerDiagnosticHook(c, rootDir)
+    },
+    {
+      id: "task-budgets",
+      requires: ["tool.hook"],
+      run: (c) => registerTaskBudgetHooks(c, rootDir)
+    },
+    {
+      id: "circuit-breaker",
+      requires: ["tool.hook"],
+      run: (c) => registerCircuitBreakerHook(c)
+    },
+    {
+      id: "memory-upkeep",
+      requires: ["tool.hook"],
+      run: (c) => registerMemoryUpkeepHooks(c, rootDir)
+    },
+    {
+      id: "ui-craft-skill",
+      requires: ["skill.transform"],
+      run: (c) => registerUICraftSkill(c, rootDir)
+    },
+    {
+      id: "muse-overlay",
+      requires: ["session.hook"],
+      run: (c) => registerMuseOverlay(c)
+    },
     {
       id: "context-budget",
       requires: ["session.hook"],
@@ -6486,6 +7227,7 @@ function buildSetupModules(rootDir, config) {
         await registerShipCommand(c);
         await registerSwarmCommand(c, rootDir);
         await registerOmniCommands(c, rootDir);
+        await registerReplayCommand(c, rootDir);
       }
     },
     ...observe
@@ -6553,7 +7295,9 @@ export {
   buildRepoMap,
   buildSetupModules,
   captureDesktopWindow,
+  claimTask,
   cleanupTournamentWorktrees,
+  clearDiagnosticCache,
   clearTaint,
   commitWorktree,
   computeLineHash,
@@ -6562,6 +7306,7 @@ export {
   createEmptyBoard,
   createTaintEvaluator,
   createTask,
+  createTaskBudgetEvaluator,
   src_default as default,
   discoverChecks,
   estimateTokens,
@@ -6569,16 +7314,21 @@ export {
   evaluateFileMutation,
   evaluateNeedsReview,
   evaluatePermissionGuard,
+  evaluateTaskBudgetViolation,
+  exportSessionToBenchmark,
   extractFailures,
   extractMutatedPaths,
   extractOfficeOrDataFile,
   extractOutline,
+  findSymbolDefinitions,
+  findSymbolReferences,
   finishTransaction,
   forgetLesson,
   formatDoctorReport,
   formatVerifyRun,
   getArtifactsDir,
   getBoardPath,
+  getCachedDiagnostic,
   getCheckpointsDir,
   getConfigPath,
   getContextBudgetReport,
@@ -6589,6 +7339,7 @@ export {
   getSetupReport,
   getTelemetryDir,
   getVerifyDir,
+  getWarmLspStatus,
   hasCapability,
   hashEditFile,
   hashReadFile,
@@ -6602,6 +7353,7 @@ export {
   listArtifacts,
   listChangedFiles,
   listCheckpoints,
+  listReplayableSessions,
   listSessionStates,
   listTelemetryFiles,
   loadBoard,
@@ -6610,6 +7362,7 @@ export {
   loadLessons,
   loadProposals,
   loadResearchSources,
+  loadSessionTelemetry,
   loadSkillContent,
   loadVerifyRun,
   lockContract,
@@ -6635,6 +7388,7 @@ export {
   recordLessonOutcome,
   recordResearchSource,
   recordTaint,
+  recordTaskSpend,
   registerArtifactContextHook,
   registerArtifactTools,
   registerCheckpointTools,
@@ -6644,6 +7398,7 @@ export {
   registerDoctorTools,
   registerGuiStudioTools,
   registerHashlineTools,
+  registerLspTools,
   registerMemoryContextHook,
   registerMemoryTools,
   registerMemoryUpkeepHooks,
@@ -6652,20 +7407,26 @@ export {
   registerOmniCommands,
   registerPermissionGuard,
   registerPtyTapTools,
+  registerReplayCommand,
+  registerReplayTools,
   registerRepoMapTools,
   registerResearchTools,
   registerTaintHooks,
+  registerTaskBudgetHooks,
   registerTelemetryHooks,
   registerTransactionHooks,
   registerUntaintCommand,
   registerVerifyTools,
   rejectProposal,
   renderDocumentPreviews,
+  replaySessionTrace,
   resetCircuitBreaker,
   resetSessionStates,
   resetTransactions,
+  resolveSessionTask,
   resolveTournament,
   rollbackCheckpoint,
+  runParallelDiagnostics,
   runQuickDiagnostics,
   runSetupModules,
   runVerify,
@@ -6673,7 +7434,9 @@ export {
   saveLessons,
   scoreLesson,
   scoreTournament,
+  setTaskBudget,
   setup,
+  shutdownWarmLspServers,
   storeSetupReport,
   stripAnsi,
   stripCommentsAndStrings,
@@ -6683,6 +7446,7 @@ export {
   transactionStats,
   updateTaskStatus,
   verifyReleaseReady,
+  warmDiagnosticStats,
   withBoardLock,
   withPinningProfile,
   writeArtifact

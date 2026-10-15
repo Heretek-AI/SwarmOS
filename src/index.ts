@@ -1,4 +1,4 @@
-import { registerSwarmOSAgents, SWARMOS_ROLES } from "./agents/roles.js"
+import { registerSwarmOSAgents, SWARMOS_ROLES } from "./agents/roles.js";
 import {
   evaluateBoardGuard,
   evaluatePermissionGuard,
@@ -10,7 +10,7 @@ import {
   type GuardEvaluator,
   type GuardDecision,
   type PermissionEvaluationEvent,
-} from "./agents/guard.js"
+} from "./agents/guard.js";
 import {
   PROMPT_ARCHITECT,
   PROMPT_DIRECTOR,
@@ -22,10 +22,12 @@ import {
   PROMPT_STAFF_BACKEND,
   PROMPT_STAFF_UI,
   PROMPT_STUDIO_GUI,
-} from "./agents/prompts.js"
+} from "./agents/prompts.js";
 import {
   BOARD_VERSION,
+  claimTask,
   createEmptyBoard,
+  evaluateTaskBudgetViolation,
   createTask,
   getBoardPath,
   initProject,
@@ -34,15 +36,17 @@ import {
   planTournament,
   resolveTournament,
   saveBoard,
+  setTaskBudget,
   submitQAReceipt,
   taskWorkdir,
   updateTaskStatus,
   verifyReleaseReady,
   withBoardLock,
-} from "./board/board.js"
+} from "./board/board.js";
 import type {
   AestheticArchetype,
   BoardPolicy,
+  ClaimTaskInput,
   Contract,
   CreateTaskInput,
   InitProjectInput,
@@ -53,21 +57,41 @@ import type {
   QAReceipt,
   ReleaseReadinessReport,
   ResolveTournamentInput,
+  SetTaskBudgetInput,
   SubmitQAReceiptInput,
   Task,
+  TaskBudget,
   TaskStatus,
+  TaskUsage,
   Tournament,
   TournamentCandidate,
-} from "./board/types.js"
-import { extractOutline, registerFSTools } from "./codemode/fs-outline.js"
-import { registerOrgTools } from "./codemode/org-tools.js"
-import { registerUITools } from "./codemode/ui-tools.js"
-import { registerOmniCommands } from "./commands/omni.js"
-import { registerShipCommand } from "./commands/ship.js"
-import { registerSwarmCommand } from "./commands/swarm.js"
-import { buildDoctorText, registerDoctorCommand, registerDoctorTools } from "./commands/doctor.js"
-import { DEFAULT_CONFIG, getConfigPath, loadConfig, type SwarmOSConfig, type SwarmOSMode } from "./host/config.js"
-import { HOST_CONTRACT, hasCapability, missingRequired, probeHost, type HostCapability, type HostProbeResult } from "./host/contract.js"
+} from "./board/types.js";
+import { extractOutline, registerFSTools } from "./codemode/fs-outline.js";
+import { registerOrgTools } from "./codemode/org-tools.js";
+import { registerUITools } from "./codemode/ui-tools.js";
+import { registerOmniCommands } from "./commands/omni.js";
+import { registerShipCommand } from "./commands/ship.js";
+import { registerSwarmCommand } from "./commands/swarm.js";
+import {
+  buildDoctorText,
+  registerDoctorCommand,
+  registerDoctorTools,
+} from "./commands/doctor.js";
+import {
+  DEFAULT_CONFIG,
+  getConfigPath,
+  loadConfig,
+  type SwarmOSConfig,
+  type SwarmOSMode,
+} from "./host/config.js";
+import {
+  HOST_CONTRACT,
+  hasCapability,
+  missingRequired,
+  probeHost,
+  type HostCapability,
+  type HostProbeResult,
+} from "./host/contract.js";
 import {
   formatDoctorReport,
   getSetupReport,
@@ -77,8 +101,13 @@ import {
   type ModuleReport,
   type SetupModule,
   type SetupReport,
-} from "./host/setup-report.js"
-import { getSessionState, listSessionStates, resetSessionStates, type SessionState } from "./host/session-state.js"
+} from "./host/setup-report.js";
+import {
+  getSessionState,
+  listSessionStates,
+  resetSessionStates,
+  type SessionState,
+} from "./host/session-state.js";
 import {
   appendTelemetry,
   getTelemetryDir,
@@ -88,8 +117,8 @@ import {
   summarizeTelemetry,
   type TelemetryRecord,
   type TelemetrySummary,
-} from "./host/telemetry.js"
-import { SWARMOS_VERSION } from "./version.js"
+} from "./host/telemetry.js";
+import { SWARMOS_VERSION } from "./version.js";
 import {
   ROLE_NAMESPACES,
   buildContextBlocks,
@@ -101,9 +130,23 @@ import {
   withPinningProfile,
   type ContextBlock,
   type ContextBudgetReport,
-} from "./omni/context-budget.js"
-import { buildRepoGraph, parseSourceFacts, stripCommentsAndStrings, type ImportEdge, type RepoGraph, type RepoLanguage } from "./omni/repomap.js"
-import { analyzeShell, isReadOnly, parseShell, type CommandAnalysis, type ShellAnalysis, type ShellEffect } from "./agents/shell-parse.js"
+} from "./omni/context-budget.js";
+import {
+  buildRepoGraph,
+  parseSourceFacts,
+  stripCommentsAndStrings,
+  type ImportEdge,
+  type RepoGraph,
+  type RepoLanguage,
+} from "./omni/repomap.js";
+import {
+  analyzeShell,
+  isReadOnly,
+  parseShell,
+  type CommandAnalysis,
+  type ShellAnalysis,
+  type ShellEffect,
+} from "./agents/shell-parse.js";
 import {
   beginTransaction,
   finishTransaction,
@@ -111,8 +154,14 @@ import {
   registerTransactionHooks,
   resetTransactions,
   transactionStats,
-} from "./omni/transactions.js"
-import { clearTaint, createTaintEvaluator, recordTaint, registerTaintHooks, registerUntaintCommand } from "./omni/taint.js"
+} from "./omni/transactions.js";
+import {
+  clearTaint,
+  createTaintEvaluator,
+  recordTaint,
+  registerTaintHooks,
+  registerUntaintCommand,
+} from "./omni/taint.js";
 import {
   cleanupTournamentWorktrees,
   commitWorktree,
@@ -122,7 +171,7 @@ import {
   scoreTournament,
   type CandidateScore,
   type MergeResult,
-} from "./board/worktrees.js"
+} from "./board/worktrees.js";
 import {
   computeTreeFingerprint,
   discoverChecks,
@@ -143,11 +192,54 @@ import {
   type VerifyKind,
   type VerifyRun,
   type VerifyRunInput,
-} from "./omni/verify.js"
-import { extractMutatedPaths, registerDiagnosticHook, runQuickDiagnostics } from "./diagnostics/runner.js"
-import { DOM_GEOMETRY_AUDIT_SCRIPT, type DOMAuditResult, type DOMDefect } from "./geometry/audit-script.js"
-import { STANDARD_VIEWPORTS, type ViewportDefinition } from "./geometry/viewports.js"
-import { MUSE_SOTA_BASE_PROMPT, registerMuseOverlay } from "./muse/overlay.js"
+} from "./omni/verify.js";
+import {
+  extractMutatedPaths,
+  registerDiagnosticHook,
+  runQuickDiagnostics,
+} from "./diagnostics/runner.js";
+import {
+  clearDiagnosticCache,
+  findSymbolDefinitions,
+  findSymbolReferences,
+  getCachedDiagnostic,
+  getWarmLspStatus,
+  registerLspTools,
+  runParallelDiagnostics,
+  shutdownWarmLspServers,
+  warmDiagnosticStats,
+  type CachedDiagEntry,
+  type LspSymbolLocation,
+} from "./diagnostics/warm-lsp.js";
+import {
+  createTaskBudgetEvaluator,
+  recordTaskSpend,
+  registerTaskBudgetHooks,
+  resolveSessionTask,
+} from "./omni/budget.js";
+import {
+  exportSessionToBenchmark,
+  listReplayableSessions,
+  loadSessionTelemetry,
+  registerReplayCommand,
+  registerReplayTools,
+  replaySessionTrace,
+  type ExportBenchmarkInput,
+  type ExportedBenchmarkTask,
+  type ReplayableSession,
+  type ReplayExecutionReport,
+  type ReplayStepOutcome,
+} from "./omni/replay.js";
+import {
+  DOM_GEOMETRY_AUDIT_SCRIPT,
+  type DOMAuditResult,
+  type DOMDefect,
+} from "./geometry/audit-script.js";
+import {
+  STANDARD_VIEWPORTS,
+  type ViewportDefinition,
+} from "./geometry/viewports.js";
+import { MUSE_SOTA_BASE_PROMPT, registerMuseOverlay } from "./muse/overlay.js";
 import {
   getArtifactsDir,
   listArtifacts,
@@ -156,7 +248,7 @@ import {
   registerArtifactTools,
   writeArtifact,
   type ArtifactName,
-} from "./omni/artifacts.js"
+} from "./omni/artifacts.js";
 import {
   createCheckpoint,
   getCheckpointsDir,
@@ -165,18 +257,18 @@ import {
   rollbackCheckpoint,
   type CheckpointFileEntry,
   type CheckpointManifest,
-} from "./omni/checkpoints.js"
+} from "./omni/checkpoints.js";
 import {
   recordAndEvaluateCircuitBreaker,
   registerCircuitBreakerHook,
   resetCircuitBreaker,
   type ToolAttemptRecord,
-} from "./omni/circuit-breaker.js"
+} from "./omni/circuit-breaker.js";
 import {
   captureDesktopWindow,
   registerGuiStudioTools,
   VISUAL_QUALITY_CHECKLIST,
-} from "./omni/gui-studio.js"
+} from "./omni/gui-studio.js";
 import {
   computeLineHash,
   hashEditFile,
@@ -185,7 +277,7 @@ import {
   type HashEditResult,
   type HashLineHunk,
   type HashReadResult,
-} from "./omni/hashline.js"
+} from "./omni/hashline.js";
 import {
   acceptProposal,
   evaluateNeedsReview,
@@ -206,18 +298,18 @@ import {
   type EpisodicLesson,
   type LessonProposal,
   type LessonStats,
-} from "./omni/memory.js"
+} from "./omni/memory.js";
 import {
   extractOfficeOrDataFile,
   registerOfficeTools,
   renderDocumentPreviews,
   SUPPORTED_OFFICE_EXTENSIONS,
-} from "./omni/office.js"
+} from "./omni/office.js";
 import {
   readDevServerLogs,
   registerPtyTapTools,
   type PtyLogReadInput,
-} from "./omni/pty-tap.js"
+} from "./omni/pty-tap.js";
 import {
   analyzeBlastRadius,
   buildRepoMap,
@@ -225,7 +317,7 @@ import {
   type BlastRadiusReport,
   type RepoMapNode,
   type RepoMapReport,
-} from "./omni/repomap.js"
+} from "./omni/repomap.js";
 import {
   auditMarkdownCitations,
   getResearchLedgerPath,
@@ -234,14 +326,14 @@ import {
   registerResearchTools,
   type CitationAuditReport,
   type ResearchSource,
-} from "./omni/research.js"
+} from "./omni/research.js";
 import {
   EMBEDDED_UI_CRAFT_SKILL_MD,
   loadSkillContent,
   registerUICraftSkill,
   UI_CRAFT_SKILL_ID,
   UI_CRAFT_SKILL_NAME,
-} from "./skills/ui-craft/skill.js"
+} from "./skills/ui-craft/skill.js";
 
 export {
   // Agent roles, prompts & runtime guard
@@ -444,7 +536,31 @@ export {
   registerMemoryUpkeepHooks,
   rejectProposal,
   saveLessons,
-}
+
+  // v0.9.0: Task spend/step budgets, Session Replay -> Benchmarks, Warm Parallel LSP Diagnostics
+  claimTask,
+  setTaskBudget,
+  evaluateTaskBudgetViolation,
+  resolveSessionTask,
+  recordTaskSpend,
+  createTaskBudgetEvaluator,
+  registerTaskBudgetHooks,
+  listReplayableSessions,
+  loadSessionTelemetry,
+  exportSessionToBenchmark,
+  replaySessionTrace,
+  registerReplayTools,
+  registerReplayCommand,
+  runParallelDiagnostics,
+  getCachedDiagnostic,
+  clearDiagnosticCache,
+  warmDiagnosticStats,
+  findSymbolDefinitions,
+  findSymbolReferences,
+  getWarmLspStatus,
+  shutdownWarmLspServers,
+  registerLspTools,
+};
 
 export type {
   SwarmOSConfig,
@@ -512,15 +628,29 @@ export type {
   CheckpointManifest,
   EpisodicLesson,
   PtyLogReadInput,
-}
+  TaskBudget,
+  TaskUsage,
+  ClaimTaskInput,
+  SetTaskBudgetInput,
+  ReplayableSession,
+  ExportBenchmarkInput,
+  ExportedBenchmarkTask,
+  ReplayStepOutcome,
+  ReplayExecutionReport,
+  CachedDiagEntry,
+  LspSymbolLocation,
+};
 
-export const SWARMOS_PLUGIN_ID = "heretek.swarmos"
+export const SWARMOS_PLUGIN_ID = "heretek.swarmos";
 
 /**
  * Builds the ordered list of SwarmOS setup modules. Each module declares the host
  * capabilities it needs so `/doctor` can explain exactly why it is or is not active.
  */
-export function buildSetupModules(rootDir: string, config: SwarmOSConfig): SetupModule[] {
+export function buildSetupModules(
+  rootDir: string,
+  config: SwarmOSConfig,
+): SetupModule[] {
   const observe: SetupModule[] = [
     {
       id: "telemetry",
@@ -531,43 +661,64 @@ export function buildSetupModules(rootDir: string, config: SwarmOSConfig): Setup
       id: "doctor",
       requires: ["tool.transform", "command.transform"],
       run: async (c) => {
-        await c.tool.transform((editor: any) => registerDoctorTools(editor, rootDir))
-        await registerDoctorCommand(c, rootDir)
+        await c.tool.transform((editor: any) =>
+          registerDoctorTools(editor, rootDir),
+        );
+        await registerDoctorCommand(c, rootDir);
       },
     },
-  ]
-  if (config.mode === "observe") return observe
+  ];
+  if (config.mode === "observe") return observe;
 
   return [
-    { id: "agents", requires: ["agent.transform"], run: (c) => c.agent.transform((editor: any) => registerSwarmOSAgents(editor)) },
+    {
+      id: "agents",
+      requires: ["agent.transform"],
+      run: (c) =>
+        c.agent.transform((editor: any) => registerSwarmOSAgents(editor)),
+    },
     {
       id: "codemode-tools",
       requires: ["tool.transform"],
       run: (c) =>
         c.tool.transform((rawEditor: any) => {
-          const editor = withPinningProfile(rawEditor, config.pinnedNamespaces)
-          registerOrgTools(editor, rootDir)
-          registerUITools(editor)
-          registerFSTools(editor, rootDir)
-          registerHashlineTools(editor, rootDir)
-          registerArtifactTools(editor, rootDir)
-          registerOfficeTools(editor, rootDir)
-          registerResearchTools(editor, rootDir)
-          registerGuiStudioTools(editor, rootDir)
-          registerRepoMapTools(editor, rootDir)
-          registerCheckpointTools(editor, rootDir)
-          registerMemoryTools(editor, rootDir)
-          registerPtyTapTools(editor, c, rootDir)
-          registerVerifyTools(editor, rootDir)
+          const editor = withPinningProfile(rawEditor, config.pinnedNamespaces);
+          registerOrgTools(editor, rootDir);
+          registerUITools(editor);
+          registerFSTools(editor, rootDir);
+          registerHashlineTools(editor, rootDir);
+          registerArtifactTools(editor, rootDir);
+          registerOfficeTools(editor, rootDir);
+          registerResearchTools(editor, rootDir);
+          registerGuiStudioTools(editor, rootDir);
+          registerRepoMapTools(editor, rootDir);
+          registerCheckpointTools(editor, rootDir);
+          registerMemoryTools(editor, rootDir);
+          registerPtyTapTools(editor, c, rootDir);
+          registerVerifyTools(editor, rootDir);
+          registerReplayTools(editor, rootDir);
+          registerLspTools(editor, rootDir, (r, p) =>
+            runQuickDiagnostics(r, p),
+          );
         }),
     },
     {
       id: "permission-guard",
       requires: ["permission.hook"],
-      run: (c) => registerPermissionGuard(c, rootDir, config.taintTracking ? [createTaintEvaluator(rootDir)] : []),
+      run: (c) =>
+        registerPermissionGuard(c, rootDir, [
+          ...(config.taintTracking ? [createTaintEvaluator(rootDir)] : []),
+          createTaskBudgetEvaluator(),
+        ]),
     },
     ...(config.autoTransactions
-      ? [{ id: "transactions", requires: ["tool.hook"], run: (c: any) => registerTransactionHooks(c, rootDir) }]
+      ? [
+          {
+            id: "transactions",
+            requires: ["tool.hook"],
+            run: (c: any) => registerTransactionHooks(c, rootDir),
+          },
+        ]
       : []),
     ...(config.taintTracking
       ? [
@@ -575,43 +726,70 @@ export function buildSetupModules(rootDir: string, config: SwarmOSConfig): Setup
             id: "taint-tracking",
             requires: ["tool.hook"],
             run: async (c: any) => {
-              await registerTaintHooks(c)
-              await registerUntaintCommand(c)
+              await registerTaintHooks(c);
+              await registerUntaintCommand(c);
             },
           },
         ]
       : []),
-    { id: "diagnostics", requires: ["tool.hook"], run: (c) => registerDiagnosticHook(c, rootDir) },
-    { id: "circuit-breaker", requires: ["tool.hook"], run: (c) => registerCircuitBreakerHook(c) },
+    {
+      id: "diagnostics",
+      requires: ["tool.hook"],
+      run: (c) => registerDiagnosticHook(c, rootDir),
+    },
+    {
+      id: "task-budgets",
+      requires: ["tool.hook"],
+      run: (c) => registerTaskBudgetHooks(c, rootDir),
+    },
+    {
+      id: "circuit-breaker",
+      requires: ["tool.hook"],
+      run: (c) => registerCircuitBreakerHook(c),
+    },
     // Runs after the circuit breaker so it sees interventions and can draft lesson proposals.
-    { id: "memory-upkeep", requires: ["tool.hook"], run: (c) => registerMemoryUpkeepHooks(c, rootDir) },
-    { id: "ui-craft-skill", requires: ["skill.transform"], run: (c) => registerUICraftSkill(c, rootDir) },
-    { id: "muse-overlay", requires: ["session.hook"], run: (c) => registerMuseOverlay(c) },
+    {
+      id: "memory-upkeep",
+      requires: ["tool.hook"],
+      run: (c) => registerMemoryUpkeepHooks(c, rootDir),
+    },
+    {
+      id: "ui-craft-skill",
+      requires: ["skill.transform"],
+      run: (c) => registerUICraftSkill(c, rootDir),
+    },
+    {
+      id: "muse-overlay",
+      requires: ["session.hook"],
+      run: (c) => registerMuseOverlay(c),
+    },
     {
       id: "context-budget",
       requires: ["session.hook"],
-      run: (c) => registerContextBudgetHook(c, rootDir, config.contextBudgetTokens),
+      run: (c) =>
+        registerContextBudgetHook(c, rootDir, config.contextBudgetTokens),
     },
     {
       id: "commands",
       requires: ["command.transform"],
       run: async (c) => {
-        await registerShipCommand(c)
-        await registerSwarmCommand(c, rootDir)
-        await registerOmniCommands(c, rootDir)
+        await registerShipCommand(c);
+        await registerSwarmCommand(c, rootDir);
+        await registerOmniCommands(c, rootDir);
+        await registerReplayCommand(c, rootDir);
       },
     },
     // Telemetry runs last so its execute.after hook sees interventions appended by earlier hooks.
     ...observe,
-  ]
+  ];
 }
 
 /**
  * OpenCode SwarmOS Omni-Harness Plugin Setup Function.
  */
 export async function setup(ctx: any): Promise<SetupReport> {
-  const rootDir = ctx.location?.directory ?? process.cwd()
-  const config = await loadConfig(rootDir)
+  const rootDir = ctx.location?.directory ?? process.cwd();
+  const config = await loadConfig(rootDir);
   const report: SetupReport = {
     version: SWARMOS_VERSION,
     mode: config.mode,
@@ -619,27 +797,27 @@ export async function setup(ctx: any): Promise<SetupReport> {
     startedAt: new Date().toISOString(),
     host: probeHost(ctx),
     modules: [],
-  }
-  storeSetupReport(report)
-  await runSetupModules(ctx, buildSetupModules(rootDir, config), report)
-  return report
+  };
+  storeSetupReport(report);
+  await runSetupModules(ctx, buildSetupModules(rootDir, config), report);
+  return report;
 }
 
 export interface SwarmOSPluginCallable {
-  (ctx: any): Promise<void>
-  readonly id: string
-  readonly setup: (ctx: any) => Promise<SetupReport>
+  (ctx: any): Promise<void>;
+  readonly id: string;
+  readonly setup: (ctx: any) => Promise<SetupReport>;
 }
 
 export const SwarmOSPlugin: SwarmOSPluginCallable = Object.assign(
   async function SwarmOSPlugin(ctx: any): Promise<void> {
-    await setup(ctx)
+    await setup(ctx);
   },
   {
     id: SWARMOS_PLUGIN_ID,
     setup,
   },
-)
+);
 
-export default SwarmOSPlugin
-export const plugin = SwarmOSPlugin
+export default SwarmOSPlugin;
+export const plugin = SwarmOSPlugin;

@@ -29,8 +29,8 @@ export interface ContextBudgetReport {
 export const ROLE_NAMESPACES: Record<string, string[]> = {
   director: ["org", "repo", "memory", "artifacts", "swarmos"],
   architect: ["org", "repo", "fs", "checkpoints"],
-  manager: ["org", "repo", "verify", "artifacts"],
-  "staff-backend": ["fs", "repo", "verify", "checkpoints", "memory", "artifacts"],
+  manager: ["org", "repo", "verify", "artifacts", "replay"],
+  "staff-backend": ["fs", "repo", "lsp", "verify", "checkpoints", "memory", "artifacts"],
   "staff-ui": ["fs", "ui", "verify", "checkpoints", "artifacts", "gui"],
   "qa-adversary": ["verify", "org", "repo", "ui", "fs"],
   "release-ops": ["verify", "org", "repo"],

@@ -41,6 +41,24 @@ export interface QAReceipt {
   timestamp: string
 }
 
+export interface TaskBudget {
+  /** Maximum total tokens (input + output + cacheRead) allowed for this task. */
+  maxTokens?: number
+  /** Maximum LLM turns allowed for this task. */
+  maxTurns?: number
+  /** Maximum tool calls allowed for this task. */
+  maxToolCalls?: number
+}
+
+export interface TaskUsage {
+  tokensUsed: number
+  turnsUsed: number
+  toolCallsUsed: number
+  overBudget?: boolean
+  overBudgetReason?: string
+  updatedAt?: string
+}
+
 export interface Task {
   id: string
   title: string
@@ -48,6 +66,9 @@ export interface Task {
   ownedPaths: string[]
   worktree?: string
   tournamentId?: string
+  claimedBySessionID?: string
+  budget?: TaskBudget
+  usage?: TaskUsage
   status: TaskStatus
   qaReceipts: QAReceipt[]
   createdAt: string
@@ -133,6 +154,19 @@ export interface CreateTaskInput {
   ownedPaths: string[]
   worktree?: string
   tournamentId?: string
+  budget?: TaskBudget
+}
+
+export interface ClaimTaskInput {
+  taskId: string
+  sessionID?: string
+}
+
+export interface SetTaskBudgetInput {
+  taskId: string
+  budget: TaskBudget
+  /** If true, resets accumulated token/turn/toolCall usage counters on the task. */
+  resetUsage?: boolean
 }
 
 export interface SubmitQAReceiptInput {
