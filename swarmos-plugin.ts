@@ -1,4 +1,3198 @@
 // @bun
+// src/epistemic/dialectic.ts
+import { createHash } from "crypto";
+import * as fs from "fs/promises";
+import * as path from "path";
+var PERMISSIVE_LICENSES = new Set([
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "0BSD",
+  "Unlicense",
+  "CC0-1.0"
+]);
+var WEAK_COPYLEFT_LICENSES = new Set([
+  "MPL-2.0",
+  "LGPL-2.1",
+  "LGPL-2.1-only",
+  "LGPL-3.0",
+  "LGPL-3.0-only",
+  "EPL-2.0"
+]);
+var STRONG_COPYLEFT_LICENSES = new Set([
+  "GPL-2.0",
+  "GPL-2.0-only",
+  "GPL-3.0",
+  "GPL-3.0-only",
+  "AGPL-3.0",
+  "AGPL-3.0-only",
+  "SSPL-1.0"
+]);
+function classifySpdxLicense(a, b) {
+  if (b === undefined) {
+    const spdx = a ?? "";
+    if (!spdx.trim())
+      return "unknown";
+    const norm = spdx.trim();
+    if (PERMISSIVE_LICENSES.has(norm))
+      return "permissive";
+    if (WEAK_COPYLEFT_LICENSES.has(norm))
+      return "weak-copyleft";
+    if (STRONG_COPYLEFT_LICENSES.has(norm) || /\b(?:AGPL|GPL|SSPL)/i.test(norm))
+      return "copyleft-contaminating";
+    return "unknown";
+  }
+  const pkgName = a ?? "";
+  const spdx = b;
+  const category = classifySpdxLicense(spdx);
+  const classification = category === "copyleft-contaminating" ? "copyleft-contaminating" : category === "permissive" ? "permissive" : category === "weak-copyleft" ? "weak-copyleft" : "unknown";
+  const verdict = classification === "permissive" ? "depend-or-vendor" : classification === "weak-copyleft" ? "dynamic-link-only" : classification === "copyleft-contaminating" ? "clean-room-rebuild-only" : "manual-review";
+  return { name: pkgName, license: spdx, classification, verdict };
+}
+function getEpistemicDir(rootDir) {
+  return path.join(rootDir, ".opencode", "epistemic");
+}
+function getEpistemicSourcesDir(rootDir) {
+  return path.join(getEpistemicDir(rootDir), "sources");
+}
+async function loadEpistemicIndex(rootDir) {
+  try {
+    const raw = await fs.readFile(path.join(getEpistemicDir(rootDir), "index.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+async function saveEpistemicIndex(rootDir, entries) {
+  const dir = getEpistemicDir(rootDir);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "index.json"), JSON.stringify(entries, null, 2), "utf8");
+}
+async function cacheEpistemicSource(rootDir, input) {
+  const normalizedContent = input.content.replace(/\r\n/g, `
+`);
+  const sha256 = createHash("sha256").update(normalizedContent, "utf8").digest("hex");
+  const shortHash = sha256.slice(0, 12);
+  const sourcesDir = getEpistemicSourcesDir(rootDir);
+  await fs.mkdir(sourcesDir, { recursive: true });
+  const filePath = path.join(sourcesDir, `${shortHash}.md`);
+  const header = [
+    "---",
+    `hash: ${sha256}`,
+    `shortHash: ${shortHash}`,
+    `title: ${input.title}`,
+    "---",
+    ""
+  ].join(`
+`);
+  await fs.writeFile(filePath, `${header}${normalizedContent}`, "utf8");
+  const entry = {
+    hash: sha256,
+    shortHash,
+    title: input.title,
+    ...input.url ? { url: input.url } : {},
+    ...input.spdxLicense ? { spdxLicense: input.spdxLicense } : {},
+    licenseCategory: classifySpdxLicense(input.spdxLicense),
+    cachedAt: new Date().toISOString(),
+    path: filePath,
+    filePath: path.relative(rootDir, filePath).split(path.sep).join("/"),
+    byteLength: Buffer.byteLength(normalizedContent, "utf8")
+  };
+  const index = await loadEpistemicIndex(rootDir);
+  const existingIdx = index.findIndex((e) => e.shortHash === shortHash);
+  if (existingIdx >= 0)
+    index[existingIdx] = entry;
+  else
+    index.push(entry);
+  await saveEpistemicIndex(rootDir, index);
+  return entry;
+}
+async function verifyEpistemicClaims(rootDir, markdownText) {
+  const index = await loadEpistemicIndex(rootDir);
+  const byHash = new Map;
+  for (const e of index) {
+    byHash.set(e.shortHash.toLowerCase(), e);
+    byHash.set(e.hash.toLowerCase(), e);
+  }
+  if (byHash.size === 0) {
+    try {
+      const files = await fs.readdir(getEpistemicSourcesDir(rootDir));
+      for (const f of files) {
+        if (!f.endsWith(".md"))
+          continue;
+        const stem = path.basename(f, ".md").toLowerCase();
+        if (!byHash.has(stem)) {
+          byHash.set(stem, {
+            hash: stem,
+            shortHash: stem.slice(0, 12),
+            title: stem,
+            licenseCategory: "unknown",
+            cachedAt: new Date().toISOString(),
+            path: path.join(getEpistemicSourcesDir(rootDir), f),
+            filePath: `.opencode/epistemic/sources/${f}`,
+            byteLength: 0
+          });
+        }
+      }
+    } catch {}
+  }
+  const tagRe = /\[VERIFIED:\s*([a-fA-F0-9]{6,64})(?:\s*\|\s*"([^"]+)")?\]/g;
+  const failedClaims = [];
+  const verifiedClaims = [];
+  let verifiedCount = 0;
+  let totalClaimsChecked = 0;
+  let match;
+  while ((match = tagRe.exec(markdownText)) !== null) {
+    totalClaimsChecked++;
+    const rawTag = match[0];
+    const hashKey = match[1].toLowerCase();
+    const quote = match[2];
+    const entry = byHash.get(hashKey) ?? [...byHash.values()].find((e) => e.shortHash.startsWith(hashKey) || hashKey.startsWith(e.shortHash));
+    if (!entry) {
+      failedClaims.push({
+        tag: rawTag,
+        reason: `Unknown source hash "${hashKey}" not found in .opencode/epistemic/index.json`
+      });
+      verifiedClaims.push({
+        hash: hashKey,
+        quote,
+        valid: false,
+        reason: "Source hash not found"
+      });
+      continue;
+    }
+    const absFile = path.isAbsolute(entry.filePath) ? entry.filePath : path.resolve(rootDir, entry.filePath);
+    let sourceText = "";
+    try {
+      sourceText = await fs.readFile(entry.path ?? absFile, "utf8");
+      if (!sourceText)
+        sourceText = await fs.readFile(absFile, "utf8");
+    } catch {
+      failedClaims.push({
+        tag: rawTag,
+        reason: `Cached source file missing on disk: ${entry.filePath}`
+      });
+      verifiedClaims.push({
+        hash: hashKey,
+        quote,
+        valid: false,
+        reason: "Cached source file missing"
+      });
+      continue;
+    }
+    if (quote) {
+      const normSource = sourceText.replace(/\s+/g, " ").trim();
+      const normQuote = quote.replace(/\s+/g, " ").trim();
+      if (!normSource.includes(normQuote)) {
+        failedClaims.push({
+          tag: rawTag,
+          reason: `Verbatim quote "${quote.slice(0, 60)}" not found inside cached source [${entry.shortHash}] (${entry.title})`
+        });
+        verifiedClaims.push({
+          hash: hashKey,
+          quote,
+          valid: false,
+          reason: "Verbatim quote not found"
+        });
+        continue;
+      }
+    }
+    verifiedCount++;
+    verifiedClaims.push({ hash: hashKey, quote, valid: true });
+  }
+  const inferredClaims = [
+    ...markdownText.matchAll(/\[INFERRED:\s*([^\]]+)\]/gi)
+  ].map((m) => m[1].trim());
+  const hypothesisClaims = [
+    ...markdownText.matchAll(/\[HYPOTHESIS:\s*([^\]]+)\]/gi)
+  ].map((m) => m[1].trim());
+  const negativeKnowledgeClaims = [
+    ...markdownText.matchAll(/\[NEGATIVE_KNOWLEDGE:\s*([^\]]+)\]/gi)
+  ].map((m) => m[1].trim());
+  const paragraphs = markdownText.split(/\n\s*\n/).map((p) => p.trim()).filter((p) => p.length > 60 && !p.startsWith("#") && !p.startsWith("|") && !p.startsWith("```"));
+  const untaggedParagraphs = paragraphs.filter((p) => !/\[(?:VERIFIED|INFERRED|HYPOTHESIS|NEGATIVE_KNOWLEDGE):/i.test(p)).length;
+  const totalTagged = verifiedClaims.length + inferredClaims.length + hypothesisClaims.length + negativeKnowledgeClaims.length;
+  const baseScore = totalTagged > 0 ? 100 : 60;
+  const integrityScore = Math.max(0, Math.min(100, baseScore - failedClaims.length * 25 - untaggedParagraphs * 5));
+  return {
+    totalClaimsChecked,
+    verifiedCount,
+    failedClaims,
+    passed: failedClaims.length === 0,
+    verifiedClaims,
+    inferredClaims,
+    hypothesisClaims,
+    negativeKnowledgeClaims,
+    untaggedParagraphs,
+    integrityScore
+  };
+}
+async function listEpistemicSources(rootDir) {
+  return loadEpistemicIndex(rootDir);
+}
+function generateGrillQuestions(specText, focusAreas = []) {
+  const lines = specText.split(`
+`).map((l) => l.trim()).filter(Boolean);
+  const topic = lines[0]?.replace(/^#+\s*/, "") || "System Architecture & Specification";
+  const questions = [
+    `[State & Concurrency] What happens in "${topic}" if two subagents or requests mutate the same state concurrently or a process crashes mid-write?`,
+    `[Failure Modes & Recovery] Which external dependencies or I/O boundaries in "${topic}" can fail or time out, and what is the deterministic fallback or rollback path?`,
+    `[Boundary Invariants] What untrusted inputs enter "${topic}", and where is the schema validation boundary enforced before business logic executes?`,
+    `[Verification & Observability] What single automated command or invariant assertion proves "${topic}" works without human guesswork?`,
+    `[Scope & Blast Radius] Which existing modules or contracts could break if "${topic}" changes, and what is the minimal viable slice we should lock first?`
+  ];
+  for (const area of focusAreas) {
+    questions.push(`[Focused Stress-Test: ${area}] What implicit assumption in "${area}" has not yet been verified against actual code or primary sources?`);
+  }
+  return { topic, questions };
+}
+function registerEpistemicTools(editor, rootDir) {
+  editor.namespace({
+    name: "epistemic",
+    description: "IUMBTEMS Epistemic & Dialectic Engine: SHA-256 content-addressed source cache, verbatim quote verifier, SPDX license contamination guard, and Socratic grill stress-tester."
+  });
+  editor.add({
+    name: "cache_source",
+    description: "Cache raw source text or documentation in `.opencode/epistemic/sources/<shortHash>.md`, compute its SHA-256 hash, and classify its SPDX license.",
+    options: { namespace: "epistemic", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        content: { type: "string" },
+        url: { type: "string" },
+        spdxLicense: { type: "string" }
+      },
+      required: ["title", "content"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const entry = await cacheEpistemicSource(rootDir, input);
+      return {
+        output: entry,
+        content: `Cached epistemic source [${entry.shortHash}] (${entry.licenseCategory}): ${entry.title}`
+      };
+    }
+  });
+  editor.add({
+    name: "verify_claims",
+    description: "Verify all `[VERIFIED: <shortHash> | 'exact quote']` tags in a Markdown text against `.opencode/epistemic/sources/`.",
+    options: { namespace: "epistemic", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: { markdown: { type: "string" } },
+      required: ["markdown"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const report = await verifyEpistemicClaims(rootDir, input.markdown);
+      return { output: report, content: JSON.stringify(report, null, 2) };
+    }
+  });
+  editor.add({
+    name: "grill_spec",
+    description: "Generate Socratic stress-test questions to expose hidden assumptions, race conditions, and unverified boundaries in a specification.",
+    options: { namespace: "epistemic", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        specText: { type: "string" },
+        focusAreas: { type: "array", items: { type: "string" } }
+      },
+      required: ["specText"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = generateGrillQuestions(input.specText, input.focusAreas ?? []);
+      return { output: res, content: JSON.stringify(res, null, 2) };
+    }
+  });
+}
+
+// src/compat/claude-code.ts
+import * as fs2 from "fs/promises";
+import * as os from "os";
+import * as path2 from "path";
+function parseFrontmatter(raw) {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(raw);
+  if (!m)
+    return { meta: {}, body: raw.trim() };
+  const meta = {};
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = /^([A-Za-z0-9_-]+)\s*:\s*(.+)$/.exec(line.trim());
+    if (kv)
+      meta[kv[1].toLowerCase()] = kv[2].trim().replace(/^["']|["']$/g, "");
+  }
+  return { meta, body: m[2].trim() };
+}
+async function listMdFiles(dir) {
+  try {
+    const entries = await fs2.readdir(dir, { withFileTypes: true });
+    return entries.filter((e) => e.isFile() && e.name.endsWith(".md")).map((e) => path2.join(dir, e.name));
+  } catch {
+    return [];
+  }
+}
+async function discoverClaudeCodeAssets(rootDir, includeUserHome = false) {
+  const roots = [
+    path2.join(rootDir, ".claude"),
+    ...includeUserHome ? [path2.join(os.homedir(), ".claude")] : []
+  ];
+  const commands = [];
+  const agents = [];
+  const skills = [];
+  const seenCmds = new Set;
+  const seenAgents = new Set;
+  const seenSkills = new Set;
+  for (const base of roots) {
+    for (const file of await listMdFiles(path2.join(base, "commands"))) {
+      const name = path2.basename(file, ".md").toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+      if (seenCmds.has(name))
+        continue;
+      seenCmds.add(name);
+      const raw = await fs2.readFile(file, "utf8");
+      const { meta, body } = parseFrontmatter(raw);
+      commands.push({
+        name,
+        description: meta.description ?? `Claude Code command /${name}`,
+        template: body,
+        path: file
+      });
+    }
+    for (const file of await listMdFiles(path2.join(base, "agents"))) {
+      const raw = await fs2.readFile(file, "utf8");
+      const { meta, body } = parseFrontmatter(raw);
+      const id = (meta.name ?? path2.basename(file, ".md")).toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+      if (seenAgents.has(id))
+        continue;
+      seenAgents.add(id);
+      agents.push({
+        id,
+        name: meta.name ?? id,
+        description: meta.description ?? `Claude Code subagent ${id}`,
+        system: body,
+        path: file
+      });
+    }
+    try {
+      const skillDirs = await fs2.readdir(path2.join(base, "skills"), {
+        withFileTypes: true
+      });
+      for (const d of skillDirs) {
+        if (!d.isDirectory())
+          continue;
+        const skillFile = path2.join(base, "skills", d.name, "SKILL.md");
+        try {
+          const raw = await fs2.readFile(skillFile, "utf8");
+          const { meta } = parseFrontmatter(raw);
+          const id = (meta.name ?? d.name).toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+          if (seenSkills.has(id))
+            continue;
+          seenSkills.add(id);
+          skills.push({
+            id,
+            name: meta.name ?? d.name,
+            description: meta.description ?? `Claude Code skill ${id}`,
+            content: raw,
+            path: skillFile
+          });
+        } catch {}
+      }
+    } catch {}
+  }
+  return { commands, agents, skills };
+}
+async function registerClaudeCodeBridge(ctx, rootDir) {
+  const inv = await discoverClaudeCodeAssets(rootDir, false);
+  if (inv.agents.length > 0 && ctx.agent?.transform) {
+    await ctx.agent.transform((editor) => {
+      for (const a of inv.agents) {
+        editor.update(a.id, (item) => {
+          item.name = a.name;
+          item.description = a.description;
+          item.mode = "subagent";
+          item.system = a.system;
+        });
+      }
+    });
+  }
+  if (inv.skills.length > 0 && ctx.skill?.transform) {
+    await ctx.skill.transform((editor) => {
+      for (const s of inv.skills) {
+        editor.add({
+          id: s.id,
+          name: s.name,
+          description: s.description,
+          autoinvoke: false,
+          path: s.path,
+          content: s.content
+        });
+      }
+    });
+  }
+  if (inv.commands.length > 0 && ctx.command?.transform) {
+    await ctx.command.transform((editor) => {
+      for (const cmd of inv.commands) {
+        editor.add({
+          name: cmd.name,
+          description: cmd.description,
+          execute: async (input) => {
+            const args = String(input?.prompt?.text ?? input?.prompt ?? "").trim();
+            const rendered = cmd.template.includes("$ARGUMENTS") ? cmd.template.replaceAll("$ARGUMENTS", args) : `${cmd.template}${args ? `
+
+${args}` : ""}`;
+            if (ctx.session?.prompt) {
+              await ctx.session.prompt({
+                ...input.prompt,
+                sessionID: input.sessionID,
+                text: rendered,
+                delivery: input.delivery ?? "steer"
+              });
+            }
+          }
+        });
+      }
+    });
+  }
+  return inv;
+}
+function registerClaudeBridgeTools(editor, rootDir) {
+  editor.namespace({
+    name: "claude",
+    description: "Claude Code Compatibility Bridge (`claude-4-opencode`): inspects and loads `.claude/commands/*.md`, `.claude/agents/*.md`, and `.claude/skills/*/SKILL.md`."
+  });
+  editor.add({
+    name: "inventory",
+    description: "List all Claude Code commands, subagents, and skills discovered in `.claude/`.",
+    options: { namespace: "claude", codemode: true, pinned: false },
+    input: {
+      type: "object",
+      properties: {
+        includeUserHome: {
+          type: "boolean",
+          description: "Also scan ~/.claude/ (default false)"
+        }
+      }
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const inv = await discoverClaudeCodeAssets(rootDir, Boolean(input?.includeUserHome));
+      return { output: inv, content: JSON.stringify(inv, null, 2) };
+    }
+  });
+}
+var registerClaudeCompatTools = registerClaudeBridgeTools;
+
+// src/omni/ux-judge.ts
+import * as fs3 from "fs/promises";
+import * as path3 from "path";
+var UX_SCORECARD_BROWSER_SCRIPT = `(() => {
+  const vw = window.innerWidth || 1440;
+  const vh = window.innerHeight || 900;
+  const horizontalOverflowPx = Math.max(0, document.documentElement.scrollWidth - vw - 2);
+
+  let elementOverflowCount = 0;
+  let siblingCollisionCount = 0;
+  let baselineJitterCount = 0;
+  let lowContrastCount = 0;
+  let descenderClipCount = 0;
+  let tinyTargetCount = 0;
+  let unlabeledControlCount = 0;
+  let offGridSpacingCount = 0;
+  let totalSpacingSamples = 0;
+  let proseLineLengthViolations = 0;
+  let neonSlopGradientCount = 0;
+  let occupiedArea = 0;
+
+  const fontSizes = new Set();
+  let maxHeadingSize = 16;
+  let bodyFontSize = parseFloat(getComputedStyle(document.body).fontSize) || 16;
+
+  function parseRgb(str) {
+    const m = str && str.match(/rgba?((d+),s*(d+),s*(d+)(?:,s*([d.]+))?)/);
+    if (!m) return null;
+    return { r: +m[1], g: +m[2], b: +m[3], a: m[4] !== undefined ? +m[4] : 1 };
+  }
+  function luminance({ r, g, b }) {
+    const a = [r, g, b].map((v) => {
+      v /= 255;
+      return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    });
+    return a[0] * 0.2126 + a[1] * 0.7152 + a[2] * 0.0722;
+  }
+  function contrastRatio(c1, c2) {
+    const l1 = luminance(c1);
+    const l2 = luminance(c2);
+    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+  }
+  function effectiveBg(el) {
+    let cur = el;
+    while (cur && cur.nodeType === 1) {
+      const bg = parseRgb(getComputedStyle(cur).backgroundColor);
+      if (bg && bg.a >= 0.85) return bg;
+      cur = cur.parentElement;
+    }
+    return { r: 255, g: 255, b: 255, a: 1 };
+  }
+
+  const all = Array.from(document.querySelectorAll('body *'));
+  for (const el of all) {
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || +style.opacity === 0) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+
+    if (el.parentElement === document.body) {
+      occupiedArea += Math.min(rect.width, vw) * Math.min(rect.height, vh);
+    }
+
+    const fs = Math.round(parseFloat(style.fontSize) || 16);
+    fontSizes.add(fs);
+    if (/^H[1-3]$/.test(el.tagName)) maxHeadingSize = Math.max(maxHeadingSize, fs);
+
+    if (style.backgroundImage && /linear-gradient|radial-gradient/i.test(style.backgroundImage)) {
+      if (/rgba?(s*(?:1[2-9]d|2[0-5]d)s*,s*[0-6]ds*,s*2[0-5]d/i.test(style.backgroundImage)) {
+        neonSlopGradientCount++;
+      }
+    }
+
+    for (const prop of ['paddingTop', 'paddingBottom', 'paddingLeft', 'paddingRight', 'gap']) {
+      const val = Math.round(parseFloat(style[prop]) || 0);
+      if (val > 0) {
+        totalSpacingSamples++;
+        if (val % 4 !== 0 && val % 6 !== 0) offGridSpacingCount++;
+      }
+    }
+
+    if (
+      el.scrollWidth > el.clientWidth + 2 &&
+      style.overflowX !== 'auto' &&
+      style.overflowX !== 'scroll' &&
+      style.overflowX !== 'hidden'
+    ) {
+      elementOverflowCount++;
+    }
+
+    const isInteractive = el.matches('button, a, input, select, textarea, [role="button"]');
+    if (isInteractive) {
+      if (rect.width < 24 || rect.height < 24) tinyTargetCount++;
+      const label = (el.textContent || '') + (el.getAttribute('aria-label') || '') + (el.getAttribute('title') || '') + (el.getAttribute('placeholder') || '');
+      if (!label.trim() && !el.querySelector('svg, img')) unlabeledControlCount++;
+    }
+
+    const hasDirectText = Array.from(el.childNodes).some((n) => n.nodeType === 3 && n.textContent.trim().length > 0);
+    if (hasDirectText) {
+      const fg = parseRgb(style.color);
+      const bg = effectiveBg(el);
+      if (fg && bg) {
+        const ratio = contrastRatio(fg, bg);
+        const minR = fs >= 19 ? 3.0 : 4.5;
+        if (ratio < minR) lowContrastCount++;
+      }
+      const lh = parseFloat(style.lineHeight);
+      if (lh && fs && lh / fs < 1.15 && style.overflow === 'hidden') descenderClipCount++;
+      if (el.tagName === 'P' && (el.textContent || '').trim().length > 140 && rect.width > fs * 52) {
+        proseLineLengthViolations++;
+      }
+    }
+
+    const children = Array.from(el.children).filter((c) => {
+      const cs = getComputedStyle(c);
+      return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.position !== 'absolute' && cs.position !== 'fixed';
+    });
+    for (let i = 0; i < children.length; i++) {
+      const r1 = children[i].getBoundingClientRect();
+      for (let j = i + 1; j < children.length; j++) {
+        const r2 = children[j].getBoundingClientRect();
+        const overlapX = Math.max(0, Math.min(r1.right, r2.right) - Math.max(r1.left, r2.left));
+        const overlapY = Math.max(0, Math.min(r1.bottom, r2.bottom) - Math.max(r1.top, r2.top));
+        if (overlapX > 2 && overlapY > 2) siblingCollisionCount++;
+        const topDiff = Math.abs(r1.top - r2.top);
+        if (topDiff > 0.5 && topDiff <= 3.5 && overlapX === 0) baselineJitterCount++;
+      }
+    }
+  }
+
+  return {
+    viewport: { width: vw, height: vh },
+    horizontalOverflowPx,
+    elementOverflowCount,
+    siblingCollisionCount,
+    baselineJitterCount,
+    lowContrastCount,
+    descenderClipCount,
+    tinyTargetCount,
+    unlabeledControlCount,
+    offGridSpacingCount,
+    totalSpacingSamples,
+    distinctFontSizes: fontSizes.size,
+    headingToBodyRatio: +(maxHeadingSize / Math.max(12, bodyFontSize)).toFixed(2),
+    proseLineLengthViolations,
+    neonSlopGradientCount,
+    viewportCoverageRatio: +Math.min(1, occupiedArea / Math.max(1, vw * vh)).toFixed(2)
+  };
+})()`;
+function scoreUXMetrics(metrics) {
+  const remediation = [];
+  let spatialScore = 25;
+  if (metrics.horizontalOverflowPx > 2) {
+    spatialScore -= 15;
+    remediation.push(`Eliminate horizontal page overflow (${metrics.horizontalOverflowPx}px wider than ${metrics.viewport.width}px viewport).`);
+  }
+  if (metrics.elementOverflowCount > 0) {
+    const deduct = Math.min(10, metrics.elementOverflowCount * 4);
+    spatialScore -= deduct;
+    remediation.push(`Fix ${metrics.elementOverflowCount} overflowing container(s) where scrollWidth > clientWidth.`);
+  }
+  spatialScore = Math.max(0, spatialScore);
+  let alignmentScore = 20;
+  if (metrics.collisionCount > 0) {
+    const deduct = Math.min(14, metrics.collisionCount * 7);
+    alignmentScore -= deduct;
+    remediation.push(`Resolve ${metrics.collisionCount} sibling bounding-box overlap collision(s).`);
+  }
+  if (metrics.baselineJitterCount > 0) {
+    const deduct = Math.min(8, metrics.baselineJitterCount * 2);
+    alignmentScore -= deduct;
+    remediation.push(`Align ${metrics.baselineJitterCount} sibling row element(s) with 1px-3.5px vertical baseline jitter.`);
+  }
+  alignmentScore = Math.max(0, alignmentScore);
+  let typographyScore = 20;
+  if (metrics.lowContrastCount > 0) {
+    const deduct = Math.min(14, metrics.lowContrastCount * 4);
+    typographyScore -= deduct;
+    remediation.push(`Increase foreground/background contrast on ${metrics.lowContrastCount} low-contrast text element(s) to meet WCAG AA (>= 4.5:1).`);
+  }
+  if (metrics.descenderClipCount > 0) {
+    const deduct = Math.min(6, metrics.descenderClipCount * 3);
+    typographyScore -= deduct;
+    remediation.push(`Increase line-height (>= 1.15x font-size) on ${metrics.descenderClipCount} clipped heading/text container(s).`);
+  }
+  typographyScore = Math.max(0, typographyScore);
+  let interactiveScore = 15;
+  if (metrics.tinyTargetCount > 0) {
+    const deduct = Math.min(9, metrics.tinyTargetCount * 3);
+    interactiveScore -= deduct;
+    remediation.push(`Enlarge ${metrics.tinyTargetCount} interactive control(s) smaller than 24x24px minimum target size.`);
+  }
+  if (metrics.missingLabelCount > 0) {
+    const deduct = Math.min(6, metrics.missingLabelCount * 3);
+    interactiveScore -= deduct;
+    remediation.push(`Add accessible text or aria-label to ${metrics.missingLabelCount} unlabeled button/input control(s).`);
+  }
+  interactiveScore = Math.max(0, interactiveScore);
+  let tokenScore = 10;
+  if (metrics.uniqueFontSizes > 8) {
+    const deduct = Math.min(5, (metrics.uniqueFontSizes - 8) * 2);
+    tokenScore -= deduct;
+    remediation.push(`Consolidate typography scale (${metrics.uniqueFontSizes} distinct font sizes detected; target <= 7).`);
+  }
+  if (metrics.arbitraryInlineHexCount > 0) {
+    const deduct = Math.min(5, metrics.arbitraryInlineHexCount);
+    tokenScore -= deduct;
+    remediation.push(`Replace ${metrics.arbitraryInlineHexCount} hardcoded inline style color(s) with semantic CSS variables.`);
+  }
+  tokenScore = Math.max(0, tokenScore);
+  let runtimeScore = 10;
+  if (metrics.consoleErrorCount > 0) {
+    runtimeScore -= Math.min(6, metrics.consoleErrorCount * 6);
+    remediation.push(`Fix ${metrics.consoleErrorCount} uncaught browser console error(s).`);
+  }
+  if (metrics.failedNetworkCount > 0) {
+    runtimeScore -= Math.min(4, metrics.failedNetworkCount * 4);
+    remediation.push(`Fix ${metrics.failedNetworkCount} failing 4xx/5xx network request(s).`);
+  }
+  runtimeScore = Math.max(0, runtimeScore);
+  const totalScore = spatialScore + alignmentScore + typographyScore + interactiveScore + tokenScore + runtimeScore;
+  const grade = totalScore >= 95 ? "S" : totalScore >= 85 ? "A" : totalScore >= 75 ? "B" : totalScore >= 60 ? "C" : "F";
+  const passed = totalScore >= 85 && metrics.horizontalOverflowPx <= 2 && metrics.collisionCount === 0 && metrics.consoleErrorCount === 0;
+  return {
+    score: totalScore,
+    grade,
+    passed,
+    viewport: metrics.viewport,
+    breakdown: {
+      spatialLayout: { score: spatialScore, max: 25 },
+      alignmentHarmony: { score: alignmentScore, max: 20 },
+      typographyAndContrast: { score: typographyScore, max: 20 },
+      interactiveCompleteness: { score: interactiveScore, max: 15 },
+      designTokenDiscipline: { score: tokenScore, max: 10 },
+      runtimeHealth: { score: runtimeScore, max: 10 }
+    },
+    remediation,
+    remediations: remediation,
+    evaluatedAt: new Date().toISOString()
+  };
+}
+async function saveUXScorecard(rootDir, scorecard) {
+  const dir = path3.join(rootDir, ".opencode", "artifacts");
+  await fs3.mkdir(dir, { recursive: true });
+  const file = path3.join(dir, "ux-scorecard.json");
+  await fs3.writeFile(file, JSON.stringify(scorecard, null, 2), "utf8");
+  return file;
+}
+function registerUXJudgeTools(editor, rootDir) {
+  editor.add({
+    name: "get_ux_scorecard_script",
+    description: "Return the JavaScript expression string to pass to `tools.browser.evaluate({ tabID, script })` to collect raw 6-axis UI/UX metrics for `tools.ui.score_ux`.",
+    options: { namespace: "ui", codemode: true, pinned: true },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => ({
+      output: { script: UX_SCORECARD_BROWSER_SCRIPT },
+      content: UX_SCORECARD_BROWSER_SCRIPT
+    })
+  });
+  editor.add({
+    name: "score_ux",
+    description: "Compute a deterministic 0\u2013100 Visual Quality & UI/UX Scorecard (`grade: S|A|B|C|F`, `passed: score >= 85`) from raw browser metrics returned by `get_ux_scorecard_script`, and save it to `.opencode/artifacts/ux-scorecard.json`.",
+    options: { namespace: "ui", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        metrics: {
+          type: "object",
+          description: "Raw metrics object returned by evaluating get_ux_scorecard_script"
+        },
+        threshold: {
+          type: "number",
+          description: "Minimum passing score (default 85)"
+        }
+      },
+      required: ["metrics"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const card = scoreUXMetrics(input.metrics);
+      await saveUXScorecard(rootDir, card);
+      return {
+        output: card,
+        content: `UX Scorecard: ${card.score}/100 (Grade ${card.grade}) \u2014 ${card.passed ? "PASSED" : "FAILED"}
+${card.remediation.map((r) => "- " + r).join(`
+`)}`
+      };
+    }
+  });
+}
+
+// src/packs/index.ts
+import * as fs4 from "fs/promises";
+import * as path4 from "path";
+import { createHash as createHash2 } from "crypto";
+var activePacksByRoot = new Map;
+async function detectDomainPacks(rootDir) {
+  let entries = [];
+  try {
+    entries = await fs4.readdir(rootDir);
+  } catch {
+    return {
+      godot: false,
+      gdevelop: false,
+      reverseEngineering: false,
+      recommendedPacks: []
+    };
+  }
+  const godot = entries.includes("project.godot") || entries.some((n) => n.endsWith(".tscn") || n.endsWith(".gd"));
+  const gdevelop = entries.includes("game.json") || entries.some((n) => n.endsWith(".gdg"));
+  const reverseEngineering = entries.some((n) => /\.(?:exe|dll|so|dylib|bin|elf|apk|ipa|pcap)$/i.test(n));
+  const recommendedPacks = [];
+  if (godot)
+    recommendedPacks.push("godot");
+  if (gdevelop)
+    recommendedPacks.push("gdevelop");
+  if (reverseEngineering)
+    recommendedPacks.push("re");
+  const key = path4.resolve(rootDir);
+  const manual = activePacksByRoot.get(key) ?? new Set;
+  if (godot)
+    manual.add("godot");
+  if (gdevelop)
+    manual.add("gdevelop");
+  if (reverseEngineering)
+    manual.add("re");
+  activePacksByRoot.set(key, manual);
+  return { godot, gdevelop, reverseEngineering, recommendedPacks };
+}
+async function listDomainPackStatus(rootDir) {
+  const d = await detectDomainPacks(rootDir);
+  const key = path4.resolve(rootDir);
+  const manual = activePacksByRoot.get(key) ?? new Set;
+  return [
+    {
+      id: "re",
+      title: "Reverse Engineering & Binary Analysis Pack",
+      replacesRepo: "Heretek-AI/opencode-rea",
+      active: manual.has("re"),
+      autoDetected: d.reverseEngineering,
+      reason: d.reverseEngineering ? "Detected binary artifact in workspace" : "Dormant (0 token overhead)"
+    },
+    {
+      id: "godot",
+      title: "Godot 4.x Scene & GDScript Pack",
+      replacesRepo: "Heretek-AI/godot-opencode",
+      active: manual.has("godot"),
+      autoDetected: d.godot,
+      reason: d.godot ? "Detected Godot project/scene" : "Dormant (0 token overhead)"
+    },
+    {
+      id: "gdevelop",
+      title: "GDevelop 5 Project & Debug Log Pack",
+      replacesRepo: "Heretek-AI/GDevelop-Unlocked",
+      active: manual.has("gdevelop"),
+      autoDetected: d.gdevelop,
+      reason: d.gdevelop ? "Detected GDevelop game.json/.gdg" : "Dormant (0 token overhead)"
+    }
+  ];
+}
+async function inspectGodotScene(rootDir, scenePath) {
+  const abs = path4.resolve(rootDir, scenePath);
+  const raw = await fs4.readFile(abs, "utf8");
+  const headerMatch = /\[gd_scene[^\]]*format=(\d+)/.exec(raw);
+  const formatVersion = headerMatch ? Number(headerMatch[1]) : 3;
+  const nodes = [];
+  const nodeRe = /\[node\s+name="([^"]+)"(?:\s+type="([^"]+)")?(?:\s+parent="([^"]+)")?[^\]]*\]/g;
+  let m;
+  while ((m = nodeRe.exec(raw)) !== null) {
+    nodes.push({ name: m[1], type: m[2] || "Instance", parent: m[3] || "." });
+  }
+  const extResources = [];
+  for (const em of raw.matchAll(/\[ext_resource\s+([^\]]+)\]/g)) {
+    const attrs = em[1];
+    const id = /id="([^"]+)"/.exec(attrs)?.[1] ?? /id=(\S+)/.exec(attrs)?.[1] ?? "";
+    const type = /type="([^"]+)"/.exec(attrs)?.[1] ?? "";
+    const p = /path="([^"]+)"/.exec(attrs)?.[1] ?? "";
+    extResources.push({ id, type, path: p });
+  }
+  const externalScripts = [];
+  const extRe = /\[ext_resource\s+type="Script"\s+path="([^"]+)"[^\]]*\]/g;
+  while ((m = extRe.exec(raw)) !== null) {
+    externalScripts.push(m[1]);
+  }
+  const signalConnections = [];
+  const connRe = /\[connection\s+signal="([^"]+)"\s+from="([^"]+)"\s+to="([^"]+)"\s+method="([^"]+)"[^\]]*\]/g;
+  while ((m = connRe.exec(raw)) !== null) {
+    signalConnections.push({
+      signal: m[1],
+      from: m[2],
+      to: m[3],
+      method: m[4]
+    });
+  }
+  return {
+    path: scenePath,
+    formatVersion,
+    nodeCount: nodes.length,
+    nodes,
+    extResources,
+    externalScripts,
+    signalConnections
+  };
+}
+async function inspectGDevelopProject(rootDir, projectPath = "game.json") {
+  const abs = path4.resolve(rootDir, projectPath);
+  const parsed = JSON.parse(await fs4.readFile(abs, "utf8"));
+  const props = parsed.properties ?? {};
+  const layouts = Array.isArray(parsed.layouts) ? parsed.layouts : [];
+  const scenes = layouts.map((l) => ({
+    name: String(l.name ?? "Untitled"),
+    objectCount: Array.isArray(l.objects) ? l.objects.length : 0,
+    objectsCount: Array.isArray(l.objects) ? l.objects.length : 0,
+    layerCount: Array.isArray(l.layers) ? l.layers.length : 0,
+    eventCount: Array.isArray(l.events) ? l.events.length : 0,
+    eventsCount: Array.isArray(l.events) ? l.events.length : 0
+  }));
+  return {
+    projectName: String(props.name ?? "GDevelop Project"),
+    name: String(props.name ?? "Untitled GDevelop Game"),
+    version: String(props.version ?? "1.0.0"),
+    windowWidth: Number(props.windowWidth ?? 800),
+    windowHeight: Number(props.windowHeight ?? 600),
+    sceneCount: scenes.length,
+    scenes,
+    globalObjectsCount: Array.isArray(parsed.objects) ? parsed.objects.length : 0,
+    extensionsCount: Array.isArray(parsed.eventsFunctionsExtensions) ? parsed.eventsFunctionsExtensions.length : 0,
+    extensionCount: Array.isArray(parsed.eventsFunctionsExtensions) ? parsed.eventsFunctionsExtensions.length : 0,
+    externalEventCount: Array.isArray(parsed.externalEvents) ? parsed.externalEvents.length : 0
+  };
+}
+async function inspectBinaryTarget(rootDir, binaryPath) {
+  const abs = path4.resolve(rootDir, binaryPath);
+  const buf = await fs4.readFile(abs);
+  const sha256 = createHash2("sha256").update(buf).digest("hex");
+  let format = "UNKNOWN";
+  if (buf.length >= 4) {
+    if (buf[0] === 127 && buf[1] === 69 && buf[2] === 76 && buf[3] === 70)
+      format = "ELF";
+    else if (buf[0] === 77 && buf[1] === 90)
+      format = "PE/COFF";
+    else if (buf[0] === 254 && buf[1] === 237 && buf[2] === 250 && (buf[3] === 206 || buf[3] === 207) || buf[3] === 254 && buf[2] === 237 && buf[1] === 250 && (buf[0] === 206 || buf[0] === 207))
+      format = "Mach-O";
+    else if (buf[0] === 0 && buf[1] === 97 && buf[2] === 115 && buf[3] === 109)
+      format = "WASM";
+  }
+  const counts = new Array(256).fill(0);
+  for (let i = 0;i < buf.length; i++)
+    counts[buf[i]]++;
+  let entropy = 0;
+  if (buf.length > 0) {
+    for (const c of counts) {
+      if (c > 0) {
+        const p = c / buf.length;
+        entropy -= p * Math.log2(p);
+      }
+    }
+  }
+  const asciiContent = buf.toString("latin1");
+  const strMatches = asciiContent.match(/[ -~]{5,120}/g) ?? [];
+  const suspiciousRe = /(?:https?:\/\/|\/bin\/|\/etc\/|cmd\.exe|powershell|VirtualAlloc|LoadLibrary|dlopen|ptrace|AES|RSA|flag\{|password|token|secret)/i;
+  const suspiciousStrings = strMatches.filter((s) => suspiciousRe.test(s)).slice(0, 40);
+  return {
+    path: binaryPath,
+    sizeBytes: buf.length,
+    byteLength: buf.length,
+    sha256,
+    format,
+    entropyBitsPerByte: +entropy.toFixed(3),
+    extractedStringsSample: strMatches.slice(0, 60),
+    extractedStringsCount: strMatches.length,
+    suspiciousStrings
+  };
+}
+var DOMAIN_PACK_ROLES = {
+  "specialist-godot": {
+    id: "specialist-godot",
+    name: "Godot 4 Architect",
+    description: "Godot 4.x GDScript, Scene Tree (.tscn), Signal & Shader Specialist (consolidates godot-opencode).",
+    mode: "subagent",
+    system: "You are the Principal Godot 4.x Engine Architect (`specialist-godot`). Inspect `.tscn` scene trees via `tools.packs.godot_inspect_scene`, enforce typed GDScript 2.0 (`class_name`, `@export`, `@onready`), and verify signal connections cleanly."
+  },
+  "specialist-gdevelop": {
+    id: "specialist-gdevelop",
+    name: "GDevelop 5 Specialist",
+    description: "GDevelop 5 Event Sheet, Scene JSON (`game.json`), and Custom Behavior Specialist (consolidates GDevelop-Unlocked).",
+    mode: "subagent",
+    system: "You are the Principal GDevelop 5 Game Engineer (`specialist-gdevelop`). Inspect `game.json` via `tools.packs.gdevelop_inspect_game` before mutating scenes, objects, or event sheets, and preserve valid GDevelop JSON schema invariants."
+  },
+  "specialist-re": {
+    id: "specialist-re",
+    name: "Reverse Engineering Analyst",
+    description: "Binary Triage, Disassembly, Protocol Reconstruction & Security Analyst (consolidates opencode-rea).",
+    mode: "subagent",
+    system: "You are the Principal Reverse Engineering & Binary Intelligence Analyst (`specialist-re`). Use `tools.packs.re_inspect_binary` for static header, entropy, and string triage before deeper disassembly or decompilation."
+  }
+};
+function registerDomainPackTools(editor, rootDir) {
+  editor.namespace({
+    name: "packs",
+    description: "Unified Heretek Domain Packs (`re` from opencode-rea, `godot` from godot-opencode, `gdevelop` from GDevelop-Unlocked). Dormant until auto-detected or activated via `/pack`."
+  });
+  editor.add({
+    name: "status",
+    description: "List all domain packs (`re`, `godot`, `gdevelop`) and whether they are active in this workspace.",
+    options: { namespace: "packs", codemode: true, pinned: false },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const detection = await detectDomainPacks(rootDir);
+      const packs = await listDomainPackStatus(rootDir);
+      return {
+        output: { detection, packs },
+        content: JSON.stringify({ detection, packs }, null, 2)
+      };
+    }
+  });
+  editor.add({
+    name: "godot_inspect_scene",
+    description: "Parse a Godot 4.x `.tscn` scene file into its node hierarchy, attached scripts, and external resources.",
+    options: { namespace: "packs", codemode: true, pinned: false },
+    input: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to .tscn file" }
+      },
+      required: ["path"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await inspectGodotScene(rootDir, input.path);
+      return { output: res, content: JSON.stringify(res, null, 2) };
+    }
+  });
+  editor.add({
+    name: "gdevelop_inspect_project",
+    description: "Parse a GDevelop 5 `game.json` project into scenes, object counts, event counts, and extensions.",
+    options: { namespace: "packs", codemode: true, pinned: false },
+    input: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Path to game.json (default 'game.json')"
+        }
+      }
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await inspectGDevelopProject(rootDir, input?.path ?? "game.json");
+      return { output: res, content: JSON.stringify(res, null, 2) };
+    }
+  });
+  editor.add({
+    name: "gdevelop_inspect_game",
+    description: "Inspect a GDevelop 5 game.json project (alias of gdevelop_inspect_project).",
+    options: { namespace: "packs", codemode: true, pinned: false },
+    input: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Path to game.json (default 'game.json')"
+        }
+      }
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await inspectGDevelopProject(rootDir, input?.path ?? "game.json");
+      return { output: res, content: JSON.stringify(res, null, 2) };
+    }
+  });
+  editor.add({
+    name: "re_inspect_binary",
+    description: "Identify binary format (ELF, PE, Mach-O, WASM), byte size, and printable strings sample from a binary file.",
+    options: { namespace: "packs", codemode: true, pinned: false },
+    input: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to binary file" }
+      },
+      required: ["path"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await inspectBinaryTarget(rootDir, input.path);
+      return { output: res, content: JSON.stringify(res, null, 2) };
+    }
+  });
+}
+async function registerDomainPacks(ctx, rootDir) {
+  const detection = await detectDomainPacks(rootDir);
+  const ids = [];
+  if (detection.godot)
+    ids.push("godot");
+  if (detection.gdevelop)
+    ids.push("gdevelop");
+  if (detection.reverseEngineering)
+    ids.push("re");
+  if (ctx?.agent?.transform) {
+    await ctx.agent.transform((editor) => {
+      for (const [id, def] of Object.entries(DOMAIN_PACK_ROLES)) {
+        const packId = id.replace("specialist-", "");
+        const active = ids.some((p) => packId.startsWith(p) || p === "re" && packId === "re");
+        if (!active && (detection.recommendedPacks.length > 0 || ids.length > 0))
+          continue;
+        editor.register?.(def);
+      }
+    });
+  }
+  if (ctx?.tool?.transform) {
+    await ctx.tool.transform((editor) => {
+      registerDomainPackTools(editor, rootDir);
+    });
+  }
+}
+
+// src/webui/dashboard.ts
+import * as fs10 from "fs/promises";
+import * as path10 from "path";
+
+// src/board/board.ts
+import * as fs8 from "fs/promises";
+import * as path8 from "path";
+
+// src/omni/verify.ts
+import { exec, execFile } from "child_process";
+import { createHash as createHash3 } from "crypto";
+import * as fs6 from "fs/promises";
+import * as path6 from "path";
+import { promisify } from "util";
+
+// src/omni/repomap.ts
+import * as fs5 from "fs/promises";
+import * as path5 from "path";
+var LANG_BY_EXT = {
+  ".ts": "ts",
+  ".tsx": "ts",
+  ".mts": "ts",
+  ".cts": "ts",
+  ".js": "ts",
+  ".jsx": "ts",
+  ".mjs": "ts",
+  ".cjs": "ts",
+  ".py": "py",
+  ".go": "go",
+  ".rs": "rs"
+};
+var IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", ".opencode", ".worktrees", "target", "__pycache__", "vendor", ".venv", "venv"]);
+var MAX_FILES = 3000;
+var MAX_FILE_BYTES = 512 * 1024;
+async function walkSourceFiles(dir, rootDir, acc = []) {
+  if (acc.length >= MAX_FILES)
+    return acc;
+  let entries = [];
+  try {
+    entries = await fs5.readdir(dir, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of entries) {
+    if (acc.length >= MAX_FILES)
+      break;
+    if (entry.name.startsWith(".") && entry.name !== ".github")
+      continue;
+    if (entry.isDirectory()) {
+      if (IGNORED_DIRS.has(entry.name))
+        continue;
+      await walkSourceFiles(path5.join(dir, entry.name), rootDir, acc);
+    } else if (entry.isFile() && LANG_BY_EXT[path5.extname(entry.name).toLowerCase()] && !entry.name.endsWith(".d.ts")) {
+      acc.push(path5.relative(rootDir, path5.join(dir, entry.name)).split(path5.sep).join("/"));
+    }
+  }
+  return acc;
+}
+function stripCommentsAndStrings(text, lang) {
+  let out = "";
+  let i = 0;
+  const keepSpecifier = () => /(?:\bfrom|\bimport|\brequire\s*\(|\bimport\s*\()\s*$/.test(out.slice(-40));
+  while (i < text.length) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (lang !== "py" && ch === "/" && next === "/") {
+      while (i < text.length && text[i] !== `
+`)
+        i++;
+      continue;
+    }
+    if (lang !== "py" && ch === "/" && next === "*") {
+      const end = text.indexOf("*/", i + 2);
+      const stop = end < 0 ? text.length : end + 2;
+      out += text.slice(i, stop).replace(/[^\n]/g, " ");
+      i = stop;
+      continue;
+    }
+    if (lang === "py" && ch === "#") {
+      while (i < text.length && text[i] !== `
+`)
+        i++;
+      continue;
+    }
+    if (lang === "py" && (text.startsWith('"""', i) || text.startsWith("'''", i))) {
+      const q = text.slice(i, i + 3);
+      const end = text.indexOf(q, i + 3);
+      const stop = end < 0 ? text.length : end + 3;
+      out += text.slice(i, stop).replace(/[^\n]/g, " ");
+      i = stop;
+      continue;
+    }
+    if (lang === "rs" && ch === "'") {
+      const m = /^'(?:\\.|[^\\'\n])'/.exec(text.slice(i, i + 6));
+      if (m) {
+        out += " ".repeat(m[0].length);
+        i += m[0].length;
+        continue;
+      }
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== ch) {
+        if (text[j] === "\\")
+          j++;
+        else if (text[j] === `
+` && ch !== "`")
+          break;
+        j++;
+      }
+      const literal = text.slice(i, j + 1);
+      const keep = ch !== "`" && (lang === "go" || lang === "py" || keepSpecifier());
+      out += keep ? literal : ch + literal.slice(1, -1).replace(/[^\n]/g, " ") + (literal.length > 1 ? ch : "");
+      i = j + 1;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+function splitNames(list) {
+  return list.split(",").map((s) => s.trim().replace(/^type\s+/, "")).filter(Boolean).map((s) => {
+    const m = /^([\w$]+)(?:\s+as\s+([\w$]+))?$/.exec(s);
+    return m ? [m[1], m[2] ?? m[1]] : ["*", "*"];
+  });
+}
+function parseTs(code) {
+  const imports = [];
+  const exports = new Set;
+  for (const m of code.matchAll(/\bimport\s+(?:type\s+)?([\s\S]*?)\s+from\s*["']([^"']+)["']/g)) {
+    const clause = m[1].trim();
+    const names = [];
+    const braces = /\{([\s\S]*)\}/.exec(clause);
+    if (braces)
+      for (const [imported] of splitNames(braces[1]))
+        names.push(imported);
+    if (/\*\s+as\s+[\w$]+/.test(clause))
+      names.push("*");
+    const def = clause.replace(/\{[\s\S]*\}/, "").replace(/\*\s+as\s+[\w$]+/, "").replace(/,/g, " ").trim();
+    if (def && /^[\w$]+$/.test(def))
+      names.push("default");
+    imports.push({ spec: m[2], names: names.length ? names : ["*"], reexports: [] });
+  }
+  for (const m of code.matchAll(/\bimport\s*["']([^"']+)["']/g))
+    imports.push({ spec: m[1], names: ["*"], reexports: [] });
+  for (const m of code.matchAll(/\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/g))
+    imports.push({ spec: m[1], names: ["*"], reexports: [] });
+  for (const m of code.matchAll(/\bexport\s+(?:type\s+)?\{([^}]*)\}\s*from\s*["']([^"']+)["']/g)) {
+    const pairs = splitNames(m[1]);
+    imports.push({ spec: m[2], names: pairs.map((p) => p[0]), reexports: pairs });
+    for (const [, exported] of pairs)
+      exports.add(exported);
+  }
+  for (const m of code.matchAll(/\bexport\s*\*\s*(?:as\s+([\w$]+)\s+)?from\s*["']([^"']+)["']/g)) {
+    imports.push({ spec: m[2], names: ["*"], reexports: [["*", m[1] ?? "*"]] });
+    if (m[1])
+      exports.add(m[1]);
+  }
+  for (const m of code.matchAll(/\bexport\s+(?:declare\s+)?(?:default\s+)?(?:async\s+)?(?:abstract\s+)?(?:function\*?|class|interface|type|const|let|var|enum|namespace)\s+([\w$]+)/g)) {
+    exports.add(m[1]);
+  }
+  if (/\bexport\s+default\b/.test(code))
+    exports.add("default");
+  for (const m of code.matchAll(/\bexport\s+(?:type\s+)?\{([^}]*)\}(?!\s*from)/g)) {
+    for (const [, exported] of splitNames(m[1]))
+      exports.add(exported);
+  }
+  if (exports.size === 0) {
+    for (const m of code.matchAll(/\bexports\.([\w$]+)\s*=/g))
+      exports.add(m[1]);
+  }
+  return { lang: "ts", exports: [...exports], imports };
+}
+function parsePy(code) {
+  const imports = [];
+  const exports = new Set;
+  const joined = code.replace(/\(\s*([^)]*?)\s*\)/gs, (_, inner) => inner.replace(/\s*\n\s*/g, " "));
+  for (const line of joined.split(`
+`)) {
+    let m = /^\s*from\s+([.\w]+)\s+import\s+(.+)$/.exec(line);
+    if (m) {
+      const names = m[2].split(",").map((s) => s.trim().split(/\s+as\s+/)[0]).filter(Boolean);
+      imports.push({ spec: m[1], names: names.includes("*") ? ["*"] : names, reexports: [] });
+      continue;
+    }
+    m = /^\s*import\s+(.+)$/.exec(line);
+    if (m) {
+      for (const part of m[1].split(",")) {
+        const mod = part.trim().split(/\s+as\s+/)[0];
+        if (mod)
+          imports.push({ spec: mod, names: ["*"], reexports: [] });
+      }
+      continue;
+    }
+    m = /^(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)/.exec(line) ?? /^([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)/.exec(line);
+    if (m)
+      exports.add(m[1]);
+  }
+  return { lang: "py", exports: [...exports], imports };
+}
+function parseGo(code) {
+  const imports = [];
+  const goSelectors = new Map;
+  const specs = [];
+  for (const m of code.matchAll(/\bimport\s*\(([\s\S]*?)\)/g)) {
+    for (const line of m[1].split(`
+`)) {
+      const lm = /^\s*([\w.]+\s+)?"([^"]+)"/.exec(line);
+      if (lm)
+        specs.push({ alias: lm[1]?.trim(), spec: lm[2] });
+    }
+  }
+  for (const m of code.matchAll(/\bimport\s+([\w.]+\s+)?"([^"]+)"/g))
+    specs.push({ alias: m[1]?.trim(), spec: m[2] });
+  for (const { alias, spec } of specs) {
+    const name = alias && alias !== "_" && alias !== "." ? alias : spec.split("/").pop();
+    const used = new Set;
+    for (const u of code.matchAll(new RegExp(`\\b${name.replace(/[^\w]/g, "")}\\.([A-Z]\\w*)`, "g")))
+      used.add(u[1]);
+    goSelectors.set(spec, used);
+    imports.push({ spec, names: alias === "." || used.size === 0 ? ["*"] : [...used], reexports: [] });
+  }
+  const exports = new Set;
+  for (const m of code.matchAll(/^(?:func\s+(?:\([^)]*\)\s*)?|type\s+|var\s+|const\s+)([A-Z]\w*)/gm))
+    exports.add(m[1]);
+  for (const m of code.matchAll(/^(?:var|const)\s*\(([\s\S]*?)^\)/gm)) {
+    for (const line of m[1].split(`
+`)) {
+      const lm = /^\s*([A-Z]\w*)/.exec(line);
+      if (lm)
+        exports.add(lm[1]);
+    }
+  }
+  return { lang: "go", exports: [...exports], imports, goSelectors };
+}
+function parseRs(code) {
+  const imports = [];
+  const exports = new Set;
+  for (const m of code.matchAll(/^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z_]\w*)\s*;/gm)) {
+    imports.push({ spec: `mod:${m[1]}`, names: ["*"], reexports: [] });
+  }
+  for (const m of code.matchAll(/^\s*(pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/gm)) {
+    const body = m[2].replace(/\s+/g, "");
+    const brace = /^(.*?)::\{(.*)\}$/.exec(body);
+    const isPub = Boolean(m[1]);
+    if (brace) {
+      const names = brace[2].split(",").map((n) => n.split("as")[0]).filter(Boolean);
+      imports.push({ spec: `use:${brace[1]}`, names, reexports: isPub ? names.map((n) => [n, n]) : [] });
+    } else {
+      const segs = body.split("::");
+      const last = segs.pop().split("as")[0];
+      imports.push({ spec: `use:${segs.join("::")}`, names: [last === "*" ? "*" : last], reexports: isPub ? [[last, last]] : [] });
+    }
+  }
+  for (const m of code.matchAll(/^\s*pub(?:\([^)]*\))?\s+(?:async\s+)?(?:unsafe\s+)?(?:fn|struct|enum|trait|type|const|static|mod|union)\s+([A-Za-z_]\w*)/gm)) {
+    exports.add(m[1]);
+  }
+  return { lang: "rs", exports: [...exports], imports };
+}
+function parseSourceFacts(text, lang) {
+  const code = stripCommentsAndStrings(text, lang);
+  if (lang === "py")
+    return parsePy(code);
+  if (lang === "go")
+    return parseGo(code);
+  if (lang === "rs")
+    return parseRs(code);
+  return parseTs(code);
+}
+function resolveTs(from, spec, ctx) {
+  let base;
+  if (spec.startsWith("."))
+    base = path5.posix.normalize(path5.posix.join(path5.posix.dirname(from), spec));
+  else if (spec.startsWith("@/") || spec.startsWith("~/"))
+    base = `src/${spec.slice(2)}`;
+  else if (spec.startsWith("/"))
+    base = spec.slice(1);
+  else
+    return [];
+  const stripped = base.replace(/\.(?:[cm]?js|jsx)$/, "");
+  const candidates = [
+    base,
+    ...[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"].map((e) => `${stripped}${e}`),
+    ...["index.ts", "index.tsx", "index.js", "index.mjs"].map((f) => `${base}/${f}`)
+  ];
+  const hit = candidates.find((c) => ctx.known.has(c));
+  return hit ? [hit] : [];
+}
+function resolvePy(from, spec, ctx) {
+  let parts;
+  if (spec.startsWith(".")) {
+    const dots = /^\.+/.exec(spec)[0].length;
+    let dir = path5.posix.dirname(from);
+    for (let k = 1;k < dots; k++)
+      dir = path5.posix.dirname(dir);
+    parts = [...dir === "." ? [] : dir.split("/"), ...spec.slice(dots).split(".").filter(Boolean)];
+  } else {
+    parts = spec.split(".");
+  }
+  const rel = parts.join("/");
+  for (const root of ["", "src/", "lib/"]) {
+    for (const c of [`${root}${rel}.py`, `${root}${rel}/__init__.py`]) {
+      if (ctx.known.has(c.replace(/^\//, "")))
+        return { files: [c.replace(/^\//, "")] };
+    }
+  }
+  return { files: [] };
+}
+function resolveGo(spec, ctx) {
+  if (!ctx.goModule || !(spec === ctx.goModule || spec.startsWith(`${ctx.goModule}/`)))
+    return [];
+  const dir = spec === ctx.goModule ? "." : spec.slice(ctx.goModule.length + 1);
+  return ctx.goDirs.get(dir) ?? [];
+}
+function resolveRs(from, spec, ctx, names) {
+  const fromDir = path5.posix.dirname(from);
+  const fileStem = path5.posix.basename(from, ".rs");
+  const moduleDir = ["mod", "lib", "main"].includes(fileStem) ? fromDir : `${fromDir}/${fileStem}`;
+  const tryModule = (dir, segs) => {
+    const p = [dir, ...segs].filter((x) => x && x !== ".").join("/");
+    return [`${p}.rs`, `${p}/mod.rs`].find((c) => ctx.known.has(c));
+  };
+  if (spec.startsWith("mod:")) {
+    const hit = tryModule(moduleDir, [spec.slice(4)]);
+    return { files: hit ? [hit] : [], names: ["*"] };
+  }
+  const segs = spec.slice(4).split("::").filter(Boolean);
+  let baseDir;
+  if (segs[0] === "crate") {
+    baseDir = ctx.rustRoots.find((r) => from.startsWith(r === "." ? "" : `${r}/`)) ?? ctx.rustRoots[0] ?? "src";
+    segs.shift();
+  } else if (segs[0] === "super") {
+    baseDir = ["mod", "lib", "main"].includes(fileStem) ? path5.posix.dirname(fromDir) : fromDir;
+    segs.shift();
+    while (segs[0] === "super") {
+      baseDir = path5.posix.dirname(baseDir);
+      segs.shift();
+    }
+  } else if (segs[0] === "self") {
+    baseDir = moduleDir;
+    segs.shift();
+  } else {
+    return { files: [], names };
+  }
+  for (let k = segs.length;k >= 0; k--) {
+    const hit = k === 0 ? undefined : tryModule(baseDir, segs.slice(0, k));
+    if (hit)
+      return { files: [hit], names: k === segs.length ? names : [segs[k]] };
+  }
+  const rootFile = [`${baseDir}/lib.rs`, `${baseDir}/main.rs`, `${baseDir}/mod.rs`].find((c) => ctx.known.has(c));
+  return rootFile ? { files: [rootFile], names: segs.length ? [segs[0]] : names } : { files: [], names };
+}
+var factsCache = new Map;
+async function readFacts(rootDir, rel) {
+  const abs = path5.resolve(rootDir, rel);
+  try {
+    const st = await fs5.stat(abs);
+    if (st.size > MAX_FILE_BYTES)
+      return;
+    const cached = factsCache.get(abs);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size)
+      return cached.facts;
+    const text = await fs5.readFile(abs, "utf8");
+    const facts = parseSourceFacts(text, LANG_BY_EXT[path5.extname(rel).toLowerCase()]);
+    factsCache.set(abs, { mtimeMs: st.mtimeMs, size: st.size, facts });
+    return facts;
+  } catch {
+    return;
+  }
+}
+async function buildRepoGraph(rootDir) {
+  const files = await walkSourceFiles(rootDir, rootDir);
+  const known = new Set(files);
+  const goDirs = new Map;
+  for (const f of files) {
+    if (f.endsWith(".go") && !f.endsWith("_test.go")) {
+      const dir = path5.posix.dirname(f);
+      goDirs.set(dir, [...goDirs.get(dir) ?? [], f]);
+    }
+  }
+  let goModule;
+  try {
+    goModule = /^module\s+(\S+)/m.exec(await fs5.readFile(path5.join(rootDir, "go.mod"), "utf8"))?.[1];
+  } catch {}
+  const rustRoots = [...new Set(files.filter((f) => /(?:^|\/)(?:lib|main)\.rs$/.test(f)).map((f) => path5.posix.dirname(f)))];
+  const ctx = { known, goModule, goDirs, rustRoots };
+  const nodes = new Map;
+  const edges = [];
+  const factsByFile = new Map;
+  for (const f of files) {
+    const facts = await readFacts(rootDir, f);
+    const lang = LANG_BY_EXT[path5.extname(f).toLowerCase()];
+    nodes.set(f, { path: f, lang, imports: [], importedBy: [], centralityScore: 0, symbols: facts?.exports.slice(0, 24) ?? [] });
+    if (facts)
+      factsByFile.set(f, facts);
+  }
+  for (const [f, facts] of factsByFile) {
+    for (const imp of facts.imports) {
+      let targets = [];
+      let names = imp.names;
+      if (facts.lang === "ts")
+        targets = resolveTs(f, imp.spec, ctx);
+      else if (facts.lang === "py")
+        targets = resolvePy(f, imp.spec, ctx).files;
+      else if (facts.lang === "go")
+        targets = resolveGo(imp.spec, ctx);
+      else if (facts.lang === "rs")
+        ({ files: targets, names } = resolveRs(f, imp.spec, ctx, imp.names));
+      const edgeNames = new Map(targets.map((t) => [t, names]));
+      if (facts.lang === "py") {
+        for (const n of imp.names) {
+          const sub = resolvePy(f, `${imp.spec}${imp.spec.endsWith(".") ? "" : "."}${n}`, ctx).files;
+          for (const s of sub) {
+            if (!targets.includes(s))
+              targets.push(s);
+            edgeNames.set(s, ["*"]);
+          }
+        }
+      }
+      if (facts.lang === "rs" && imp.spec.startsWith("mod:"))
+        for (const t of targets)
+          edgeNames.set(t, []);
+      for (const to of targets) {
+        if (to === f)
+          continue;
+        edges.push({ from: f, to, names: edgeNames.get(to) ?? names, reexports: imp.reexports });
+        const node = nodes.get(f);
+        if (!node.imports.includes(to))
+          node.imports.push(to);
+        const target = nodes.get(to);
+        if (!target.importedBy.includes(f))
+          target.importedBy.push(f);
+      }
+    }
+  }
+  computePageRank(nodes);
+  return { files, nodes, edges };
+}
+function computePageRank(nodes) {
+  const n = nodes.size;
+  if (n === 0)
+    return;
+  const damping = 0.85;
+  let rank = new Map([...nodes.keys()].map((k) => [k, 1 / n]));
+  for (let iter = 0;iter < 50; iter++) {
+    let dangling = 0;
+    for (const [k, node] of nodes)
+      if (node.imports.length === 0)
+        dangling += rank.get(k);
+    const next = new Map;
+    let delta = 0;
+    for (const [k, node] of nodes) {
+      let sum = 0;
+      for (const caller of node.importedBy)
+        sum += rank.get(caller) / nodes.get(caller).imports.length;
+      const value = (1 - damping) / n + damping * (sum + dangling / n);
+      next.set(k, value);
+      delta += Math.abs(value - rank.get(k));
+    }
+    rank = next;
+    if (delta < 0.000000001)
+      break;
+  }
+  for (const [k, node] of nodes)
+    node.centralityScore = +(rank.get(k) * n).toFixed(3);
+}
+async function buildRepoMap(rootDir, topN = 25) {
+  const graph = await buildRepoGraph(rootDir);
+  const sorted = [...graph.nodes.values()].sort((a, b) => b.centralityScore - a.centralityScore || b.importedBy.length - a.importedBy.length || a.path.localeCompare(b.path));
+  return { totalFilesScanned: graph.files.length, topFiles: sorted.slice(0, topN) };
+}
+async function analyzeBlastRadius(rootDir, targetFile, symbol) {
+  const relTarget = path5.relative(rootDir, path5.resolve(rootDir, targetFile)).split(path5.sep).join("/");
+  const graph = await buildRepoGraph(rootDir);
+  let direct;
+  if (!symbol) {
+    direct = [...graph.nodes.get(relTarget)?.importedBy ?? []];
+  } else {
+    const directSet = new Set;
+    const seen = new Set;
+    const queue = [[relTarget, symbol]];
+    while (queue.length) {
+      const [file, name] = queue.shift();
+      const key = `${file}#${name}`;
+      if (seen.has(key))
+        continue;
+      seen.add(key);
+      for (const e of graph.edges) {
+        if (e.to !== file)
+          continue;
+        const takes = e.names.includes("*") || e.names.includes(name);
+        if (!takes)
+          continue;
+        const reexport = e.reexports.find(([imported]) => imported === name || imported === "*");
+        if (reexport) {
+          queue.push([e.from, reexport[1] === "*" ? name : reexport[1]]);
+          if (!e.names.every((x) => e.reexports.some(([imp]) => imp === x || imp === "*")))
+            directSet.add(e.from);
+        } else {
+          directSet.add(e.from);
+        }
+      }
+    }
+    directSet.delete(relTarget);
+    direct = [...directSet];
+  }
+  const visited = new Set(direct);
+  const queue = [...direct];
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    for (const c of graph.nodes.get(cur)?.importedBy ?? []) {
+      if (c !== relTarget && !visited.has(c)) {
+        visited.add(c);
+        queue.push(c);
+      }
+    }
+  }
+  const transitive = [...visited].sort();
+  return {
+    targetFile: relTarget,
+    ...symbol ? { symbol } : {},
+    directDependents: direct.sort(),
+    transitiveDependents: transitive,
+    impactScore: direct.length * 2 + transitive.length
+  };
+}
+function registerRepoMapTools(editor, rootDir, pinned = true) {
+  editor.namespace({
+    name: "repo",
+    description: "Repository map (TS/JS, Python, Go, Rust): PageRank-ranked files with their exported symbols, and file- or symbol-level blast radius."
+  });
+  editor.add({
+    name: "map",
+    description: "Build a PageRank-weighted repository dependency map showing the highest-centrality files, their exported symbols, and their importers/dependents.",
+    options: { namespace: "repo", codemode: true, pinned },
+    input: {
+      type: "object",
+      properties: {
+        topN: { type: "number", description: "Number of top-ranked files to return (default 25)" }
+      }
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const report = await buildRepoMap(rootDir, input?.topN ?? 25);
+      return { output: report, content: JSON.stringify(report, null, 2) };
+    }
+  });
+  editor.add({
+    name: "blast_radius",
+    description: "List files that directly or transitively depend on `path`. Pass `symbol` to count only importers of that exported symbol (following re-exports), e.g. before changing one function's signature.",
+    options: { namespace: "repo", codemode: true, pinned },
+    input: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Target file path to analyze" },
+        symbol: { type: "string", description: "Optional exported symbol name to narrow the analysis" }
+      },
+      required: ["path"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const report = await analyzeBlastRadius(rootDir, input.path, input.symbol);
+      return { output: report, content: JSON.stringify(report, null, 2) };
+    }
+  });
+}
+
+// src/omni/verify.ts
+var execFileAsync = promisify(execFile);
+var ANSI_RE = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*\u0007/g;
+function stripAnsi(text) {
+  return text.replace(ANSI_RE, "").replace(/\r(?!\n)/g, `
+`);
+}
+function getVerifyDir(rootDir) {
+  return path6.join(rootDir, ".opencode", "verify");
+}
+async function readJson(file) {
+  try {
+    return JSON.parse(await fs6.readFile(file, "utf8"));
+  } catch {
+    return;
+  }
+}
+async function exists(file) {
+  try {
+    await fs6.access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function detectRunner(command) {
+  if (/\bbun\s+test\b/.test(command))
+    return "bun";
+  if (/\bvitest\b/.test(command))
+    return "vitest";
+  if (/\bjest\b/.test(command))
+    return "jest";
+  if (/\bnode\s+--test\b/.test(command))
+    return "node";
+  if (/\bpytest\b/.test(command))
+    return "pytest";
+  if (/\bgo\s+test\b/.test(command))
+    return "go";
+  if (/\bcargo\s+test\b/.test(command))
+    return "cargo";
+  return "unknown";
+}
+async function packageManager(rootDir) {
+  if (await exists(path6.join(rootDir, "bun.lock")) || await exists(path6.join(rootDir, "bun.lockb")))
+    return "bun";
+  if (await exists(path6.join(rootDir, "pnpm-lock.yaml")))
+    return "pnpm";
+  if (await exists(path6.join(rootDir, "yarn.lock")))
+    return "yarn";
+  return "npm";
+}
+var AGENTS_LINE_RE = /^\s*(?:[-*]\s*)?\**(typecheck|type-check|lint|test)\**\s*[:=]\s*`([^`]+)`/i;
+function normalizeKind(raw) {
+  const k = raw.toLowerCase();
+  return k === "type-check" ? "typecheck" : k;
+}
+async function discoverChecks(rootDir) {
+  const found = new Map;
+  const add = (kind, command, source) => {
+    if (found.has(kind) || !command.trim())
+      return;
+    found.set(kind, { kind, command: command.trim(), source, ...kind === "test" ? { runner: detectRunner(command) } : {} });
+  };
+  for (const [file, label] of [
+    [path6.join(rootDir, ".opencode", "swarmos.json"), ".opencode/swarmos.json"],
+    [path6.join(rootDir, "opencode.json"), "opencode.json"]
+  ]) {
+    const verifier = (await readJson(file))?.verifier;
+    if (verifier && typeof verifier === "object") {
+      for (const [k, v] of Object.entries(verifier)) {
+        if (typeof v === "string" && /^(typecheck|type-check|lint|test)$/i.test(k))
+          add(normalizeKind(k), v, label);
+      }
+    }
+  }
+  try {
+    const agentsMd = await fs6.readFile(path6.join(rootDir, "AGENTS.md"), "utf8");
+    for (const line of agentsMd.split(`
+`)) {
+      const m = AGENTS_LINE_RE.exec(line);
+      if (m)
+        add(normalizeKind(m[1]), m[2], "AGENTS.md");
+    }
+  } catch {}
+  const pkg = await readJson(path6.join(rootDir, "package.json"));
+  if (pkg?.scripts && typeof pkg.scripts === "object") {
+    const pm = await packageManager(rootDir);
+    const scripts = pkg.scripts;
+    const typecheckScript = ["typecheck", "type-check", "check-types", "tsc"].find((s) => scripts[s]);
+    if (typecheckScript)
+      add("typecheck", `${pm} run ${typecheckScript}`, "package.json");
+    else if (await exists(path6.join(rootDir, "tsconfig.json")))
+      add("typecheck", "npx --no-install tsc --noEmit", "tsconfig.json");
+    if (scripts.lint)
+      add("lint", `${pm} run lint`, "package.json");
+    if (scripts.test && !/no test specified/.test(scripts.test)) {
+      if (!found.has("test")) {
+        found.set("test", { kind: "test", command: `${pm} run test`, source: "package.json", runner: detectRunner(scripts.test) });
+      }
+    }
+  }
+  if (await exists(path6.join(rootDir, "Cargo.toml"))) {
+    add("typecheck", "cargo check --quiet", "Cargo.toml");
+    add("test", "cargo test --quiet", "Cargo.toml");
+  }
+  if (await exists(path6.join(rootDir, "go.mod"))) {
+    add("typecheck", "go vet ./...", "go.mod");
+    add("test", "go test ./...", "go.mod");
+  }
+  if (await exists(path6.join(rootDir, "pyproject.toml")) || await exists(path6.join(rootDir, "pytest.ini")) || await exists(path6.join(rootDir, "setup.py"))) {
+    add("test", "python3 -m pytest -q", "python project");
+  }
+  const order = ["typecheck", "lint", "test"];
+  return order.flatMap((k) => found.has(k) ? [found.get(k)] : []);
+}
+async function git(rootDir, args) {
+  try {
+    const { stdout } = await execFileAsync("git", args, { cwd: rootDir, timeout: 1e4, maxBuffer: 32 * 1024 * 1024 });
+    return stdout;
+  } catch {
+    return;
+  }
+}
+async function listChangedFiles(rootDir) {
+  const tracked = await git(rootDir, ["diff", "--name-only", "HEAD"]);
+  if (tracked === undefined)
+    return;
+  const untracked = await git(rootDir, ["ls-files", "--others", "--exclude-standard"]) ?? "";
+  const files = [...tracked.split(`
+`), ...untracked.split(`
+`)].map((f) => f.trim()).filter(Boolean);
+  return [...new Set(files)].filter((f) => !f.startsWith(".opencode/"));
+}
+async function computeTreeFingerprint(rootDir) {
+  const head = await git(rootDir, ["rev-parse", "HEAD"]);
+  if (head === undefined)
+    return null;
+  const hash = createHash3("sha256");
+  hash.update(head.trim());
+  hash.update(await git(rootDir, ["diff", "HEAD", "--", ".", ":(exclude).opencode"]) ?? "");
+  const untracked = (await git(rootDir, ["ls-files", "--others", "--exclude-standard"]) ?? "").split(`
+`).map((f) => f.trim()).filter((f) => f && !f.startsWith(".opencode/")).sort();
+  for (const f of untracked) {
+    hash.update(`\x00${f}\x00`);
+    try {
+      hash.update(await fs6.readFile(path6.join(rootDir, f)));
+    } catch {}
+  }
+  return hash.digest("hex").slice(0, 32);
+}
+var TEST_FILE_RE = /(?:\.(?:test|spec)\.[cm]?[jt]sx?$)|(?:(?:^|\/)test_[^/]+\.py$)|(?:_test\.py$)|(?:_test\.go$)/;
+function isTestFile(file) {
+  return TEST_FILE_RE.test(file);
+}
+function scopedTestCommand(check, testFiles, goPackages) {
+  const quoted = testFiles.map((f) => JSON.stringify(f)).join(" ");
+  switch (check.runner) {
+    case "bun":
+      return `bun test ${testFiles.map((f) => JSON.stringify(f.startsWith(".") ? f : `./${f}`)).join(" ")}`;
+    case "vitest":
+      return `npx --no-install vitest run ${quoted}`;
+    case "jest":
+      return `npx --no-install jest ${quoted}`;
+    case "node":
+      return `node --test ${quoted}`;
+    case "pytest":
+      return `python3 -m pytest -q ${quoted}`;
+    case "go":
+      return goPackages.length ? `go test ${goPackages.join(" ")}` : undefined;
+    default:
+      return;
+  }
+}
+var FAILURE_LOC_RES = [
+  /(?:^|[\s(])((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?|py|go|rs|vue|svelte|css))[:](\d+)(?::(\d+))?/,
+  /(?:^|\s)((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?))\((\d+),(\d+)\)/,
+  /File "([^"]+\.py)", line (\d+)/
+];
+var TEST_HEADER_RE = /^((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?)):$/;
+var NAMED_FAILURE_RES = [
+  /^\s*FAIL\s+((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?))(.*)$/,
+  /^FAILED\s+([\w@./-]+\.py)::(\S+)(.*)$/
+];
+function extractFailures(output, rootDir, max = 30) {
+  const failures = [];
+  const seen = new Set;
+  let currentTestFile;
+  for (const line of output.split(`
+`)) {
+    if (failures.length >= max)
+      break;
+    const header = TEST_HEADER_RE.exec(line.trim());
+    if (header) {
+      currentTestFile = header[1];
+      continue;
+    }
+    const bunFail = /^\(fail\)\s+(.+?)(?:\s+\[[\d.]+m?s\])?$/.exec(line.trim());
+    if (bunFail && currentTestFile) {
+      const key = `${currentTestFile}#${bunFail[1]}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        failures.push({ file: currentTestFile, message: `(fail) ${bunFail[1]}` });
+      }
+      continue;
+    }
+    let named = false;
+    for (const re of NAMED_FAILURE_RES) {
+      const m = re.exec(line);
+      if (!m)
+        continue;
+      named = true;
+      const key = `${m[1]}#${m[2]}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        failures.push({ file: m[1], message: line.trim().slice(0, 240) });
+      }
+      break;
+    }
+    if (named)
+      continue;
+    if (!/(error|fail|assert|expect|exception|panic|warning|\u2717|\u00D7)/i.test(line) && !/File "|^\s*at\s/.test(line))
+      continue;
+    for (const re of FAILURE_LOC_RES) {
+      const m = re.exec(line);
+      if (!m)
+        continue;
+      let file = m[1];
+      if (file.includes("node_modules") || file.startsWith("internal/"))
+        break;
+      if (rootDir && path6.isAbsolute(file))
+        file = path6.relative(rootDir, file).split(path6.sep).join("/");
+      const key = `${file}:${m[2]}`;
+      if (seen.has(key))
+        break;
+      seen.add(key);
+      failures.push({ file, line: Number(m[2]), ...m[3] ? { col: Number(m[3]) } : {}, message: line.trim().slice(0, 240) });
+      break;
+    }
+  }
+  return failures;
+}
+function lastInt(text, re) {
+  let last;
+  for (const m of text.matchAll(re))
+    last = Number(m[1]);
+  return last;
+}
+function sumInt(text, re) {
+  let total = 0;
+  for (const m of text.matchAll(re))
+    total += Number(m[1]);
+  return total;
+}
+function parseCounts(output, runner = "unknown") {
+  if (runner === "cargo") {
+    const passed = sumInt(output, /(\d+) passed;/g);
+    const failed = sumInt(output, /(\d+) failed;/g);
+    return /test result:/.test(output) ? { passed, failed } : undefined;
+  }
+  if (runner === "go") {
+    const failed = (output.match(/^--- FAIL:/gm) ?? []).length;
+    const passed = (output.match(/^--- PASS:/gm) ?? []).length;
+    const okPkgs = (output.match(/^ok\s+/gm) ?? []).length;
+    return failed + passed + okPkgs > 0 ? { passed: passed || okPkgs, failed } : undefined;
+  }
+  const passed = lastInt(output, /(\d+)\s+(?:pass|passed|passing)\b/gi);
+  const failed = lastInt(output, /(\d+)\s+(?:fail|failed|failing)\b/gi);
+  if (passed === undefined && failed === undefined)
+    return;
+  return { passed: passed ?? 0, failed: failed ?? 0 };
+}
+function runShell(command, cwd, timeoutMs) {
+  return new Promise((resolve) => {
+    exec(command, { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, env: { ...process.env, CI: "1", FORCE_COLOR: "0", NO_COLOR: "1" } }, (err, stdout, stderr) => {
+      const output = stripAnsi(`${stdout ?? ""}
+${stderr ?? ""}`);
+      const timedOut = Boolean(err?.killed && err?.signal);
+      resolve({ exitCode: err ? typeof err.code === "number" ? err.code : 1 : 0, output, timedOut });
+    });
+  });
+}
+async function resolveScope(rootDir, input) {
+  const changed = input.paths?.length ? input.paths : await listChangedFiles(rootDir) ?? [];
+  if (changed.length === 0)
+    return { changedFiles: [], scopedTests: [], goPackages: [], note: "no changed files; ran full suite" };
+  const candidates = new Set(changed);
+  for (const file of changed.filter((f) => !isTestFile(f)).slice(0, 20)) {
+    try {
+      const radius = await analyzeBlastRadius(rootDir, file);
+      for (const dep of radius.transitiveDependents)
+        candidates.add(dep);
+    } catch {}
+  }
+  const scopedTests = [];
+  for (const f of candidates) {
+    if (isTestFile(f) && await exists(path6.join(rootDir, f)))
+      scopedTests.push(f);
+  }
+  const goPackages = [...new Set(changed.filter((f) => f.endsWith(".go")).map((f) => `./${path6.posix.dirname(f)}`))];
+  return { changedFiles: changed, scopedTests: scopedTests.sort(), goPackages };
+}
+async function runVerify(rootDir, input = {}) {
+  const checks = (await discoverChecks(rootDir)).filter((c) => !input.kinds || input.kinds.includes(c.kind));
+  const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 300000, 5000), 1800000);
+  let scope = input.scope ?? "changed";
+  const scoping = scope === "changed" ? await resolveScope(rootDir, input) : { changedFiles: [], scopedTests: [], goPackages: [] };
+  let scopeNote = scoping.note;
+  const results = [];
+  for (const check of checks) {
+    let command = check.command;
+    if (check.kind === "test" && scope === "changed") {
+      const scoped = scoping.scopedTests.length || scoping.goPackages.length ? scopedTestCommand(check, scoping.scopedTests, scoping.goPackages) : undefined;
+      if (scoped)
+        command = scoped;
+      else if (scoping.changedFiles.length > 0) {
+        scopeNote = scoping.scopedTests.length ? `runner "${check.runner}" cannot be scoped; ran full test command` : "no tests import the changed files; ran full test command";
+      }
+    }
+    const started = Date.now();
+    const { exitCode, output, timedOut } = await runShell(command, rootDir, timeoutMs);
+    const lines = output.split(`
+`).filter((l) => l.trim());
+    results.push({
+      kind: check.kind,
+      command,
+      source: check.source,
+      exitCode,
+      passed: exitCode === 0 && !timedOut,
+      timedOut,
+      durationMs: Date.now() - started,
+      ...check.kind === "test" ? { counts: parseCounts(output, check.runner) } : {},
+      failures: exitCode === 0 ? [] : extractFailures(output, rootDir),
+      outputTail: lines.slice(-40).join(`
+`)
+    });
+  }
+  if (scope === "changed" && scoping.changedFiles.length === 0)
+    scope = "full";
+  const run = {
+    id: `verify-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    createdAt: new Date().toISOString(),
+    rootDir: path6.resolve(rootDir),
+    scope,
+    ...scopeNote ? { scopeNote } : {},
+    fingerprint: await computeTreeFingerprint(rootDir),
+    changedFiles: scoping.changedFiles,
+    scopedTests: scoping.scopedTests,
+    checks: results,
+    passed: results.length > 0 && results.every((r) => r.passed)
+  };
+  await saveVerifyRun(rootDir, run);
+  return run;
+}
+async function saveVerifyRun(rootDir, run) {
+  const dir = path6.join(getVerifyDir(rootDir), "runs");
+  await fs6.mkdir(dir, { recursive: true });
+  const payload = JSON.stringify(run, null, 2);
+  await fs6.writeFile(path6.join(dir, `${run.id}.json`), payload, "utf8");
+  await fs6.writeFile(path6.join(getVerifyDir(rootDir), "latest.json"), payload, "utf8");
+  if (run.scope === "full")
+    await fs6.writeFile(path6.join(getVerifyDir(rootDir), "latest-full.json"), payload, "utf8");
+}
+async function loadVerifyRun(rootDir, runId) {
+  return readJson(path6.join(getVerifyDir(rootDir), "runs", `${path6.basename(runId)}.json`));
+}
+async function loadLatestVerifyRun(rootDir, scope) {
+  return readJson(path6.join(getVerifyDir(rootDir), scope === "full" ? "latest-full.json" : "latest.json"));
+}
+function formatVerifyRun(run) {
+  const lines = [
+    `Verify ${run.passed ? "PASSED" : "FAILED"} [${run.id}] scope=${run.scope}${run.scopeNote ? ` (${run.scopeNote})` : ""}`
+  ];
+  if (run.checks.length === 0)
+    lines.push("No verification commands discovered. Add a `verifier` field to .opencode/swarmos.json.");
+  for (const c of run.checks) {
+    const counts = c.counts ? ` ${c.counts.passed} passed / ${c.counts.failed} failed` : "";
+    lines.push(`- ${c.kind}: ${c.passed ? "pass" : c.timedOut ? "TIMEOUT" : `FAIL (exit ${c.exitCode})`}${counts} \u2014 \`${c.command}\` (${c.durationMs}ms)`);
+    for (const f of c.failures.slice(0, 15)) {
+      lines.push(`    ${f.file}${f.line ? `:${f.line}` : ""}${f.col ? `:${f.col}` : ""} ${f.message}`);
+    }
+    if (!c.passed && c.failures.length === 0)
+      lines.push(c.outputTail.split(`
+`).slice(-15).map((l) => `    ${l}`).join(`
+`));
+  }
+  return lines.join(`
+`);
+}
+function resolveVerifyDir(rootDir, dir) {
+  if (!dir)
+    return rootDir;
+  const abs = path6.resolve(rootDir, dir);
+  const rel = path6.relative(path6.resolve(rootDir), abs);
+  if (rel.startsWith("..") || path6.isAbsolute(rel))
+    throw new Error(`SwarmOS Verify: "${dir}" is outside the workspace.`);
+  return abs;
+}
+function registerVerifyTools(editor, rootDir, pinned = true) {
+  editor.namespace({
+    name: "verify",
+    description: "Run the repository's own typecheck, lint and test commands scoped to changed files, with structured pass/fail counts and file:line failures."
+  });
+  editor.add({
+    name: "run",
+    description: "Run the repo's verification commands. scope 'changed' (default) runs typecheck/lint plus only the tests that import changed files; 'full' runs everything. Returns a run ID that QA receipts must cite.",
+    options: { namespace: "verify", codemode: true, pinned },
+    input: {
+      type: "object",
+      properties: {
+        dir: { type: "string", description: "Directory to verify relative to the workspace root, e.g. a tournament worktree '.worktrees/<taskId>'" },
+        scope: { type: "string", enum: ["changed", "full"], description: "Scope of the run (default 'changed')" },
+        kinds: { type: "array", items: { type: "string", enum: ["typecheck", "lint", "test"] }, description: "Subset of checks to run" },
+        paths: { type: "array", items: { type: "string" }, description: "Override the changed-file set" },
+        timeoutMs: { type: "number", description: "Per-check timeout (default 300000)" }
+      }
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const run = await runVerify(resolveVerifyDir(rootDir, input?.dir), input ?? {});
+      return { output: run, content: formatVerifyRun(run) };
+    }
+  });
+  editor.add({
+    name: "checks",
+    description: "List the verification commands SwarmOS discovered for this repository and where each came from.",
+    options: { namespace: "verify", codemode: true, pinned },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const checks = await discoverChecks(rootDir);
+      return { output: { checks }, content: JSON.stringify(checks, null, 2) };
+    }
+  });
+}
+
+// src/board/worktrees.ts
+import { execFile as execFile2 } from "child_process";
+import * as fs7 from "fs/promises";
+import * as path7 from "path";
+import { promisify as promisify2 } from "util";
+var execFileAsync2 = promisify2(execFile2);
+async function git2(cwd, args, timeout = 60000) {
+  try {
+    const { stdout, stderr } = await execFileAsync2("git", args, { cwd, timeout, maxBuffer: 32 * 1024 * 1024 });
+    return { ok: true, stdout, stderr };
+  } catch (err) {
+    return { ok: false, stdout: err?.stdout ?? "", stderr: err?.stderr ?? String(err?.message ?? err) };
+  }
+}
+async function isGitRepo(rootDir) {
+  const res = await git2(rootDir, ["rev-parse", "--is-inside-work-tree"]);
+  return res.ok && res.stdout.trim() === "true";
+}
+function candidateBranch(taskId) {
+  return `swarmos/${taskId}`;
+}
+async function provisionWorktree(rootDir, taskId, worktree, baseRef) {
+  const branch = candidateBranch(taskId);
+  const abs = path7.resolve(rootDir, worktree);
+  const list = await git2(rootDir, ["worktree", "list", "--porcelain"]);
+  if (list.ok && list.stdout.split(`
+`).some((l) => l === `worktree ${abs}`)) {
+    return { worktree, branch, provisioned: true, reason: "reused existing worktree" };
+  }
+  await fs7.mkdir(path7.dirname(abs), { recursive: true });
+  const branchExists = (await git2(rootDir, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`])).ok;
+  const res = branchExists ? await git2(rootDir, ["worktree", "add", abs, branch]) : await git2(rootDir, ["worktree", "add", "-b", branch, abs, baseRef]);
+  if (!res.ok)
+    return { worktree, branch, provisioned: false, reason: res.stderr.trim().slice(0, 300) };
+  return { worktree, branch, provisioned: true };
+}
+async function commitWorktree(worktreeDir, message) {
+  await git2(worktreeDir, ["add", "-A", "--", ".", ":(exclude).opencode"]);
+  const staged = await git2(worktreeDir, ["diff", "--cached", "--quiet"]);
+  if (staged.ok)
+    return false;
+  let res = await git2(worktreeDir, ["commit", "-q", "-m", message]);
+  if (!res.ok && /identity|user\.(name|email)/i.test(res.stderr)) {
+    res = await git2(worktreeDir, ["-c", "user.name=SwarmOS", "-c", "user.email=swarmos@localhost", "commit", "-q", "-m", message]);
+  }
+  if (!res.ok)
+    throw new Error(`SwarmOS Worktree: commit failed in ${worktreeDir}: ${res.stderr.trim()}`);
+  return true;
+}
+function parseShortstat(text) {
+  const n = (re) => Number(re.exec(text)?.[1] ?? 0);
+  return { files: n(/(\d+) files? changed/), insertions: n(/(\d+) insertions?/), deletions: n(/(\d+) deletions?/) };
+}
+async function scoreTournament(rootDir, tournament) {
+  const scores = [];
+  for (const c of tournament.candidates) {
+    const dir = path7.resolve(rootDir, c.worktree);
+    const provisioned = c.provisioned !== false && await isGitRepo(dir);
+    if (!provisioned) {
+      scores.push({ taskId: c.taskId, worktree: c.worktree, provisioned: false, passed: false, failedChecks: 0, failedTests: 0, diff: { files: 0, insertions: 0, deletions: 0 } });
+      continue;
+    }
+    const run = await runVerify(dir, { scope: "full" });
+    const base = tournament.baseRef ?? "HEAD";
+    const stat = await git2(dir, ["diff", "--shortstat", base, "--", ".", ":(exclude).opencode"]);
+    scores.push({
+      taskId: c.taskId,
+      worktree: c.worktree,
+      provisioned: true,
+      verifyRunId: run.id,
+      passed: run.passed,
+      failedChecks: run.checks.filter((k) => !k.passed).length,
+      failedTests: run.checks.reduce((a, k) => a + (k.counts?.failed ?? 0), 0),
+      diff: parseShortstat(stat.stdout)
+    });
+  }
+  const size = (s) => s.diff.insertions + s.diff.deletions;
+  return scores.sort((a, b) => Number(b.passed) - Number(a.passed) || a.failedChecks - b.failedChecks || a.failedTests - b.failedTests || size(a) - size(b));
+}
+async function mergeTournamentWinner(rootDir, tournament, winnerTaskId) {
+  const winner = tournament.candidates.find((c) => c.taskId === winnerTaskId);
+  if (!winner)
+    throw new Error(`SwarmOS Tournament: ${winnerTaskId} is not a candidate of ${tournament.id}`);
+  const winnerDir = path7.resolve(rootDir, winner.worktree);
+  await commitWorktree(winnerDir, `swarmos: ${tournament.id} candidate ${winner.label}`);
+  const branch = winner.branch ?? candidateBranch(winnerTaskId);
+  const merge = await git2(rootDir, ["merge", "--no-ff", "-m", `swarmos: merge tournament ${tournament.id} winner ${winnerTaskId}`, branch]);
+  if (!merge.ok) {
+    const conflicts = (await git2(rootDir, ["diff", "--name-only", "--diff-filter=U"])).stdout.trim().split(`
+`).filter(Boolean);
+    await git2(rootDir, ["merge", "--abort"]);
+    throw new Error(`SwarmOS Tournament: merging ${branch} failed${conflicts.length ? ` with conflicts in ${conflicts.join(", ")}` : ""}: ${merge.stderr.trim().slice(0, 300)}. The merge was aborted; resolve it manually or re-run the candidate on the current base.`);
+  }
+  const commit = (await git2(rootDir, ["rev-parse", "HEAD"])).stdout.trim();
+  const cleanup = await cleanupTournamentWorktrees(rootDir, tournament);
+  return { merged: true, commit, ...cleanup };
+}
+async function cleanupTournamentWorktrees(rootDir, tournament) {
+  const removedWorktrees = [];
+  const deletedBranches = [];
+  for (const c of tournament.candidates) {
+    const abs = path7.resolve(rootDir, c.worktree);
+    if ((await git2(rootDir, ["worktree", "remove", "--force", abs])).ok)
+      removedWorktrees.push(c.worktree);
+    const branch = c.branch ?? candidateBranch(c.taskId);
+    if ((await git2(rootDir, ["branch", "-D", branch])).ok)
+      deletedBranches.push(branch);
+  }
+  await git2(rootDir, ["worktree", "prune"]);
+  return { removedWorktrees, deletedBranches };
+}
+
+// src/host/session-state.ts
+var sessions = new Map;
+var MAX_TOUCHED = 50;
+function getSessionState(sessionID) {
+  const sid = sessionID ?? "default";
+  let state = sessions.get(sid);
+  if (!state) {
+    state = {
+      sessionID: sid,
+      startedAt: Date.now(),
+      toolCalls: 0,
+      toolFailures: 0,
+      breakerFires: 0,
+      turns: 0,
+      touchedFiles: [],
+      taint: [],
+      openIncidents: [],
+      injectedLessons: new Set
+    };
+    sessions.set(sid, state);
+  }
+  return state;
+}
+function listSessionStates() {
+  return Array.from(sessions.values());
+}
+function resetSessionStates() {
+  sessions.clear();
+}
+function touchFile(state, file) {
+  const idx = state.touchedFiles.indexOf(file);
+  if (idx >= 0)
+    state.touchedFiles.splice(idx, 1);
+  state.touchedFiles.push(file);
+  if (state.touchedFiles.length > MAX_TOUCHED)
+    state.touchedFiles.shift();
+}
+function eventTargetPath(event) {
+  const input = event?.input;
+  if (!input || typeof input !== "object")
+    return;
+  for (const key of ["path", "filePath", "file", "target"]) {
+    if (typeof input[key] === "string" && input[key])
+      return input[key];
+  }
+  return;
+}
+function isFailedEvent(event) {
+  return event?.status === "error";
+}
+
+// src/board/board.ts
+var BOARD_VERSION = "4.1.0";
+var boardLocks = new Map;
+function getBoardPath(rootDir) {
+  return path8.join(rootDir, ".opencode", "org", "board.json");
+}
+function createEmptyBoard() {
+  return {
+    version: BOARD_VERSION,
+    project: null,
+    contracts: [],
+    tasks: [],
+    tournaments: []
+  };
+}
+async function loadBoard(rootDir) {
+  const file = getBoardPath(rootDir);
+  try {
+    const raw = await fs8.readFile(file, "utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      version: parsed.version ?? BOARD_VERSION,
+      ...parsed.policy ? { policy: parsed.policy } : {},
+      project: parsed.project ?? null,
+      contracts: Array.isArray(parsed.contracts) ? parsed.contracts : [],
+      tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
+      tournaments: Array.isArray(parsed.tournaments) ? parsed.tournaments : []
+    };
+  } catch {
+    return createEmptyBoard();
+  }
+}
+async function saveBoard(rootDir, board) {
+  const dir = path8.join(rootDir, ".opencode", "org");
+  await fs8.mkdir(dir, { recursive: true });
+  const targetFile = path8.join(dir, "board.json");
+  const tempFile = path8.join(dir, `board.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`);
+  const payload = JSON.stringify(board, null, 2);
+  await fs8.writeFile(tempFile, payload, "utf8");
+  await fs8.rename(tempFile, targetFile);
+}
+async function withBoardLock(rootDir, mutator) {
+  const key = path8.resolve(rootDir);
+  const previous = boardLocks.get(key) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const current = previous.then(() => gate);
+  boardLocks.set(key, current);
+  await previous;
+  try {
+    const board = await loadBoard(rootDir);
+    const result = await mutator(board);
+    await saveBoard(rootDir, board);
+    return result;
+  } finally {
+    release();
+    if (boardLocks.get(key) === current) {
+      boardLocks.delete(key);
+    }
+  }
+}
+async function initProject(rootDir, input) {
+  return withBoardLock(rootDir, (board) => {
+    const charter = {
+      name: input.name,
+      vision: input.vision,
+      aestheticArchetype: input.aestheticArchetype,
+      updatedAt: new Date().toISOString()
+    };
+    board.project = charter;
+    if (!board.policy || input.requireVerifiedReceipts !== undefined) {
+      board.policy = { requireVerifiedReceipts: input.requireVerifiedReceipts ?? true };
+    }
+    return charter;
+  });
+}
+async function lockContract(rootDir, input) {
+  return withBoardLock(rootDir, (board) => {
+    const contract = {
+      id: input.id,
+      title: input.title,
+      files: input.files,
+      invariants: input.invariants,
+      lockedAt: new Date().toISOString(),
+      ...input.lockedBy ? { lockedBy: input.lockedBy } : {}
+    };
+    const idx = board.contracts.findIndex((c) => c.id === input.id);
+    if (idx >= 0) {
+      board.contracts[idx] = contract;
+    } else {
+      board.contracts.push(contract);
+    }
+    return contract;
+  });
+}
+async function createTask(rootDir, input) {
+  return withBoardLock(rootDir, (board) => {
+    const existing = board.tasks.find((t) => t.id === input.id);
+    const now = new Date().toISOString();
+    const task = {
+      id: input.id,
+      title: input.title,
+      owner: input.owner,
+      ownedPaths: input.ownedPaths,
+      worktree: input.worktree,
+      ...input.tournamentId ? { tournamentId: input.tournamentId } : {},
+      ...existing?.claimedBySessionID ? { claimedBySessionID: existing.claimedBySessionID } : {},
+      ...input.budget ?? existing?.budget ? { budget: input.budget ?? existing?.budget } : {},
+      usage: existing?.usage ?? { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 },
+      status: existing?.status ?? "pending",
+      qaReceipts: existing?.qaReceipts ?? [],
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now
+    };
+    if (existing) {
+      Object.assign(existing, task);
+    } else {
+      board.tasks.push(task);
+    }
+    return task;
+  });
+}
+async function updateTaskStatus(rootDir, taskId, status) {
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === taskId);
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${taskId}`);
+    }
+    task.status = status;
+    task.updatedAt = new Date().toISOString();
+    return task;
+  });
+}
+async function claimTask(rootDir, input) {
+  const sid = input.sessionID ?? "default";
+  const state = getSessionState(sid);
+  state.taskId = input.taskId;
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === input.taskId);
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${input.taskId}`);
+    }
+    task.claimedBySessionID = sid;
+    if (task.status === "pending") {
+      task.status = "in_progress";
+    }
+    task.usage ??= { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 };
+    task.updatedAt = new Date().toISOString();
+    return task;
+  });
+}
+async function setTaskBudget(rootDir, input) {
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === input.taskId);
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${input.taskId}`);
+    }
+    task.budget = { ...task.budget, ...input.budget };
+    if (input.resetUsage || !task.usage) {
+      task.usage = { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 };
+    } else {
+      const reason = evaluateTaskBudgetViolation(task.budget, task.usage);
+      task.usage.overBudget = Boolean(reason);
+      if (reason)
+        task.usage.overBudgetReason = reason;
+      else
+        delete task.usage.overBudgetReason;
+    }
+    task.updatedAt = new Date().toISOString();
+    return task;
+  });
+}
+function evaluateTaskBudgetViolation(budget, usage) {
+  if (!budget || !usage)
+    return;
+  if (budget.maxTokens !== undefined && usage.tokensUsed > budget.maxTokens) {
+    return `tokensUsed (${usage.tokensUsed}) > maxTokens (${budget.maxTokens})`;
+  }
+  if (budget.maxTurns !== undefined && usage.turnsUsed > budget.maxTurns) {
+    return `turnsUsed (${usage.turnsUsed}) > maxTurns (${budget.maxTurns})`;
+  }
+  if (budget.maxToolCalls !== undefined && usage.toolCallsUsed > budget.maxToolCalls) {
+    return `toolCallsUsed (${usage.toolCallsUsed}) > maxToolCalls (${budget.maxToolCalls})`;
+  }
+  return;
+}
+function taskWorkdir(rootDir, task) {
+  return task.worktree ? path8.resolve(rootDir, task.worktree) : path8.resolve(rootDir);
+}
+async function assertVerifiedPass(rootDir, task, verifyRunId) {
+  if (!verifyRunId) {
+    throw new Error(`SwarmOS Verify Gate: PASS for task [${task.id}] must cite a passing \`tools.verify.run\` (pass \`verifyRunId\`). Run verification instead of asserting it.`);
+  }
+  const workdir = taskWorkdir(rootDir, task);
+  const run = await loadVerifyRun(workdir, verifyRunId) ?? await loadVerifyRun(rootDir, verifyRunId);
+  if (!run)
+    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] not found for task [${task.id}].`);
+  if (!run.passed) {
+    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] FAILED; a failing run cannot back a PASS receipt.`);
+  }
+  if (path8.resolve(run.rootDir) !== workdir) {
+    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] ran in ${run.rootDir}, but task [${task.id}] lives in ${workdir}.`);
+  }
+  const current = await computeTreeFingerprint(workdir);
+  if (current !== null && run.fingerprint !== current) {
+    throw new Error(`SwarmOS Verify Gate: code changed since verify run [${verifyRunId}]. Re-run \`tools.verify.run\` on the current tree.`);
+  }
+  return current;
+}
+async function submitQAReceipt(rootDir, input) {
+  const snapshot = await loadBoard(rootDir);
+  const target = snapshot.tasks.find((t) => t.id === input.taskId);
+  let fingerprint;
+  if (target && input.verdict === "PASS" && snapshot.policy?.requireVerifiedReceipts) {
+    fingerprint = await assertVerifiedPass(rootDir, target, input.verifyRunId);
+  }
+  return withBoardLock(rootDir, (board) => {
+    const task = board.tasks.find((t) => t.id === input.taskId);
+    if (!task) {
+      throw new Error(`SwarmOS Task not found: ${input.taskId}`);
+    }
+    const receipt = {
+      verdict: input.verdict,
+      summary: input.summary,
+      defects: input.defects,
+      testCommand: input.testCommand,
+      ...input.verifyRunId ? { verifyRunId: input.verifyRunId } : {},
+      ...fingerprint !== undefined ? { fingerprint } : {},
+      timestamp: new Date().toISOString()
+    };
+    task.qaReceipts.push(receipt);
+    task.status = input.verdict === "PASS" ? "verified" : "qa_rejected";
+    task.updatedAt = receipt.timestamp;
+    return task;
+  });
+}
+async function planTournament(rootDir, input) {
+  const planned = await recordTournamentPlan(rootDir, input);
+  if (!await isGitRepo(rootDir)) {
+    return markProvisioning(rootDir, planned.id, undefined, planned.candidates.map(() => ({ provisioned: false, reason: "not a git repository" })));
+  }
+  const baseRef = (await git2(rootDir, ["rev-parse", "HEAD"])).stdout.trim() || "HEAD";
+  const results = [];
+  for (const c of planned.candidates) {
+    results.push(await provisionWorktree(rootDir, c.taskId, c.worktree, baseRef));
+  }
+  return markProvisioning(rootDir, planned.id, baseRef, results);
+}
+async function markProvisioning(rootDir, tournamentId, baseRef, results) {
+  return withBoardLock(rootDir, (board) => {
+    const tournament = board.tournaments.find((t) => t.id === tournamentId);
+    if (baseRef)
+      tournament.baseRef = baseRef;
+    tournament.candidates.forEach((c, i) => {
+      c.provisioned = results[i].provisioned;
+      if (results[i].branch)
+        c.branch = results[i].branch;
+      if (results[i].reason)
+        c.provisionNote = results[i].reason;
+      else
+        delete c.provisionNote;
+    });
+    return tournament;
+  });
+}
+async function recordTournamentPlan(rootDir, input) {
+  return withBoardLock(rootDir, (board) => {
+    if (!Array.isArray(board.tournaments)) {
+      board.tournaments = [];
+    }
+    const count = Math.min(Math.max(input.candidates ?? 2, 2), 4);
+    const now = new Date().toISOString();
+    const candidates = [];
+    for (let i = 0;i < count; i++) {
+      const suffix = String.fromCharCode(97 + i);
+      const label = `candidate-${suffix}`;
+      const taskId = `${input.id}-${label}`;
+      const worktree = `.worktrees/${taskId}`;
+      candidates.push({ label, taskId, worktree });
+      const existingTask = board.tasks.find((t) => t.id === taskId);
+      const task = {
+        id: taskId,
+        title: `[Tournament ${input.id} \xB7 ${label.toUpperCase()}] ${input.title}`,
+        owner: input.role,
+        ownedPaths: input.ownedPaths,
+        worktree,
+        tournamentId: input.id,
+        status: existingTask?.status ?? "pending",
+        qaReceipts: existingTask?.qaReceipts ?? [],
+        createdAt: existingTask?.createdAt ?? now,
+        updatedAt: now
+      };
+      if (existingTask) {
+        Object.assign(existingTask, task);
+      } else {
+        board.tasks.push(task);
+      }
+    }
+    const tournament = {
+      id: input.id,
+      title: input.title,
+      role: input.role,
+      ownedPaths: input.ownedPaths,
+      candidates,
+      status: "active",
+      createdAt: now,
+      updatedAt: now
+    };
+    const existingIdx = board.tournaments.findIndex((t) => t.id === input.id);
+    if (existingIdx >= 0) {
+      board.tournaments[existingIdx] = tournament;
+    } else {
+      board.tournaments.push(tournament);
+    }
+    return tournament;
+  });
+}
+async function resolveTournament(rootDir, input) {
+  const snapshot = await loadBoard(rootDir);
+  const planned = assertResolvable(snapshot, input);
+  let merge;
+  if (input.merge !== false && planned.candidates.some((c) => c.provisioned)) {
+    merge = await mergeTournamentWinner(rootDir, planned, input.winningTaskId);
+  }
+  return withBoardLock(rootDir, (board) => {
+    const tournament = assertResolvable(board, input);
+    const now = new Date().toISOString();
+    for (const candidate of tournament.candidates) {
+      if (candidate.taskId === input.winningTaskId)
+        continue;
+      const loser = board.tasks.find((t) => t.id === candidate.taskId);
+      if (loser) {
+        loser.status = "superseded";
+        loser.updatedAt = now;
+      }
+    }
+    tournament.status = "resolved";
+    tournament.winningTaskId = input.winningTaskId;
+    tournament.resolutionSummary = input.summary;
+    tournament.updatedAt = now;
+    if (merge?.commit) {
+      tournament.mergeCommit = merge.commit;
+      const winnerTask = board.tasks.find((t) => t.id === input.winningTaskId);
+      if (winnerTask)
+        delete winnerTask.worktree;
+      for (const c of tournament.candidates)
+        c.provisioned = false;
+    }
+    return tournament;
+  });
+}
+function assertResolvable(board, input) {
+  const tournament = (board.tournaments ?? []).find((t) => t.id === input.tournamentId);
+  if (!tournament) {
+    throw new Error(`SwarmOS Tournament not found: ${input.tournamentId}`);
+  }
+  const isCandidate = tournament.candidates.some((c) => c.taskId === input.winningTaskId);
+  if (!isCandidate) {
+    throw new Error(`SwarmOS Tournament Guard: Task "${input.winningTaskId}" is not a registered candidate of tournament "${input.tournamentId}".`);
+  }
+  const winningTask = board.tasks.find((t) => t.id === input.winningTaskId);
+  const latestReceipt = winningTask?.qaReceipts[winningTask.qaReceipts.length - 1];
+  if (!winningTask || winningTask.status !== "verified" || latestReceipt?.verdict !== "PASS") {
+    throw new Error(`SwarmOS Tournament Guard: Winning candidate task [${input.winningTaskId}] must have a verified PASS QA receipt before resolving the tournament.`);
+  }
+  if (tournament.status === "resolved") {
+    throw new Error(`SwarmOS Tournament Guard: Tournament "${input.tournamentId}" is already resolved.`);
+  }
+  return tournament;
+}
+async function verifyReleaseReady(rootDir) {
+  const board = await loadBoard(rootDir);
+  const hasCharter = board.project !== null;
+  const lockedContractCount = board.contracts.length;
+  const verifiedTasks = [];
+  const unverifiedTasks = [];
+  const rejectedTasks = [];
+  const supersededTasks = [];
+  const blockers = [];
+  if (!hasCharter) {
+    blockers.push("Missing project charter: call `tools.org.init_project` before shipping.");
+  }
+  if (lockedContractCount === 0) {
+    blockers.push("Zero locked contracts: `architect` must lock at least one contract via `tools.org.lock_contract`.");
+  }
+  const activeTasks = board.tasks.filter((t) => t.status !== "superseded");
+  if (activeTasks.length === 0) {
+    blockers.push("Zero engineering tasks registered on the board.");
+  }
+  for (const task of board.tasks) {
+    if (task.status === "superseded") {
+      supersededTasks.push(task.id);
+      continue;
+    }
+    const latestReceipt = task.qaReceipts[task.qaReceipts.length - 1];
+    if (task.status === "verified" && latestReceipt?.verdict === "PASS" && Array.isArray(latestReceipt.defects) && latestReceipt.defects.length === 0) {
+      verifiedTasks.push(task.id);
+    } else if (task.status === "qa_rejected" || latestReceipt?.verdict === "REJECT") {
+      rejectedTasks.push(task.id);
+      blockers.push(`Task [${task.id}] (${task.owner}) was REJECTED by qa-adversary: ${latestReceipt?.summary ?? "defects unresolved"}.`);
+    } else {
+      unverifiedTasks.push(task.id);
+      blockers.push(`Task [${task.id}] (${task.owner}) is "${task.status}" and lacks a signed PASS receipt from qa-adversary.`);
+    }
+  }
+  let latestFullVerifyRunId;
+  let verifyBlocked = false;
+  if (board.policy?.requireVerifiedReceipts) {
+    for (const id of verifiedTasks) {
+      const task = board.tasks.find((t) => t.id === id);
+      if (!task.qaReceipts[task.qaReceipts.length - 1]?.verifyRunId) {
+        verifyBlocked = true;
+        blockers.push(`Task [${id}] PASS receipt does not cite a \`tools.verify.run\` result.`);
+      }
+    }
+    const full = await loadLatestVerifyRun(rootDir, "full");
+    const fingerprint = await computeTreeFingerprint(rootDir);
+    if (!full) {
+      verifyBlocked = true;
+      blockers.push('No full verification run: call `tools.verify.run({ scope: "full" })` before release.');
+    } else if (!full.passed) {
+      verifyBlocked = true;
+      blockers.push(`Latest full verification run [${full.id}] FAILED.`);
+    } else if (fingerprint !== null && full.fingerprint !== fingerprint) {
+      verifyBlocked = true;
+      blockers.push(`Code changed since full verification run [${full.id}]: re-run \`tools.verify.run({ scope: "full" })\`.`);
+    } else {
+      latestFullVerifyRunId = full.id;
+    }
+  }
+  const tournaments = Array.isArray(board.tournaments) ? board.tournaments : [];
+  const activeTournaments = tournaments.filter((t) => t.status === "active").map((t) => t.id);
+  for (const tid of activeTournaments) {
+    blockers.push(`Tournament [${tid}] is still active: call \`tools.org.resolve_tournament\` after QA verification.`);
+  }
+  const ready = hasCharter && lockedContractCount > 0 && activeTasks.length > 0 && unverifiedTasks.length === 0 && rejectedTasks.length === 0 && activeTournaments.length === 0 && !verifyBlocked;
+  return {
+    ready,
+    hasCharter,
+    lockedContractCount,
+    verifiedTasks,
+    unverifiedTasks,
+    rejectedTasks,
+    supersededTasks,
+    activeTournaments,
+    blockers,
+    ...latestFullVerifyRunId ? { latestFullVerifyRunId } : {},
+    checkedAt: new Date().toISOString()
+  };
+}
+
+// src/host/telemetry.ts
+import { execFile as execFile3 } from "child_process";
+import * as fs9 from "fs/promises";
+import * as path9 from "path";
+import { promisify as promisify3 } from "util";
+var execFileAsync3 = promisify3(execFile3);
+function getTelemetryDir(rootDir) {
+  return path9.join(rootDir, ".opencode", "telemetry");
+}
+function safeSessionFile(sessionID) {
+  return `${sessionID.replace(/[^A-Za-z0-9_.-]/g, "_") || "default"}.jsonl`;
+}
+var writeQueues = new Map;
+async function appendTelemetry(rootDir, record) {
+  const file = path9.join(getTelemetryDir(rootDir), safeSessionFile(record.sessionID));
+  const previous = writeQueues.get(file) ?? Promise.resolve();
+  const next = previous.then(async () => {
+    await fs9.mkdir(path9.dirname(file), { recursive: true });
+    await fs9.appendFile(file, `${JSON.stringify(record)}
+`, "utf8");
+  });
+  writeQueues.set(file, next.catch(() => {}));
+  await next;
+}
+async function gitHead(rootDir) {
+  try {
+    const { stdout } = await execFileAsync3("git", ["rev-parse", "HEAD"], { cwd: rootDir, timeout: 3000 });
+    return stdout.trim() || undefined;
+  } catch {
+    return;
+  }
+}
+function extractUsage(event) {
+  const u = event?.usage ?? event?.tokens ?? event?.result?.usage;
+  if (!u || typeof u !== "object")
+    return;
+  const input = Number(u.input ?? u.inputTokens ?? u.prompt_tokens);
+  const output = Number(u.output ?? u.outputTokens ?? u.completion_tokens);
+  const cacheRead = Number(u.cacheRead ?? u.cache?.read ?? u.cache_read_input_tokens);
+  const usage = {};
+  if (Number.isFinite(input))
+    usage.input = input;
+  if (Number.isFinite(output))
+    usage.output = output;
+  if (Number.isFinite(cacheRead))
+    usage.cacheRead = cacheRead;
+  return Object.keys(usage).length ? usage : undefined;
+}
+function lastUserText(event) {
+  const messages = event?.messages;
+  if (!Array.isArray(messages))
+    return;
+  for (let i = messages.length - 1;i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== "user")
+      continue;
+    if (typeof m.content === "string")
+      return m.content;
+    if (Array.isArray(m.content)) {
+      const text = m.content.map((p) => typeof p?.text === "string" ? p.text : "").join("");
+      if (text)
+        return text;
+    }
+    if (typeof m.text === "string")
+      return m.text;
+  }
+  return;
+}
+var startedSessions = new Set;
+async function ensureSessionStart(rootDir, sessionID, agent, prompt) {
+  if (startedSessions.has(sessionID))
+    return;
+  startedSessions.add(sessionID);
+  await appendTelemetry(rootDir, {
+    t: new Date().toISOString(),
+    kind: "session_start",
+    sessionID,
+    agent,
+    gitHead: await gitHead(rootDir),
+    prompt: prompt?.slice(0, 4000)
+  });
+}
+function trackToolEvent(event) {
+  const state = getSessionState(event?.sessionID);
+  if (event?.agent)
+    state.agent = event.agent;
+  state.toolCalls++;
+  if (isFailedEvent(event))
+    state.toolFailures++;
+  const target = eventTargetPath(event);
+  if (target)
+    touchFile(state, target);
+  const text = typeof event?.result?.content === "string" ? event.result.content : Array.isArray(event?.result?.content) ? event.result.content.map((p) => p?.text ?? "").join("") : String(event?.error?.message ?? "");
+  const breaker = text.includes("DOOM-LOOP CIRCUIT BREAKER");
+  if (breaker)
+    state.breakerFires++;
+  return { breaker };
+}
+async function registerTelemetryHooks(ctx, rootDir, writeFiles) {
+  if (ctx.tool?.hook) {
+    await ctx.tool.hook("execute.after", async (event) => {
+      const sessionID = event?.sessionID ?? "default";
+      const { breaker } = trackToolEvent(event);
+      if (!writeFiles)
+        return;
+      await ensureSessionStart(rootDir, sessionID, event?.agent);
+      await appendTelemetry(rootDir, {
+        t: new Date().toISOString(),
+        kind: "tool",
+        sessionID,
+        agent: event?.agent,
+        tool: event?.tool,
+        status: event?.status,
+        target: eventTargetPath(event) ?? (typeof event?.input?.command === "string" ? event.input.command.slice(0, 120) : undefined),
+        error: isFailedEvent(event) ? String(event?.error?.message ?? event?.error ?? "").slice(0, 300) : undefined,
+        breaker: breaker || undefined
+      });
+    });
+  }
+  if (ctx.session?.hook) {
+    await ctx.session.hook("generate", async (event) => {
+      if (event?.agent === "compaction" || event?.kind === "compaction")
+        return;
+      const sessionID = event?.sessionID ?? "default";
+      const state = getSessionState(sessionID);
+      state.turns++;
+      if (event?.agent)
+        state.agent = event.agent;
+      if (!writeFiles)
+        return;
+      await ensureSessionStart(rootDir, sessionID, event?.agent, lastUserText(event));
+      await appendTelemetry(rootDir, {
+        t: new Date().toISOString(),
+        kind: "turn",
+        sessionID,
+        agent: event?.agent,
+        usage: extractUsage(event)
+      });
+    });
+  }
+}
+function summarizeTelemetry(records) {
+  const start = records.find((r) => r.kind === "session_start");
+  let input = 0;
+  let output = 0;
+  let cacheRead = 0;
+  let sawUsage = false;
+  const summary = {
+    sessionID: records[0]?.sessionID ?? "unknown",
+    turns: 0,
+    toolCalls: 0,
+    toolFailures: 0,
+    breakerFires: 0,
+    tokens: null,
+    cacheHitRatio: null,
+    gitHead: start?.gitHead,
+    prompt: start?.prompt
+  };
+  for (const r of records) {
+    if (r.kind === "turn") {
+      summary.turns++;
+      if (r.usage) {
+        sawUsage = true;
+        input += r.usage.input ?? 0;
+        output += r.usage.output ?? 0;
+        cacheRead += r.usage.cacheRead ?? 0;
+      }
+    } else if (r.kind === "tool") {
+      summary.toolCalls++;
+      if (r.status === "error")
+        summary.toolFailures++;
+      if (r.breaker)
+        summary.breakerFires++;
+    }
+  }
+  if (sawUsage) {
+    summary.tokens = { input, output, cacheRead };
+    summary.cacheHitRatio = input + cacheRead > 0 ? +(cacheRead / (input + cacheRead)).toFixed(4) : null;
+  }
+  return summary;
+}
+async function readTelemetryFile(file) {
+  const raw = await fs9.readFile(file, "utf8");
+  return raw.split(`
+`).filter((l) => l.trim()).flatMap((l) => {
+    try {
+      return [JSON.parse(l)];
+    } catch {
+      return [];
+    }
+  });
+}
+async function listTelemetryFiles(rootDir) {
+  try {
+    const dir = getTelemetryDir(rootDir);
+    const entries = await fs9.readdir(dir);
+    return entries.filter((e) => e.endsWith(".jsonl")).map((e) => path9.join(dir, e));
+  } catch {
+    return [];
+  }
+}
+
+// src/webui/dashboard.ts
+function escapeHtml(raw) {
+  return String(raw ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+async function generateSwarmDashboardHtml(rootDir) {
+  const [board, readiness, epistemicSources, packs, telemetry] = await Promise.all([
+    loadBoard(rootDir),
+    verifyReleaseReady(rootDir),
+    listEpistemicSources(rootDir),
+    detectDomainPacks(rootDir),
+    listTelemetryFiles(rootDir).catch(() => [])
+  ]);
+  let uxScorecard = null;
+  try {
+    const rawUx = await fs10.readFile(path10.join(rootDir, ".opencode", "artifacts", "ux-scorecard.json"), "utf8");
+    uxScorecard = JSON.parse(rawUx);
+  } catch {}
+  const projectTitle = board.project?.name ?? path10.basename(path10.resolve(rootDir));
+  const projectVision = board.project?.vision ?? "Autonomous Multi-Agent Engineering Workspace";
+  const archetype = board.project?.aestheticArchetype ?? "High-Craft Technical Dark";
+  const tasksByStatus = {
+    pending: board.tasks.filter((t) => t.status === "pending"),
+    in_progress: board.tasks.filter((t) => t.status === "in_progress" || t.status === "ready_for_qa"),
+    qa_rejected: board.tasks.filter((t) => t.status === "qa_rejected"),
+    verified: board.tasks.filter((t) => t.status === "verified")
+  };
+  const renderTaskCard = (t) => {
+    const latestReceipt = Array.isArray(t.qaReceipts) && t.qaReceipts.length > 0 ? t.qaReceipts[t.qaReceipts.length - 1] : null;
+    const badgeClass = latestReceipt?.verdict === "PASS" ? "badge-pass" : latestReceipt?.verdict === "REJECT" ? "badge-reject" : "badge-neutral";
+    const badgeLabel = latestReceipt ? `QA: ${latestReceipt.verdict}` : "QA: PENDING";
+    return `<div class="card task-card">
+      <div class="card-header">
+        <span class="mono-id">${escapeHtml(t.id)}</span>
+        <span class="badge ${badgeClass}">${escapeHtml(badgeLabel)}</span>
+      </div>
+      <div class="card-title">${escapeHtml(t.title)}</div>
+      <div class="card-meta">
+        <span>Role: <strong>${escapeHtml(t.owner)}</strong></span>
+        ${t.worktree ? `<span class="mono-tag">${escapeHtml(t.worktree)}</span>` : ""}
+      </div>
+      <div class="card-paths">${(t.ownedPaths ?? []).map((p) => `<code>${escapeHtml(p)}</code>`).join(" ")}</div>
+    </div>`;
+  };
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SwarmOS v1.0 Command Center \u2014 ${escapeHtml(projectTitle)}</title>
+  <style>
+    :root {
+      --surface-0: #0D0E11;
+      --surface-1: #14161B;
+      --surface-2: #1C1F26;
+      --surface-3: #252932;
+      --text-primary: #F3F4F6;
+      --text-secondary: #9CA3AF;
+      --text-muted: #6B7280;
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --accent-emerald: #10B981;
+      --accent-amber: #F59E0B;
+      --accent-rose: #F43F5E;
+      --accent-sky: #38BDF8;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-6: 24px;
+      --space-8: 32px;
+      --radius-sm: 4px;
+      --radius-md: 6px;
+      --radius-lg: 10px;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--surface-0);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
+      padding: var(--space-6);
+      font-variant-numeric: tabular-nums;
+    }
+    .shell { max-width: 1440px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--space-6); }
+    header.topbar {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: var(--space-4) var(--space-6);
+      background: var(--surface-1);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+    }
+    .brand { display: flex; flex-direction: column; gap: var(--space-1); }
+    .brand h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.02em; }
+    .brand p { color: var(--text-secondary); font-size: 13px; }
+    .status-pill {
+      display: inline-flex; align-items: center; gap: var(--space-2);
+      padding: 6px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600;
+      font-family: var(--font-mono);
+    }
+    .status-ready { background: rgba(16, 185, 129, 0.14); color: #34D399; border: 1px solid rgba(16, 185, 129, 0.35); }
+    .status-blocked { background: rgba(245, 158, 11, 0.14); color: #FBBF24; border: 1px solid rgba(245, 158, 11, 0.35); }
+    .metrics-grid {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-4);
+    }
+    .metric-card {
+      background: var(--surface-1); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md); padding: var(--space-4);
+      display: flex; flex-direction: column; gap: var(--space-1);
+    }
+    .metric-label { color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .metric-value { font-size: 24px; font-weight: 600; font-family: var(--font-mono); }
+    .metric-sub { color: var(--text-muted); font-size: 12px; }
+    .kanban {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: var(--space-4);
+    }
+    .kanban-col {
+      background: var(--surface-1); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md); padding: var(--space-4);
+      display: flex; flex-direction: column; gap: var(--space-3); min-height: 260px;
+    }
+    .col-header {
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+      color: var(--text-secondary); padding-bottom: var(--space-2);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+    .card {
+      background: var(--surface-2); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm); padding: var(--space-3);
+      display: flex; flex-direction: column; gap: var(--space-2);
+    }
+    .card-header { display: flex; justify-content: space-between; align-items: center; }
+    .mono-id { font-family: var(--font-mono); font-size: 11px; color: var(--accent-sky); }
+    .badge { font-family: var(--font-mono); font-size: 10px; padding: 2px 6px; border-radius: var(--radius-sm); font-weight: 600; }
+    .badge-pass { background: rgba(16, 185, 129, 0.16); color: #34D399; }
+    .badge-reject { background: rgba(244, 63, 94, 0.16); color: #FB7185; }
+    .badge-neutral { background: rgba(156, 163, 175, 0.14); color: #D1D5DB; }
+    .card-title { font-weight: 500; font-size: 13px; color: var(--text-primary); }
+    .card-meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-secondary); }
+    .card-paths { display: flex; flex-wrap: wrap; gap: 4px; }
+    code { font-family: var(--font-mono); font-size: 11px; background: var(--surface-3); padding: 1px 5px; border-radius: 3px; color: #E5E7EB; }
+    .bottom-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); }
+    .panel {
+      background: var(--surface-1); border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md); padding: var(--space-4);
+      display: flex; flex-direction: column; gap: var(--space-3);
+    }
+    .panel h2 { font-size: 14px; font-weight: 600; color: var(--text-primary); border-bottom: 1px solid var(--border-subtle); padding-bottom: var(--space-2); }
+    ul.clean-list { list-style: none; display: flex; flex-direction: column; gap: var(--space-2); font-size: 13px; color: var(--text-secondary); }
+    @media (max-width: 960px) {
+      .metrics-grid, .kanban, .bottom-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <h1>SwarmOS v1.0 \u2014 The Agency Command Center \xB7 ${escapeHtml(projectTitle)}</h1>
+        <p>${escapeHtml(projectVision)} \xB7 Archetype: <code>${escapeHtml(archetype)}</code></p>
+      </div>
+      <div class="status-pill ${readiness.ready ? "status-ready" : "status-blocked"}">
+        ${readiness.ready ? "RELEASE GATE: READY TO SHIP" : `RELEASE GATE: ${readiness.blockers.length} BLOCKER(S)`}
+      </div>
+    </header>
+
+    <section class="metrics-grid">
+      <div class="metric-card">
+        <span class="metric-label">Locked Contracts</span>
+        <span class="metric-value">${board.contracts.length}</span>
+        <span class="metric-sub">Architect Gate 1 Invariants</span>
+      </div>
+      <div class="metric-card">
+        <span class="metric-label">Verified Tasks</span>
+        <span class="metric-value">${readiness.verifiedTasks.length} / ${board.tasks.filter((t) => t.status !== "superseded").length}</span>
+        <span class="metric-sub">Signed Adversarial QA Receipts</span>
+      </div>
+      <div class="metric-card">
+        <span class="metric-label">Visual UI/UX Judge</span>
+        <span class="metric-value">${uxScorecard ? `${uxScorecard.score}/100 (${escapeHtml(uxScorecard.grade)})` : "Not Run"}</span>
+        <span class="metric-sub">${uxScorecard ? uxScorecard.passed ? "Passed >= 85 Threshold" : "Needs Visual Remediation" : "Run tools.ui.score_ux"}</span>
+      </div>
+      <div class="metric-card">
+        <span class="metric-label">Epistemic Sources & Packs</span>
+        <span class="metric-value">${epistemicSources.length} src \xB7 ${packs.recommendedPacks.length} pack</span>
+        <span class="metric-sub">Active Packs: ${escapeHtml(packs.recommendedPacks.join(", ") || "core")}</span>
+      </div>
+    </section>
+
+    <section class="kanban">
+      <div class="kanban-col">
+        <div class="col-header"><span>Pending</span><span>${tasksByStatus.pending.length}</span></div>
+        ${tasksByStatus.pending.map(renderTaskCard).join("") || `<div class="metric-sub">No pending tasks.</div>`}
+      </div>
+      <div class="kanban-col">
+        <div class="col-header"><span>In Progress / Ready QA</span><span>${tasksByStatus.in_progress.length}</span></div>
+        ${tasksByStatus.in_progress.map(renderTaskCard).join("") || `<div class="metric-sub">No active tasks.</div>`}
+      </div>
+      <div class="kanban-col">
+        <div class="col-header"><span>QA Rejected</span><span>${tasksByStatus.qa_rejected.length}</span></div>
+        ${tasksByStatus.qa_rejected.map(renderTaskCard).join("") || `<div class="metric-sub">Zero rejected tasks.</div>`}
+      </div>
+      <div class="kanban-col">
+        <div class="col-header"><span>Verified (PASS)</span><span>${tasksByStatus.verified.length}</span></div>
+        ${tasksByStatus.verified.map(renderTaskCard).join("") || `<div class="metric-sub">No verified tasks yet.</div>`}
+      </div>
+    </section>
+
+    <section class="bottom-grid">
+      <div class="panel">
+        <h2>Locked Architecture Contracts</h2>
+        <ul class="clean-list">
+          ${board.contracts.map((c) => `<li><code>${escapeHtml(c.id)}</code> \u2014 <strong>${escapeHtml(c.title)}</strong> (${escapeHtml(c.files.join(", "))})</li>`).join("") || "<li>No contracts locked yet.</li>"}
+        </ul>
+      </div>
+      <div class="panel">
+        <h2>100-Point UI/UX Scorecard Breakdown</h2>
+        <ul class="clean-list">
+          ${uxScorecard?.breakdown ? Object.entries(uxScorecard.breakdown).map(([k, v]) => `<li><strong>${escapeHtml(k)}</strong>: <code>${v.score}/${v.max}</code></li>`).join("") : "<li>Run <code>tools.ui.score_ux</code> to populate live 6-axis UI/UX metrics.</li>"}
+        </ul>
+      </div>
+      <div class="panel">
+        <h2>Epistemic Cache & Telemetry</h2>
+        <ul class="clean-list">
+          <li><strong>Verified SHA-256 Sources</strong>: ${epistemicSources.length}</li>
+          <li><strong>Detected Domain Packs</strong>: ${escapeHtml(packs.recommendedPacks.join(", ") || "none")}</li>
+          <li><strong>Recorded Telemetry Sessions</strong>: ${Array.isArray(telemetry) ? telemetry.length : 0}</li>
+        </ul>
+      </div>
+    </section>
+  </div>
+</body>
+</html>`;
+  const outDir = path10.join(rootDir, ".opencode", "artifacts");
+  await fs10.mkdir(outDir, { recursive: true });
+  const dashboardPath = path10.join(outDir, "swarm-dashboard.html");
+  await fs10.writeFile(dashboardPath, html, "utf8");
+  return {
+    dashboardPath,
+    readyToShip: readiness.ready,
+    taskCount: board.tasks.length,
+    contractCount: board.contracts.length,
+    uxScore: uxScorecard?.score ?? null
+  };
+}
+function registerDashboardTools(editor, rootDir) {
+  editor.add({
+    name: "render_dashboard",
+    description: "Generate the self-contained 'The Agency' SwarmOS Live Command Center WebUI HTML5 dashboard at `.opencode/artifacts/swarm-dashboard.html`.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const res = await generateSwarmDashboardHtml(rootDir);
+      return {
+        output: res,
+        content: `Generated SwarmOS Command Center WebUI -> ${res.dashboardPath}`
+      };
+    }
+  });
+}
+
 // src/agents/prompts.ts
 var PROMPT_DIRECTOR = `You are the **Director of Product & Engineering** (\`director\`) at OpenCode SwarmOS\u2014an autonomous multi-agent software engineering organization.
 
@@ -309,1626 +3503,7 @@ function registerSwarmOSAgents(editor) {
 }
 
 // src/agents/guard.ts
-import * as path5 from "path";
-
-// src/board/board.ts
-import * as fs4 from "fs/promises";
-import * as path4 from "path";
-
-// src/omni/verify.ts
-import { exec, execFile } from "child_process";
-import { createHash } from "crypto";
-import * as fs2 from "fs/promises";
-import * as path2 from "path";
-import { promisify } from "util";
-
-// src/omni/repomap.ts
-import * as fs from "fs/promises";
-import * as path from "path";
-var LANG_BY_EXT = {
-  ".ts": "ts",
-  ".tsx": "ts",
-  ".mts": "ts",
-  ".cts": "ts",
-  ".js": "ts",
-  ".jsx": "ts",
-  ".mjs": "ts",
-  ".cjs": "ts",
-  ".py": "py",
-  ".go": "go",
-  ".rs": "rs"
-};
-var IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", ".opencode", ".worktrees", "target", "__pycache__", "vendor", ".venv", "venv"]);
-var MAX_FILES = 3000;
-var MAX_FILE_BYTES = 512 * 1024;
-async function walkSourceFiles(dir, rootDir, acc = []) {
-  if (acc.length >= MAX_FILES)
-    return acc;
-  let entries = [];
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return acc;
-  }
-  entries.sort((a, b) => a.name.localeCompare(b.name));
-  for (const entry of entries) {
-    if (acc.length >= MAX_FILES)
-      break;
-    if (entry.name.startsWith(".") && entry.name !== ".github")
-      continue;
-    if (entry.isDirectory()) {
-      if (IGNORED_DIRS.has(entry.name))
-        continue;
-      await walkSourceFiles(path.join(dir, entry.name), rootDir, acc);
-    } else if (entry.isFile() && LANG_BY_EXT[path.extname(entry.name).toLowerCase()] && !entry.name.endsWith(".d.ts")) {
-      acc.push(path.relative(rootDir, path.join(dir, entry.name)).split(path.sep).join("/"));
-    }
-  }
-  return acc;
-}
-function stripCommentsAndStrings(text, lang) {
-  let out = "";
-  let i = 0;
-  const keepSpecifier = () => /(?:\bfrom|\bimport|\brequire\s*\(|\bimport\s*\()\s*$/.test(out.slice(-40));
-  while (i < text.length) {
-    const ch = text[i];
-    const next = text[i + 1];
-    if (lang !== "py" && ch === "/" && next === "/") {
-      while (i < text.length && text[i] !== `
-`)
-        i++;
-      continue;
-    }
-    if (lang !== "py" && ch === "/" && next === "*") {
-      const end = text.indexOf("*/", i + 2);
-      const stop = end < 0 ? text.length : end + 2;
-      out += text.slice(i, stop).replace(/[^\n]/g, " ");
-      i = stop;
-      continue;
-    }
-    if (lang === "py" && ch === "#") {
-      while (i < text.length && text[i] !== `
-`)
-        i++;
-      continue;
-    }
-    if (lang === "py" && (text.startsWith('"""', i) || text.startsWith("'''", i))) {
-      const q = text.slice(i, i + 3);
-      const end = text.indexOf(q, i + 3);
-      const stop = end < 0 ? text.length : end + 3;
-      out += text.slice(i, stop).replace(/[^\n]/g, " ");
-      i = stop;
-      continue;
-    }
-    if (lang === "rs" && ch === "'") {
-      const m = /^'(?:\\.|[^\\'\n])'/.exec(text.slice(i, i + 6));
-      if (m) {
-        out += " ".repeat(m[0].length);
-        i += m[0].length;
-        continue;
-      }
-      out += ch;
-      i++;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === "`") {
-      let j = i + 1;
-      while (j < text.length && text[j] !== ch) {
-        if (text[j] === "\\")
-          j++;
-        else if (text[j] === `
-` && ch !== "`")
-          break;
-        j++;
-      }
-      const literal = text.slice(i, j + 1);
-      const keep = ch !== "`" && (lang === "go" || lang === "py" || keepSpecifier());
-      out += keep ? literal : ch + literal.slice(1, -1).replace(/[^\n]/g, " ") + (literal.length > 1 ? ch : "");
-      i = j + 1;
-      continue;
-    }
-    out += ch;
-    i++;
-  }
-  return out;
-}
-function splitNames(list) {
-  return list.split(",").map((s) => s.trim().replace(/^type\s+/, "")).filter(Boolean).map((s) => {
-    const m = /^([\w$]+)(?:\s+as\s+([\w$]+))?$/.exec(s);
-    return m ? [m[1], m[2] ?? m[1]] : ["*", "*"];
-  });
-}
-function parseTs(code) {
-  const imports = [];
-  const exports = new Set;
-  for (const m of code.matchAll(/\bimport\s+(?:type\s+)?([\s\S]*?)\s+from\s*["']([^"']+)["']/g)) {
-    const clause = m[1].trim();
-    const names = [];
-    const braces = /\{([\s\S]*)\}/.exec(clause);
-    if (braces)
-      for (const [imported] of splitNames(braces[1]))
-        names.push(imported);
-    if (/\*\s+as\s+[\w$]+/.test(clause))
-      names.push("*");
-    const def = clause.replace(/\{[\s\S]*\}/, "").replace(/\*\s+as\s+[\w$]+/, "").replace(/,/g, " ").trim();
-    if (def && /^[\w$]+$/.test(def))
-      names.push("default");
-    imports.push({ spec: m[2], names: names.length ? names : ["*"], reexports: [] });
-  }
-  for (const m of code.matchAll(/\bimport\s*["']([^"']+)["']/g))
-    imports.push({ spec: m[1], names: ["*"], reexports: [] });
-  for (const m of code.matchAll(/\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/g))
-    imports.push({ spec: m[1], names: ["*"], reexports: [] });
-  for (const m of code.matchAll(/\bexport\s+(?:type\s+)?\{([^}]*)\}\s*from\s*["']([^"']+)["']/g)) {
-    const pairs = splitNames(m[1]);
-    imports.push({ spec: m[2], names: pairs.map((p) => p[0]), reexports: pairs });
-    for (const [, exported] of pairs)
-      exports.add(exported);
-  }
-  for (const m of code.matchAll(/\bexport\s*\*\s*(?:as\s+([\w$]+)\s+)?from\s*["']([^"']+)["']/g)) {
-    imports.push({ spec: m[2], names: ["*"], reexports: [["*", m[1] ?? "*"]] });
-    if (m[1])
-      exports.add(m[1]);
-  }
-  for (const m of code.matchAll(/\bexport\s+(?:declare\s+)?(?:default\s+)?(?:async\s+)?(?:abstract\s+)?(?:function\*?|class|interface|type|const|let|var|enum|namespace)\s+([\w$]+)/g)) {
-    exports.add(m[1]);
-  }
-  if (/\bexport\s+default\b/.test(code))
-    exports.add("default");
-  for (const m of code.matchAll(/\bexport\s+(?:type\s+)?\{([^}]*)\}(?!\s*from)/g)) {
-    for (const [, exported] of splitNames(m[1]))
-      exports.add(exported);
-  }
-  if (exports.size === 0) {
-    for (const m of code.matchAll(/\bexports\.([\w$]+)\s*=/g))
-      exports.add(m[1]);
-  }
-  return { lang: "ts", exports: [...exports], imports };
-}
-function parsePy(code) {
-  const imports = [];
-  const exports = new Set;
-  const joined = code.replace(/\(\s*([^)]*?)\s*\)/gs, (_, inner) => inner.replace(/\s*\n\s*/g, " "));
-  for (const line of joined.split(`
-`)) {
-    let m = /^\s*from\s+([.\w]+)\s+import\s+(.+)$/.exec(line);
-    if (m) {
-      const names = m[2].split(",").map((s) => s.trim().split(/\s+as\s+/)[0]).filter(Boolean);
-      imports.push({ spec: m[1], names: names.includes("*") ? ["*"] : names, reexports: [] });
-      continue;
-    }
-    m = /^\s*import\s+(.+)$/.exec(line);
-    if (m) {
-      for (const part of m[1].split(",")) {
-        const mod = part.trim().split(/\s+as\s+/)[0];
-        if (mod)
-          imports.push({ spec: mod, names: ["*"], reexports: [] });
-      }
-      continue;
-    }
-    m = /^(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)/.exec(line) ?? /^([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)/.exec(line);
-    if (m)
-      exports.add(m[1]);
-  }
-  return { lang: "py", exports: [...exports], imports };
-}
-function parseGo(code) {
-  const imports = [];
-  const goSelectors = new Map;
-  const specs = [];
-  for (const m of code.matchAll(/\bimport\s*\(([\s\S]*?)\)/g)) {
-    for (const line of m[1].split(`
-`)) {
-      const lm = /^\s*([\w.]+\s+)?"([^"]+)"/.exec(line);
-      if (lm)
-        specs.push({ alias: lm[1]?.trim(), spec: lm[2] });
-    }
-  }
-  for (const m of code.matchAll(/\bimport\s+([\w.]+\s+)?"([^"]+)"/g))
-    specs.push({ alias: m[1]?.trim(), spec: m[2] });
-  for (const { alias, spec } of specs) {
-    const name = alias && alias !== "_" && alias !== "." ? alias : spec.split("/").pop();
-    const used = new Set;
-    for (const u of code.matchAll(new RegExp(`\\b${name.replace(/[^\w]/g, "")}\\.([A-Z]\\w*)`, "g")))
-      used.add(u[1]);
-    goSelectors.set(spec, used);
-    imports.push({ spec, names: alias === "." || used.size === 0 ? ["*"] : [...used], reexports: [] });
-  }
-  const exports = new Set;
-  for (const m of code.matchAll(/^(?:func\s+(?:\([^)]*\)\s*)?|type\s+|var\s+|const\s+)([A-Z]\w*)/gm))
-    exports.add(m[1]);
-  for (const m of code.matchAll(/^(?:var|const)\s*\(([\s\S]*?)^\)/gm)) {
-    for (const line of m[1].split(`
-`)) {
-      const lm = /^\s*([A-Z]\w*)/.exec(line);
-      if (lm)
-        exports.add(lm[1]);
-    }
-  }
-  return { lang: "go", exports: [...exports], imports, goSelectors };
-}
-function parseRs(code) {
-  const imports = [];
-  const exports = new Set;
-  for (const m of code.matchAll(/^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z_]\w*)\s*;/gm)) {
-    imports.push({ spec: `mod:${m[1]}`, names: ["*"], reexports: [] });
-  }
-  for (const m of code.matchAll(/^\s*(pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/gm)) {
-    const body = m[2].replace(/\s+/g, "");
-    const brace = /^(.*?)::\{(.*)\}$/.exec(body);
-    const isPub = Boolean(m[1]);
-    if (brace) {
-      const names = brace[2].split(",").map((n) => n.split("as")[0]).filter(Boolean);
-      imports.push({ spec: `use:${brace[1]}`, names, reexports: isPub ? names.map((n) => [n, n]) : [] });
-    } else {
-      const segs = body.split("::");
-      const last = segs.pop().split("as")[0];
-      imports.push({ spec: `use:${segs.join("::")}`, names: [last === "*" ? "*" : last], reexports: isPub ? [[last, last]] : [] });
-    }
-  }
-  for (const m of code.matchAll(/^\s*pub(?:\([^)]*\))?\s+(?:async\s+)?(?:unsafe\s+)?(?:fn|struct|enum|trait|type|const|static|mod|union)\s+([A-Za-z_]\w*)/gm)) {
-    exports.add(m[1]);
-  }
-  return { lang: "rs", exports: [...exports], imports };
-}
-function parseSourceFacts(text, lang) {
-  const code = stripCommentsAndStrings(text, lang);
-  if (lang === "py")
-    return parsePy(code);
-  if (lang === "go")
-    return parseGo(code);
-  if (lang === "rs")
-    return parseRs(code);
-  return parseTs(code);
-}
-function resolveTs(from, spec, ctx) {
-  let base;
-  if (spec.startsWith("."))
-    base = path.posix.normalize(path.posix.join(path.posix.dirname(from), spec));
-  else if (spec.startsWith("@/") || spec.startsWith("~/"))
-    base = `src/${spec.slice(2)}`;
-  else if (spec.startsWith("/"))
-    base = spec.slice(1);
-  else
-    return [];
-  const stripped = base.replace(/\.(?:[cm]?js|jsx)$/, "");
-  const candidates = [
-    base,
-    ...[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"].map((e) => `${stripped}${e}`),
-    ...["index.ts", "index.tsx", "index.js", "index.mjs"].map((f) => `${base}/${f}`)
-  ];
-  const hit = candidates.find((c) => ctx.known.has(c));
-  return hit ? [hit] : [];
-}
-function resolvePy(from, spec, ctx) {
-  let parts;
-  if (spec.startsWith(".")) {
-    const dots = /^\.+/.exec(spec)[0].length;
-    let dir = path.posix.dirname(from);
-    for (let k = 1;k < dots; k++)
-      dir = path.posix.dirname(dir);
-    parts = [...dir === "." ? [] : dir.split("/"), ...spec.slice(dots).split(".").filter(Boolean)];
-  } else {
-    parts = spec.split(".");
-  }
-  const rel = parts.join("/");
-  for (const root of ["", "src/", "lib/"]) {
-    for (const c of [`${root}${rel}.py`, `${root}${rel}/__init__.py`]) {
-      if (ctx.known.has(c.replace(/^\//, "")))
-        return { files: [c.replace(/^\//, "")] };
-    }
-  }
-  return { files: [] };
-}
-function resolveGo(spec, ctx) {
-  if (!ctx.goModule || !(spec === ctx.goModule || spec.startsWith(`${ctx.goModule}/`)))
-    return [];
-  const dir = spec === ctx.goModule ? "." : spec.slice(ctx.goModule.length + 1);
-  return ctx.goDirs.get(dir) ?? [];
-}
-function resolveRs(from, spec, ctx, names) {
-  const fromDir = path.posix.dirname(from);
-  const fileStem = path.posix.basename(from, ".rs");
-  const moduleDir = ["mod", "lib", "main"].includes(fileStem) ? fromDir : `${fromDir}/${fileStem}`;
-  const tryModule = (dir, segs) => {
-    const p = [dir, ...segs].filter((x) => x && x !== ".").join("/");
-    return [`${p}.rs`, `${p}/mod.rs`].find((c) => ctx.known.has(c));
-  };
-  if (spec.startsWith("mod:")) {
-    const hit = tryModule(moduleDir, [spec.slice(4)]);
-    return { files: hit ? [hit] : [], names: ["*"] };
-  }
-  const segs = spec.slice(4).split("::").filter(Boolean);
-  let baseDir;
-  if (segs[0] === "crate") {
-    baseDir = ctx.rustRoots.find((r) => from.startsWith(r === "." ? "" : `${r}/`)) ?? ctx.rustRoots[0] ?? "src";
-    segs.shift();
-  } else if (segs[0] === "super") {
-    baseDir = ["mod", "lib", "main"].includes(fileStem) ? path.posix.dirname(fromDir) : fromDir;
-    segs.shift();
-    while (segs[0] === "super") {
-      baseDir = path.posix.dirname(baseDir);
-      segs.shift();
-    }
-  } else if (segs[0] === "self") {
-    baseDir = moduleDir;
-    segs.shift();
-  } else {
-    return { files: [], names };
-  }
-  for (let k = segs.length;k >= 0; k--) {
-    const hit = k === 0 ? undefined : tryModule(baseDir, segs.slice(0, k));
-    if (hit)
-      return { files: [hit], names: k === segs.length ? names : [segs[k]] };
-  }
-  const rootFile = [`${baseDir}/lib.rs`, `${baseDir}/main.rs`, `${baseDir}/mod.rs`].find((c) => ctx.known.has(c));
-  return rootFile ? { files: [rootFile], names: segs.length ? [segs[0]] : names } : { files: [], names };
-}
-var factsCache = new Map;
-async function readFacts(rootDir, rel) {
-  const abs = path.resolve(rootDir, rel);
-  try {
-    const st = await fs.stat(abs);
-    if (st.size > MAX_FILE_BYTES)
-      return;
-    const cached = factsCache.get(abs);
-    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size)
-      return cached.facts;
-    const text = await fs.readFile(abs, "utf8");
-    const facts = parseSourceFacts(text, LANG_BY_EXT[path.extname(rel).toLowerCase()]);
-    factsCache.set(abs, { mtimeMs: st.mtimeMs, size: st.size, facts });
-    return facts;
-  } catch {
-    return;
-  }
-}
-async function buildRepoGraph(rootDir) {
-  const files = await walkSourceFiles(rootDir, rootDir);
-  const known = new Set(files);
-  const goDirs = new Map;
-  for (const f of files) {
-    if (f.endsWith(".go") && !f.endsWith("_test.go")) {
-      const dir = path.posix.dirname(f);
-      goDirs.set(dir, [...goDirs.get(dir) ?? [], f]);
-    }
-  }
-  let goModule;
-  try {
-    goModule = /^module\s+(\S+)/m.exec(await fs.readFile(path.join(rootDir, "go.mod"), "utf8"))?.[1];
-  } catch {}
-  const rustRoots = [...new Set(files.filter((f) => /(?:^|\/)(?:lib|main)\.rs$/.test(f)).map((f) => path.posix.dirname(f)))];
-  const ctx = { known, goModule, goDirs, rustRoots };
-  const nodes = new Map;
-  const edges = [];
-  const factsByFile = new Map;
-  for (const f of files) {
-    const facts = await readFacts(rootDir, f);
-    const lang = LANG_BY_EXT[path.extname(f).toLowerCase()];
-    nodes.set(f, { path: f, lang, imports: [], importedBy: [], centralityScore: 0, symbols: facts?.exports.slice(0, 24) ?? [] });
-    if (facts)
-      factsByFile.set(f, facts);
-  }
-  for (const [f, facts] of factsByFile) {
-    for (const imp of facts.imports) {
-      let targets = [];
-      let names = imp.names;
-      if (facts.lang === "ts")
-        targets = resolveTs(f, imp.spec, ctx);
-      else if (facts.lang === "py")
-        targets = resolvePy(f, imp.spec, ctx).files;
-      else if (facts.lang === "go")
-        targets = resolveGo(imp.spec, ctx);
-      else if (facts.lang === "rs")
-        ({ files: targets, names } = resolveRs(f, imp.spec, ctx, imp.names));
-      const edgeNames = new Map(targets.map((t) => [t, names]));
-      if (facts.lang === "py") {
-        for (const n of imp.names) {
-          const sub = resolvePy(f, `${imp.spec}${imp.spec.endsWith(".") ? "" : "."}${n}`, ctx).files;
-          for (const s of sub) {
-            if (!targets.includes(s))
-              targets.push(s);
-            edgeNames.set(s, ["*"]);
-          }
-        }
-      }
-      if (facts.lang === "rs" && imp.spec.startsWith("mod:"))
-        for (const t of targets)
-          edgeNames.set(t, []);
-      for (const to of targets) {
-        if (to === f)
-          continue;
-        edges.push({ from: f, to, names: edgeNames.get(to) ?? names, reexports: imp.reexports });
-        const node = nodes.get(f);
-        if (!node.imports.includes(to))
-          node.imports.push(to);
-        const target = nodes.get(to);
-        if (!target.importedBy.includes(f))
-          target.importedBy.push(f);
-      }
-    }
-  }
-  computePageRank(nodes);
-  return { files, nodes, edges };
-}
-function computePageRank(nodes) {
-  const n = nodes.size;
-  if (n === 0)
-    return;
-  const damping = 0.85;
-  let rank = new Map([...nodes.keys()].map((k) => [k, 1 / n]));
-  for (let iter = 0;iter < 50; iter++) {
-    let dangling = 0;
-    for (const [k, node] of nodes)
-      if (node.imports.length === 0)
-        dangling += rank.get(k);
-    const next = new Map;
-    let delta = 0;
-    for (const [k, node] of nodes) {
-      let sum = 0;
-      for (const caller of node.importedBy)
-        sum += rank.get(caller) / nodes.get(caller).imports.length;
-      const value = (1 - damping) / n + damping * (sum + dangling / n);
-      next.set(k, value);
-      delta += Math.abs(value - rank.get(k));
-    }
-    rank = next;
-    if (delta < 0.000000001)
-      break;
-  }
-  for (const [k, node] of nodes)
-    node.centralityScore = +(rank.get(k) * n).toFixed(3);
-}
-async function buildRepoMap(rootDir, topN = 25) {
-  const graph = await buildRepoGraph(rootDir);
-  const sorted = [...graph.nodes.values()].sort((a, b) => b.centralityScore - a.centralityScore || b.importedBy.length - a.importedBy.length || a.path.localeCompare(b.path));
-  return { totalFilesScanned: graph.files.length, topFiles: sorted.slice(0, topN) };
-}
-async function analyzeBlastRadius(rootDir, targetFile, symbol) {
-  const relTarget = path.relative(rootDir, path.resolve(rootDir, targetFile)).split(path.sep).join("/");
-  const graph = await buildRepoGraph(rootDir);
-  let direct;
-  if (!symbol) {
-    direct = [...graph.nodes.get(relTarget)?.importedBy ?? []];
-  } else {
-    const directSet = new Set;
-    const seen = new Set;
-    const queue = [[relTarget, symbol]];
-    while (queue.length) {
-      const [file, name] = queue.shift();
-      const key = `${file}#${name}`;
-      if (seen.has(key))
-        continue;
-      seen.add(key);
-      for (const e of graph.edges) {
-        if (e.to !== file)
-          continue;
-        const takes = e.names.includes("*") || e.names.includes(name);
-        if (!takes)
-          continue;
-        const reexport = e.reexports.find(([imported]) => imported === name || imported === "*");
-        if (reexport) {
-          queue.push([e.from, reexport[1] === "*" ? name : reexport[1]]);
-          if (!e.names.every((x) => e.reexports.some(([imp]) => imp === x || imp === "*")))
-            directSet.add(e.from);
-        } else {
-          directSet.add(e.from);
-        }
-      }
-    }
-    directSet.delete(relTarget);
-    direct = [...directSet];
-  }
-  const visited = new Set(direct);
-  const queue = [...direct];
-  while (queue.length > 0) {
-    const cur = queue.shift();
-    for (const c of graph.nodes.get(cur)?.importedBy ?? []) {
-      if (c !== relTarget && !visited.has(c)) {
-        visited.add(c);
-        queue.push(c);
-      }
-    }
-  }
-  const transitive = [...visited].sort();
-  return {
-    targetFile: relTarget,
-    ...symbol ? { symbol } : {},
-    directDependents: direct.sort(),
-    transitiveDependents: transitive,
-    impactScore: direct.length * 2 + transitive.length
-  };
-}
-function registerRepoMapTools(editor, rootDir, pinned = true) {
-  editor.namespace({
-    name: "repo",
-    description: "Repository map (TS/JS, Python, Go, Rust): PageRank-ranked files with their exported symbols, and file- or symbol-level blast radius."
-  });
-  editor.add({
-    name: "map",
-    description: "Build a PageRank-weighted repository dependency map showing the highest-centrality files, their exported symbols, and their importers/dependents.",
-    options: { namespace: "repo", codemode: true, pinned },
-    input: {
-      type: "object",
-      properties: {
-        topN: { type: "number", description: "Number of top-ranked files to return (default 25)" }
-      }
-    },
-    output: { type: "object" },
-    execute: async (input) => {
-      const report = await buildRepoMap(rootDir, input?.topN ?? 25);
-      return { output: report, content: JSON.stringify(report, null, 2) };
-    }
-  });
-  editor.add({
-    name: "blast_radius",
-    description: "List files that directly or transitively depend on `path`. Pass `symbol` to count only importers of that exported symbol (following re-exports), e.g. before changing one function's signature.",
-    options: { namespace: "repo", codemode: true, pinned },
-    input: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Target file path to analyze" },
-        symbol: { type: "string", description: "Optional exported symbol name to narrow the analysis" }
-      },
-      required: ["path"]
-    },
-    output: { type: "object" },
-    execute: async (input) => {
-      const report = await analyzeBlastRadius(rootDir, input.path, input.symbol);
-      return { output: report, content: JSON.stringify(report, null, 2) };
-    }
-  });
-}
-
-// src/omni/verify.ts
-var execFileAsync = promisify(execFile);
-var ANSI_RE = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*\u0007/g;
-function stripAnsi(text) {
-  return text.replace(ANSI_RE, "").replace(/\r(?!\n)/g, `
-`);
-}
-function getVerifyDir(rootDir) {
-  return path2.join(rootDir, ".opencode", "verify");
-}
-async function readJson(file) {
-  try {
-    return JSON.parse(await fs2.readFile(file, "utf8"));
-  } catch {
-    return;
-  }
-}
-async function exists(file) {
-  try {
-    await fs2.access(file);
-    return true;
-  } catch {
-    return false;
-  }
-}
-function detectRunner(command) {
-  if (/\bbun\s+test\b/.test(command))
-    return "bun";
-  if (/\bvitest\b/.test(command))
-    return "vitest";
-  if (/\bjest\b/.test(command))
-    return "jest";
-  if (/\bnode\s+--test\b/.test(command))
-    return "node";
-  if (/\bpytest\b/.test(command))
-    return "pytest";
-  if (/\bgo\s+test\b/.test(command))
-    return "go";
-  if (/\bcargo\s+test\b/.test(command))
-    return "cargo";
-  return "unknown";
-}
-async function packageManager(rootDir) {
-  if (await exists(path2.join(rootDir, "bun.lock")) || await exists(path2.join(rootDir, "bun.lockb")))
-    return "bun";
-  if (await exists(path2.join(rootDir, "pnpm-lock.yaml")))
-    return "pnpm";
-  if (await exists(path2.join(rootDir, "yarn.lock")))
-    return "yarn";
-  return "npm";
-}
-var AGENTS_LINE_RE = /^\s*(?:[-*]\s*)?\**(typecheck|type-check|lint|test)\**\s*[:=]\s*`([^`]+)`/i;
-function normalizeKind(raw) {
-  const k = raw.toLowerCase();
-  return k === "type-check" ? "typecheck" : k;
-}
-async function discoverChecks(rootDir) {
-  const found = new Map;
-  const add = (kind, command, source) => {
-    if (found.has(kind) || !command.trim())
-      return;
-    found.set(kind, { kind, command: command.trim(), source, ...kind === "test" ? { runner: detectRunner(command) } : {} });
-  };
-  for (const [file, label] of [
-    [path2.join(rootDir, ".opencode", "swarmos.json"), ".opencode/swarmos.json"],
-    [path2.join(rootDir, "opencode.json"), "opencode.json"]
-  ]) {
-    const verifier = (await readJson(file))?.verifier;
-    if (verifier && typeof verifier === "object") {
-      for (const [k, v] of Object.entries(verifier)) {
-        if (typeof v === "string" && /^(typecheck|type-check|lint|test)$/i.test(k))
-          add(normalizeKind(k), v, label);
-      }
-    }
-  }
-  try {
-    const agentsMd = await fs2.readFile(path2.join(rootDir, "AGENTS.md"), "utf8");
-    for (const line of agentsMd.split(`
-`)) {
-      const m = AGENTS_LINE_RE.exec(line);
-      if (m)
-        add(normalizeKind(m[1]), m[2], "AGENTS.md");
-    }
-  } catch {}
-  const pkg = await readJson(path2.join(rootDir, "package.json"));
-  if (pkg?.scripts && typeof pkg.scripts === "object") {
-    const pm = await packageManager(rootDir);
-    const scripts = pkg.scripts;
-    const typecheckScript = ["typecheck", "type-check", "check-types", "tsc"].find((s) => scripts[s]);
-    if (typecheckScript)
-      add("typecheck", `${pm} run ${typecheckScript}`, "package.json");
-    else if (await exists(path2.join(rootDir, "tsconfig.json")))
-      add("typecheck", "npx --no-install tsc --noEmit", "tsconfig.json");
-    if (scripts.lint)
-      add("lint", `${pm} run lint`, "package.json");
-    if (scripts.test && !/no test specified/.test(scripts.test)) {
-      if (!found.has("test")) {
-        found.set("test", { kind: "test", command: `${pm} run test`, source: "package.json", runner: detectRunner(scripts.test) });
-      }
-    }
-  }
-  if (await exists(path2.join(rootDir, "Cargo.toml"))) {
-    add("typecheck", "cargo check --quiet", "Cargo.toml");
-    add("test", "cargo test --quiet", "Cargo.toml");
-  }
-  if (await exists(path2.join(rootDir, "go.mod"))) {
-    add("typecheck", "go vet ./...", "go.mod");
-    add("test", "go test ./...", "go.mod");
-  }
-  if (await exists(path2.join(rootDir, "pyproject.toml")) || await exists(path2.join(rootDir, "pytest.ini")) || await exists(path2.join(rootDir, "setup.py"))) {
-    add("test", "python3 -m pytest -q", "python project");
-  }
-  const order = ["typecheck", "lint", "test"];
-  return order.flatMap((k) => found.has(k) ? [found.get(k)] : []);
-}
-async function git(rootDir, args) {
-  try {
-    const { stdout } = await execFileAsync("git", args, { cwd: rootDir, timeout: 1e4, maxBuffer: 32 * 1024 * 1024 });
-    return stdout;
-  } catch {
-    return;
-  }
-}
-async function listChangedFiles(rootDir) {
-  const tracked = await git(rootDir, ["diff", "--name-only", "HEAD"]);
-  if (tracked === undefined)
-    return;
-  const untracked = await git(rootDir, ["ls-files", "--others", "--exclude-standard"]) ?? "";
-  const files = [...tracked.split(`
-`), ...untracked.split(`
-`)].map((f) => f.trim()).filter(Boolean);
-  return [...new Set(files)].filter((f) => !f.startsWith(".opencode/"));
-}
-async function computeTreeFingerprint(rootDir) {
-  const head = await git(rootDir, ["rev-parse", "HEAD"]);
-  if (head === undefined)
-    return null;
-  const hash = createHash("sha256");
-  hash.update(head.trim());
-  hash.update(await git(rootDir, ["diff", "HEAD", "--", ".", ":(exclude).opencode"]) ?? "");
-  const untracked = (await git(rootDir, ["ls-files", "--others", "--exclude-standard"]) ?? "").split(`
-`).map((f) => f.trim()).filter((f) => f && !f.startsWith(".opencode/")).sort();
-  for (const f of untracked) {
-    hash.update(`\x00${f}\x00`);
-    try {
-      hash.update(await fs2.readFile(path2.join(rootDir, f)));
-    } catch {}
-  }
-  return hash.digest("hex").slice(0, 32);
-}
-var TEST_FILE_RE = /(?:\.(?:test|spec)\.[cm]?[jt]sx?$)|(?:(?:^|\/)test_[^/]+\.py$)|(?:_test\.py$)|(?:_test\.go$)/;
-function isTestFile(file) {
-  return TEST_FILE_RE.test(file);
-}
-function scopedTestCommand(check, testFiles, goPackages) {
-  const quoted = testFiles.map((f) => JSON.stringify(f)).join(" ");
-  switch (check.runner) {
-    case "bun":
-      return `bun test ${testFiles.map((f) => JSON.stringify(f.startsWith(".") ? f : `./${f}`)).join(" ")}`;
-    case "vitest":
-      return `npx --no-install vitest run ${quoted}`;
-    case "jest":
-      return `npx --no-install jest ${quoted}`;
-    case "node":
-      return `node --test ${quoted}`;
-    case "pytest":
-      return `python3 -m pytest -q ${quoted}`;
-    case "go":
-      return goPackages.length ? `go test ${goPackages.join(" ")}` : undefined;
-    default:
-      return;
-  }
-}
-var FAILURE_LOC_RES = [
-  /(?:^|[\s(])((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?|py|go|rs|vue|svelte|css))[:](\d+)(?::(\d+))?/,
-  /(?:^|\s)((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?))\((\d+),(\d+)\)/,
-  /File "([^"]+\.py)", line (\d+)/
-];
-var TEST_HEADER_RE = /^((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?)):$/;
-var NAMED_FAILURE_RES = [
-  /^\s*FAIL\s+((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?))(.*)$/,
-  /^FAILED\s+([\w@./-]+\.py)::(\S+)(.*)$/
-];
-function extractFailures(output, rootDir, max = 30) {
-  const failures = [];
-  const seen = new Set;
-  let currentTestFile;
-  for (const line of output.split(`
-`)) {
-    if (failures.length >= max)
-      break;
-    const header = TEST_HEADER_RE.exec(line.trim());
-    if (header) {
-      currentTestFile = header[1];
-      continue;
-    }
-    const bunFail = /^\(fail\)\s+(.+?)(?:\s+\[[\d.]+m?s\])?$/.exec(line.trim());
-    if (bunFail && currentTestFile) {
-      const key = `${currentTestFile}#${bunFail[1]}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        failures.push({ file: currentTestFile, message: `(fail) ${bunFail[1]}` });
-      }
-      continue;
-    }
-    let named = false;
-    for (const re of NAMED_FAILURE_RES) {
-      const m = re.exec(line);
-      if (!m)
-        continue;
-      named = true;
-      const key = `${m[1]}#${m[2]}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        failures.push({ file: m[1], message: line.trim().slice(0, 240) });
-      }
-      break;
-    }
-    if (named)
-      continue;
-    if (!/(error|fail|assert|expect|exception|panic|warning|\u2717|\u00D7)/i.test(line) && !/File "|^\s*at\s/.test(line))
-      continue;
-    for (const re of FAILURE_LOC_RES) {
-      const m = re.exec(line);
-      if (!m)
-        continue;
-      let file = m[1];
-      if (file.includes("node_modules") || file.startsWith("internal/"))
-        break;
-      if (rootDir && path2.isAbsolute(file))
-        file = path2.relative(rootDir, file).split(path2.sep).join("/");
-      const key = `${file}:${m[2]}`;
-      if (seen.has(key))
-        break;
-      seen.add(key);
-      failures.push({ file, line: Number(m[2]), ...m[3] ? { col: Number(m[3]) } : {}, message: line.trim().slice(0, 240) });
-      break;
-    }
-  }
-  return failures;
-}
-function lastInt(text, re) {
-  let last;
-  for (const m of text.matchAll(re))
-    last = Number(m[1]);
-  return last;
-}
-function sumInt(text, re) {
-  let total = 0;
-  for (const m of text.matchAll(re))
-    total += Number(m[1]);
-  return total;
-}
-function parseCounts(output, runner = "unknown") {
-  if (runner === "cargo") {
-    const passed = sumInt(output, /(\d+) passed;/g);
-    const failed = sumInt(output, /(\d+) failed;/g);
-    return /test result:/.test(output) ? { passed, failed } : undefined;
-  }
-  if (runner === "go") {
-    const failed = (output.match(/^--- FAIL:/gm) ?? []).length;
-    const passed = (output.match(/^--- PASS:/gm) ?? []).length;
-    const okPkgs = (output.match(/^ok\s+/gm) ?? []).length;
-    return failed + passed + okPkgs > 0 ? { passed: passed || okPkgs, failed } : undefined;
-  }
-  const passed = lastInt(output, /(\d+)\s+(?:pass|passed|passing)\b/gi);
-  const failed = lastInt(output, /(\d+)\s+(?:fail|failed|failing)\b/gi);
-  if (passed === undefined && failed === undefined)
-    return;
-  return { passed: passed ?? 0, failed: failed ?? 0 };
-}
-function runShell(command, cwd, timeoutMs) {
-  return new Promise((resolve) => {
-    exec(command, { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, env: { ...process.env, CI: "1", FORCE_COLOR: "0", NO_COLOR: "1" } }, (err, stdout, stderr) => {
-      const output = stripAnsi(`${stdout ?? ""}
-${stderr ?? ""}`);
-      const timedOut = Boolean(err?.killed && err?.signal);
-      resolve({ exitCode: err ? typeof err.code === "number" ? err.code : 1 : 0, output, timedOut });
-    });
-  });
-}
-async function resolveScope(rootDir, input) {
-  const changed = input.paths?.length ? input.paths : await listChangedFiles(rootDir) ?? [];
-  if (changed.length === 0)
-    return { changedFiles: [], scopedTests: [], goPackages: [], note: "no changed files; ran full suite" };
-  const candidates = new Set(changed);
-  for (const file of changed.filter((f) => !isTestFile(f)).slice(0, 20)) {
-    try {
-      const radius = await analyzeBlastRadius(rootDir, file);
-      for (const dep of radius.transitiveDependents)
-        candidates.add(dep);
-    } catch {}
-  }
-  const scopedTests = [];
-  for (const f of candidates) {
-    if (isTestFile(f) && await exists(path2.join(rootDir, f)))
-      scopedTests.push(f);
-  }
-  const goPackages = [...new Set(changed.filter((f) => f.endsWith(".go")).map((f) => `./${path2.posix.dirname(f)}`))];
-  return { changedFiles: changed, scopedTests: scopedTests.sort(), goPackages };
-}
-async function runVerify(rootDir, input = {}) {
-  const checks = (await discoverChecks(rootDir)).filter((c) => !input.kinds || input.kinds.includes(c.kind));
-  const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 300000, 5000), 1800000);
-  let scope = input.scope ?? "changed";
-  const scoping = scope === "changed" ? await resolveScope(rootDir, input) : { changedFiles: [], scopedTests: [], goPackages: [] };
-  let scopeNote = scoping.note;
-  const results = [];
-  for (const check of checks) {
-    let command = check.command;
-    if (check.kind === "test" && scope === "changed") {
-      const scoped = scoping.scopedTests.length || scoping.goPackages.length ? scopedTestCommand(check, scoping.scopedTests, scoping.goPackages) : undefined;
-      if (scoped)
-        command = scoped;
-      else if (scoping.changedFiles.length > 0) {
-        scopeNote = scoping.scopedTests.length ? `runner "${check.runner}" cannot be scoped; ran full test command` : "no tests import the changed files; ran full test command";
-      }
-    }
-    const started = Date.now();
-    const { exitCode, output, timedOut } = await runShell(command, rootDir, timeoutMs);
-    const lines = output.split(`
-`).filter((l) => l.trim());
-    results.push({
-      kind: check.kind,
-      command,
-      source: check.source,
-      exitCode,
-      passed: exitCode === 0 && !timedOut,
-      timedOut,
-      durationMs: Date.now() - started,
-      ...check.kind === "test" ? { counts: parseCounts(output, check.runner) } : {},
-      failures: exitCode === 0 ? [] : extractFailures(output, rootDir),
-      outputTail: lines.slice(-40).join(`
-`)
-    });
-  }
-  if (scope === "changed" && scoping.changedFiles.length === 0)
-    scope = "full";
-  const run = {
-    id: `verify-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    createdAt: new Date().toISOString(),
-    rootDir: path2.resolve(rootDir),
-    scope,
-    ...scopeNote ? { scopeNote } : {},
-    fingerprint: await computeTreeFingerprint(rootDir),
-    changedFiles: scoping.changedFiles,
-    scopedTests: scoping.scopedTests,
-    checks: results,
-    passed: results.length > 0 && results.every((r) => r.passed)
-  };
-  await saveVerifyRun(rootDir, run);
-  return run;
-}
-async function saveVerifyRun(rootDir, run) {
-  const dir = path2.join(getVerifyDir(rootDir), "runs");
-  await fs2.mkdir(dir, { recursive: true });
-  const payload = JSON.stringify(run, null, 2);
-  await fs2.writeFile(path2.join(dir, `${run.id}.json`), payload, "utf8");
-  await fs2.writeFile(path2.join(getVerifyDir(rootDir), "latest.json"), payload, "utf8");
-  if (run.scope === "full")
-    await fs2.writeFile(path2.join(getVerifyDir(rootDir), "latest-full.json"), payload, "utf8");
-}
-async function loadVerifyRun(rootDir, runId) {
-  return readJson(path2.join(getVerifyDir(rootDir), "runs", `${path2.basename(runId)}.json`));
-}
-async function loadLatestVerifyRun(rootDir, scope) {
-  return readJson(path2.join(getVerifyDir(rootDir), scope === "full" ? "latest-full.json" : "latest.json"));
-}
-function formatVerifyRun(run) {
-  const lines = [
-    `Verify ${run.passed ? "PASSED" : "FAILED"} [${run.id}] scope=${run.scope}${run.scopeNote ? ` (${run.scopeNote})` : ""}`
-  ];
-  if (run.checks.length === 0)
-    lines.push("No verification commands discovered. Add a `verifier` field to .opencode/swarmos.json.");
-  for (const c of run.checks) {
-    const counts = c.counts ? ` ${c.counts.passed} passed / ${c.counts.failed} failed` : "";
-    lines.push(`- ${c.kind}: ${c.passed ? "pass" : c.timedOut ? "TIMEOUT" : `FAIL (exit ${c.exitCode})`}${counts} \u2014 \`${c.command}\` (${c.durationMs}ms)`);
-    for (const f of c.failures.slice(0, 15)) {
-      lines.push(`    ${f.file}${f.line ? `:${f.line}` : ""}${f.col ? `:${f.col}` : ""} ${f.message}`);
-    }
-    if (!c.passed && c.failures.length === 0)
-      lines.push(c.outputTail.split(`
-`).slice(-15).map((l) => `    ${l}`).join(`
-`));
-  }
-  return lines.join(`
-`);
-}
-function resolveVerifyDir(rootDir, dir) {
-  if (!dir)
-    return rootDir;
-  const abs = path2.resolve(rootDir, dir);
-  const rel = path2.relative(path2.resolve(rootDir), abs);
-  if (rel.startsWith("..") || path2.isAbsolute(rel))
-    throw new Error(`SwarmOS Verify: "${dir}" is outside the workspace.`);
-  return abs;
-}
-function registerVerifyTools(editor, rootDir, pinned = true) {
-  editor.namespace({
-    name: "verify",
-    description: "Run the repository's own typecheck, lint and test commands scoped to changed files, with structured pass/fail counts and file:line failures."
-  });
-  editor.add({
-    name: "run",
-    description: "Run the repo's verification commands. scope 'changed' (default) runs typecheck/lint plus only the tests that import changed files; 'full' runs everything. Returns a run ID that QA receipts must cite.",
-    options: { namespace: "verify", codemode: true, pinned },
-    input: {
-      type: "object",
-      properties: {
-        dir: { type: "string", description: "Directory to verify relative to the workspace root, e.g. a tournament worktree '.worktrees/<taskId>'" },
-        scope: { type: "string", enum: ["changed", "full"], description: "Scope of the run (default 'changed')" },
-        kinds: { type: "array", items: { type: "string", enum: ["typecheck", "lint", "test"] }, description: "Subset of checks to run" },
-        paths: { type: "array", items: { type: "string" }, description: "Override the changed-file set" },
-        timeoutMs: { type: "number", description: "Per-check timeout (default 300000)" }
-      }
-    },
-    output: { type: "object" },
-    execute: async (input) => {
-      const run = await runVerify(resolveVerifyDir(rootDir, input?.dir), input ?? {});
-      return { output: run, content: formatVerifyRun(run) };
-    }
-  });
-  editor.add({
-    name: "checks",
-    description: "List the verification commands SwarmOS discovered for this repository and where each came from.",
-    options: { namespace: "verify", codemode: true, pinned },
-    input: { type: "object", properties: {} },
-    output: { type: "object" },
-    execute: async () => {
-      const checks = await discoverChecks(rootDir);
-      return { output: { checks }, content: JSON.stringify(checks, null, 2) };
-    }
-  });
-}
-
-// src/board/worktrees.ts
-import { execFile as execFile2 } from "child_process";
-import * as fs3 from "fs/promises";
-import * as path3 from "path";
-import { promisify as promisify2 } from "util";
-var execFileAsync2 = promisify2(execFile2);
-async function git2(cwd, args, timeout = 60000) {
-  try {
-    const { stdout, stderr } = await execFileAsync2("git", args, { cwd, timeout, maxBuffer: 32 * 1024 * 1024 });
-    return { ok: true, stdout, stderr };
-  } catch (err) {
-    return { ok: false, stdout: err?.stdout ?? "", stderr: err?.stderr ?? String(err?.message ?? err) };
-  }
-}
-async function isGitRepo(rootDir) {
-  const res = await git2(rootDir, ["rev-parse", "--is-inside-work-tree"]);
-  return res.ok && res.stdout.trim() === "true";
-}
-function candidateBranch(taskId) {
-  return `swarmos/${taskId}`;
-}
-async function provisionWorktree(rootDir, taskId, worktree, baseRef) {
-  const branch = candidateBranch(taskId);
-  const abs = path3.resolve(rootDir, worktree);
-  const list = await git2(rootDir, ["worktree", "list", "--porcelain"]);
-  if (list.ok && list.stdout.split(`
-`).some((l) => l === `worktree ${abs}`)) {
-    return { worktree, branch, provisioned: true, reason: "reused existing worktree" };
-  }
-  await fs3.mkdir(path3.dirname(abs), { recursive: true });
-  const branchExists = (await git2(rootDir, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`])).ok;
-  const res = branchExists ? await git2(rootDir, ["worktree", "add", abs, branch]) : await git2(rootDir, ["worktree", "add", "-b", branch, abs, baseRef]);
-  if (!res.ok)
-    return { worktree, branch, provisioned: false, reason: res.stderr.trim().slice(0, 300) };
-  return { worktree, branch, provisioned: true };
-}
-async function commitWorktree(worktreeDir, message) {
-  await git2(worktreeDir, ["add", "-A", "--", ".", ":(exclude).opencode"]);
-  const staged = await git2(worktreeDir, ["diff", "--cached", "--quiet"]);
-  if (staged.ok)
-    return false;
-  let res = await git2(worktreeDir, ["commit", "-q", "-m", message]);
-  if (!res.ok && /identity|user\.(name|email)/i.test(res.stderr)) {
-    res = await git2(worktreeDir, ["-c", "user.name=SwarmOS", "-c", "user.email=swarmos@localhost", "commit", "-q", "-m", message]);
-  }
-  if (!res.ok)
-    throw new Error(`SwarmOS Worktree: commit failed in ${worktreeDir}: ${res.stderr.trim()}`);
-  return true;
-}
-function parseShortstat(text) {
-  const n = (re) => Number(re.exec(text)?.[1] ?? 0);
-  return { files: n(/(\d+) files? changed/), insertions: n(/(\d+) insertions?/), deletions: n(/(\d+) deletions?/) };
-}
-async function scoreTournament(rootDir, tournament) {
-  const scores = [];
-  for (const c of tournament.candidates) {
-    const dir = path3.resolve(rootDir, c.worktree);
-    const provisioned = c.provisioned !== false && await isGitRepo(dir);
-    if (!provisioned) {
-      scores.push({ taskId: c.taskId, worktree: c.worktree, provisioned: false, passed: false, failedChecks: 0, failedTests: 0, diff: { files: 0, insertions: 0, deletions: 0 } });
-      continue;
-    }
-    const run = await runVerify(dir, { scope: "full" });
-    const base = tournament.baseRef ?? "HEAD";
-    const stat = await git2(dir, ["diff", "--shortstat", base, "--", ".", ":(exclude).opencode"]);
-    scores.push({
-      taskId: c.taskId,
-      worktree: c.worktree,
-      provisioned: true,
-      verifyRunId: run.id,
-      passed: run.passed,
-      failedChecks: run.checks.filter((k) => !k.passed).length,
-      failedTests: run.checks.reduce((a, k) => a + (k.counts?.failed ?? 0), 0),
-      diff: parseShortstat(stat.stdout)
-    });
-  }
-  const size = (s) => s.diff.insertions + s.diff.deletions;
-  return scores.sort((a, b) => Number(b.passed) - Number(a.passed) || a.failedChecks - b.failedChecks || a.failedTests - b.failedTests || size(a) - size(b));
-}
-async function mergeTournamentWinner(rootDir, tournament, winnerTaskId) {
-  const winner = tournament.candidates.find((c) => c.taskId === winnerTaskId);
-  if (!winner)
-    throw new Error(`SwarmOS Tournament: ${winnerTaskId} is not a candidate of ${tournament.id}`);
-  const winnerDir = path3.resolve(rootDir, winner.worktree);
-  await commitWorktree(winnerDir, `swarmos: ${tournament.id} candidate ${winner.label}`);
-  const branch = winner.branch ?? candidateBranch(winnerTaskId);
-  const merge = await git2(rootDir, ["merge", "--no-ff", "-m", `swarmos: merge tournament ${tournament.id} winner ${winnerTaskId}`, branch]);
-  if (!merge.ok) {
-    const conflicts = (await git2(rootDir, ["diff", "--name-only", "--diff-filter=U"])).stdout.trim().split(`
-`).filter(Boolean);
-    await git2(rootDir, ["merge", "--abort"]);
-    throw new Error(`SwarmOS Tournament: merging ${branch} failed${conflicts.length ? ` with conflicts in ${conflicts.join(", ")}` : ""}: ${merge.stderr.trim().slice(0, 300)}. The merge was aborted; resolve it manually or re-run the candidate on the current base.`);
-  }
-  const commit = (await git2(rootDir, ["rev-parse", "HEAD"])).stdout.trim();
-  const cleanup = await cleanupTournamentWorktrees(rootDir, tournament);
-  return { merged: true, commit, ...cleanup };
-}
-async function cleanupTournamentWorktrees(rootDir, tournament) {
-  const removedWorktrees = [];
-  const deletedBranches = [];
-  for (const c of tournament.candidates) {
-    const abs = path3.resolve(rootDir, c.worktree);
-    if ((await git2(rootDir, ["worktree", "remove", "--force", abs])).ok)
-      removedWorktrees.push(c.worktree);
-    const branch = c.branch ?? candidateBranch(c.taskId);
-    if ((await git2(rootDir, ["branch", "-D", branch])).ok)
-      deletedBranches.push(branch);
-  }
-  await git2(rootDir, ["worktree", "prune"]);
-  return { removedWorktrees, deletedBranches };
-}
-
-// src/host/session-state.ts
-var sessions = new Map;
-var MAX_TOUCHED = 50;
-function getSessionState(sessionID) {
-  const sid = sessionID ?? "default";
-  let state = sessions.get(sid);
-  if (!state) {
-    state = {
-      sessionID: sid,
-      startedAt: Date.now(),
-      toolCalls: 0,
-      toolFailures: 0,
-      breakerFires: 0,
-      turns: 0,
-      touchedFiles: [],
-      taint: [],
-      openIncidents: [],
-      injectedLessons: new Set
-    };
-    sessions.set(sid, state);
-  }
-  return state;
-}
-function listSessionStates() {
-  return Array.from(sessions.values());
-}
-function resetSessionStates() {
-  sessions.clear();
-}
-function touchFile(state, file) {
-  const idx = state.touchedFiles.indexOf(file);
-  if (idx >= 0)
-    state.touchedFiles.splice(idx, 1);
-  state.touchedFiles.push(file);
-  if (state.touchedFiles.length > MAX_TOUCHED)
-    state.touchedFiles.shift();
-}
-function eventTargetPath(event) {
-  const input = event?.input;
-  if (!input || typeof input !== "object")
-    return;
-  for (const key of ["path", "filePath", "file", "target"]) {
-    if (typeof input[key] === "string" && input[key])
-      return input[key];
-  }
-  return;
-}
-function isFailedEvent(event) {
-  return event?.status === "error";
-}
-
-// src/board/board.ts
-var BOARD_VERSION = "4.1.0";
-var boardLocks = new Map;
-function getBoardPath(rootDir) {
-  return path4.join(rootDir, ".opencode", "org", "board.json");
-}
-function createEmptyBoard() {
-  return {
-    version: BOARD_VERSION,
-    project: null,
-    contracts: [],
-    tasks: [],
-    tournaments: []
-  };
-}
-async function loadBoard(rootDir) {
-  const file = getBoardPath(rootDir);
-  try {
-    const raw = await fs4.readFile(file, "utf8");
-    const parsed = JSON.parse(raw);
-    return {
-      version: parsed.version ?? BOARD_VERSION,
-      ...parsed.policy ? { policy: parsed.policy } : {},
-      project: parsed.project ?? null,
-      contracts: Array.isArray(parsed.contracts) ? parsed.contracts : [],
-      tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
-      tournaments: Array.isArray(parsed.tournaments) ? parsed.tournaments : []
-    };
-  } catch {
-    return createEmptyBoard();
-  }
-}
-async function saveBoard(rootDir, board) {
-  const dir = path4.join(rootDir, ".opencode", "org");
-  await fs4.mkdir(dir, { recursive: true });
-  const targetFile = path4.join(dir, "board.json");
-  const tempFile = path4.join(dir, `board.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`);
-  const payload = JSON.stringify(board, null, 2);
-  await fs4.writeFile(tempFile, payload, "utf8");
-  await fs4.rename(tempFile, targetFile);
-}
-async function withBoardLock(rootDir, mutator) {
-  const key = path4.resolve(rootDir);
-  const previous = boardLocks.get(key) ?? Promise.resolve();
-  let release;
-  const gate = new Promise((resolve) => {
-    release = resolve;
-  });
-  const current = previous.then(() => gate);
-  boardLocks.set(key, current);
-  await previous;
-  try {
-    const board = await loadBoard(rootDir);
-    const result = await mutator(board);
-    await saveBoard(rootDir, board);
-    return result;
-  } finally {
-    release();
-    if (boardLocks.get(key) === current) {
-      boardLocks.delete(key);
-    }
-  }
-}
-async function initProject(rootDir, input) {
-  return withBoardLock(rootDir, (board) => {
-    const charter = {
-      name: input.name,
-      vision: input.vision,
-      aestheticArchetype: input.aestheticArchetype,
-      updatedAt: new Date().toISOString()
-    };
-    board.project = charter;
-    if (!board.policy || input.requireVerifiedReceipts !== undefined) {
-      board.policy = { requireVerifiedReceipts: input.requireVerifiedReceipts ?? true };
-    }
-    return charter;
-  });
-}
-async function lockContract(rootDir, input) {
-  return withBoardLock(rootDir, (board) => {
-    const contract = {
-      id: input.id,
-      title: input.title,
-      files: input.files,
-      invariants: input.invariants,
-      lockedAt: new Date().toISOString(),
-      ...input.lockedBy ? { lockedBy: input.lockedBy } : {}
-    };
-    const idx = board.contracts.findIndex((c) => c.id === input.id);
-    if (idx >= 0) {
-      board.contracts[idx] = contract;
-    } else {
-      board.contracts.push(contract);
-    }
-    return contract;
-  });
-}
-async function createTask(rootDir, input) {
-  return withBoardLock(rootDir, (board) => {
-    const existing = board.tasks.find((t) => t.id === input.id);
-    const now = new Date().toISOString();
-    const task = {
-      id: input.id,
-      title: input.title,
-      owner: input.owner,
-      ownedPaths: input.ownedPaths,
-      worktree: input.worktree,
-      ...input.tournamentId ? { tournamentId: input.tournamentId } : {},
-      ...existing?.claimedBySessionID ? { claimedBySessionID: existing.claimedBySessionID } : {},
-      ...input.budget ?? existing?.budget ? { budget: input.budget ?? existing?.budget } : {},
-      usage: existing?.usage ?? { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 },
-      status: existing?.status ?? "pending",
-      qaReceipts: existing?.qaReceipts ?? [],
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now
-    };
-    if (existing) {
-      Object.assign(existing, task);
-    } else {
-      board.tasks.push(task);
-    }
-    return task;
-  });
-}
-async function updateTaskStatus(rootDir, taskId, status) {
-  return withBoardLock(rootDir, (board) => {
-    const task = board.tasks.find((t) => t.id === taskId);
-    if (!task) {
-      throw new Error(`SwarmOS Task not found: ${taskId}`);
-    }
-    task.status = status;
-    task.updatedAt = new Date().toISOString();
-    return task;
-  });
-}
-async function claimTask(rootDir, input) {
-  const sid = input.sessionID ?? "default";
-  const state = getSessionState(sid);
-  state.taskId = input.taskId;
-  return withBoardLock(rootDir, (board) => {
-    const task = board.tasks.find((t) => t.id === input.taskId);
-    if (!task) {
-      throw new Error(`SwarmOS Task not found: ${input.taskId}`);
-    }
-    task.claimedBySessionID = sid;
-    if (task.status === "pending") {
-      task.status = "in_progress";
-    }
-    task.usage ??= { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 };
-    task.updatedAt = new Date().toISOString();
-    return task;
-  });
-}
-async function setTaskBudget(rootDir, input) {
-  return withBoardLock(rootDir, (board) => {
-    const task = board.tasks.find((t) => t.id === input.taskId);
-    if (!task) {
-      throw new Error(`SwarmOS Task not found: ${input.taskId}`);
-    }
-    task.budget = { ...task.budget, ...input.budget };
-    if (input.resetUsage || !task.usage) {
-      task.usage = { tokensUsed: 0, turnsUsed: 0, toolCallsUsed: 0 };
-    } else {
-      const reason = evaluateTaskBudgetViolation(task.budget, task.usage);
-      task.usage.overBudget = Boolean(reason);
-      if (reason)
-        task.usage.overBudgetReason = reason;
-      else
-        delete task.usage.overBudgetReason;
-    }
-    task.updatedAt = new Date().toISOString();
-    return task;
-  });
-}
-function evaluateTaskBudgetViolation(budget, usage) {
-  if (!budget || !usage)
-    return;
-  if (budget.maxTokens !== undefined && usage.tokensUsed > budget.maxTokens) {
-    return `tokensUsed (${usage.tokensUsed}) > maxTokens (${budget.maxTokens})`;
-  }
-  if (budget.maxTurns !== undefined && usage.turnsUsed > budget.maxTurns) {
-    return `turnsUsed (${usage.turnsUsed}) > maxTurns (${budget.maxTurns})`;
-  }
-  if (budget.maxToolCalls !== undefined && usage.toolCallsUsed > budget.maxToolCalls) {
-    return `toolCallsUsed (${usage.toolCallsUsed}) > maxToolCalls (${budget.maxToolCalls})`;
-  }
-  return;
-}
-function taskWorkdir(rootDir, task) {
-  return task.worktree ? path4.resolve(rootDir, task.worktree) : path4.resolve(rootDir);
-}
-async function assertVerifiedPass(rootDir, task, verifyRunId) {
-  if (!verifyRunId) {
-    throw new Error(`SwarmOS Verify Gate: PASS for task [${task.id}] must cite a passing \`tools.verify.run\` (pass \`verifyRunId\`). Run verification instead of asserting it.`);
-  }
-  const workdir = taskWorkdir(rootDir, task);
-  const run = await loadVerifyRun(workdir, verifyRunId) ?? await loadVerifyRun(rootDir, verifyRunId);
-  if (!run)
-    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] not found for task [${task.id}].`);
-  if (!run.passed) {
-    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] FAILED; a failing run cannot back a PASS receipt.`);
-  }
-  if (path4.resolve(run.rootDir) !== workdir) {
-    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] ran in ${run.rootDir}, but task [${task.id}] lives in ${workdir}.`);
-  }
-  const current = await computeTreeFingerprint(workdir);
-  if (current !== null && run.fingerprint !== current) {
-    throw new Error(`SwarmOS Verify Gate: code changed since verify run [${verifyRunId}]. Re-run \`tools.verify.run\` on the current tree.`);
-  }
-  return current;
-}
-async function submitQAReceipt(rootDir, input) {
-  const snapshot = await loadBoard(rootDir);
-  const target = snapshot.tasks.find((t) => t.id === input.taskId);
-  let fingerprint;
-  if (target && input.verdict === "PASS" && snapshot.policy?.requireVerifiedReceipts) {
-    fingerprint = await assertVerifiedPass(rootDir, target, input.verifyRunId);
-  }
-  return withBoardLock(rootDir, (board) => {
-    const task = board.tasks.find((t) => t.id === input.taskId);
-    if (!task) {
-      throw new Error(`SwarmOS Task not found: ${input.taskId}`);
-    }
-    const receipt = {
-      verdict: input.verdict,
-      summary: input.summary,
-      defects: input.defects,
-      testCommand: input.testCommand,
-      ...input.verifyRunId ? { verifyRunId: input.verifyRunId } : {},
-      ...fingerprint !== undefined ? { fingerprint } : {},
-      timestamp: new Date().toISOString()
-    };
-    task.qaReceipts.push(receipt);
-    task.status = input.verdict === "PASS" ? "verified" : "qa_rejected";
-    task.updatedAt = receipt.timestamp;
-    return task;
-  });
-}
-async function planTournament(rootDir, input) {
-  const planned = await recordTournamentPlan(rootDir, input);
-  if (!await isGitRepo(rootDir)) {
-    return markProvisioning(rootDir, planned.id, undefined, planned.candidates.map(() => ({ provisioned: false, reason: "not a git repository" })));
-  }
-  const baseRef = (await git2(rootDir, ["rev-parse", "HEAD"])).stdout.trim() || "HEAD";
-  const results = [];
-  for (const c of planned.candidates) {
-    results.push(await provisionWorktree(rootDir, c.taskId, c.worktree, baseRef));
-  }
-  return markProvisioning(rootDir, planned.id, baseRef, results);
-}
-async function markProvisioning(rootDir, tournamentId, baseRef, results) {
-  return withBoardLock(rootDir, (board) => {
-    const tournament = board.tournaments.find((t) => t.id === tournamentId);
-    if (baseRef)
-      tournament.baseRef = baseRef;
-    tournament.candidates.forEach((c, i) => {
-      c.provisioned = results[i].provisioned;
-      if (results[i].branch)
-        c.branch = results[i].branch;
-      if (results[i].reason)
-        c.provisionNote = results[i].reason;
-      else
-        delete c.provisionNote;
-    });
-    return tournament;
-  });
-}
-async function recordTournamentPlan(rootDir, input) {
-  return withBoardLock(rootDir, (board) => {
-    if (!Array.isArray(board.tournaments)) {
-      board.tournaments = [];
-    }
-    const count = Math.min(Math.max(input.candidates ?? 2, 2), 4);
-    const now = new Date().toISOString();
-    const candidates = [];
-    for (let i = 0;i < count; i++) {
-      const suffix = String.fromCharCode(97 + i);
-      const label = `candidate-${suffix}`;
-      const taskId = `${input.id}-${label}`;
-      const worktree = `.worktrees/${taskId}`;
-      candidates.push({ label, taskId, worktree });
-      const existingTask = board.tasks.find((t) => t.id === taskId);
-      const task = {
-        id: taskId,
-        title: `[Tournament ${input.id} \xB7 ${label.toUpperCase()}] ${input.title}`,
-        owner: input.role,
-        ownedPaths: input.ownedPaths,
-        worktree,
-        tournamentId: input.id,
-        status: existingTask?.status ?? "pending",
-        qaReceipts: existingTask?.qaReceipts ?? [],
-        createdAt: existingTask?.createdAt ?? now,
-        updatedAt: now
-      };
-      if (existingTask) {
-        Object.assign(existingTask, task);
-      } else {
-        board.tasks.push(task);
-      }
-    }
-    const tournament = {
-      id: input.id,
-      title: input.title,
-      role: input.role,
-      ownedPaths: input.ownedPaths,
-      candidates,
-      status: "active",
-      createdAt: now,
-      updatedAt: now
-    };
-    const existingIdx = board.tournaments.findIndex((t) => t.id === input.id);
-    if (existingIdx >= 0) {
-      board.tournaments[existingIdx] = tournament;
-    } else {
-      board.tournaments.push(tournament);
-    }
-    return tournament;
-  });
-}
-async function resolveTournament(rootDir, input) {
-  const snapshot = await loadBoard(rootDir);
-  const planned = assertResolvable(snapshot, input);
-  let merge;
-  if (input.merge !== false && planned.candidates.some((c) => c.provisioned)) {
-    merge = await mergeTournamentWinner(rootDir, planned, input.winningTaskId);
-  }
-  return withBoardLock(rootDir, (board) => {
-    const tournament = assertResolvable(board, input);
-    const now = new Date().toISOString();
-    for (const candidate of tournament.candidates) {
-      if (candidate.taskId === input.winningTaskId)
-        continue;
-      const loser = board.tasks.find((t) => t.id === candidate.taskId);
-      if (loser) {
-        loser.status = "superseded";
-        loser.updatedAt = now;
-      }
-    }
-    tournament.status = "resolved";
-    tournament.winningTaskId = input.winningTaskId;
-    tournament.resolutionSummary = input.summary;
-    tournament.updatedAt = now;
-    if (merge?.commit) {
-      tournament.mergeCommit = merge.commit;
-      const winnerTask = board.tasks.find((t) => t.id === input.winningTaskId);
-      if (winnerTask)
-        delete winnerTask.worktree;
-      for (const c of tournament.candidates)
-        c.provisioned = false;
-    }
-    return tournament;
-  });
-}
-function assertResolvable(board, input) {
-  const tournament = (board.tournaments ?? []).find((t) => t.id === input.tournamentId);
-  if (!tournament) {
-    throw new Error(`SwarmOS Tournament not found: ${input.tournamentId}`);
-  }
-  const isCandidate = tournament.candidates.some((c) => c.taskId === input.winningTaskId);
-  if (!isCandidate) {
-    throw new Error(`SwarmOS Tournament Guard: Task "${input.winningTaskId}" is not a registered candidate of tournament "${input.tournamentId}".`);
-  }
-  const winningTask = board.tasks.find((t) => t.id === input.winningTaskId);
-  const latestReceipt = winningTask?.qaReceipts[winningTask.qaReceipts.length - 1];
-  if (!winningTask || winningTask.status !== "verified" || latestReceipt?.verdict !== "PASS") {
-    throw new Error(`SwarmOS Tournament Guard: Winning candidate task [${input.winningTaskId}] must have a verified PASS QA receipt before resolving the tournament.`);
-  }
-  if (tournament.status === "resolved") {
-    throw new Error(`SwarmOS Tournament Guard: Tournament "${input.tournamentId}" is already resolved.`);
-  }
-  return tournament;
-}
-async function verifyReleaseReady(rootDir) {
-  const board = await loadBoard(rootDir);
-  const hasCharter = board.project !== null;
-  const lockedContractCount = board.contracts.length;
-  const verifiedTasks = [];
-  const unverifiedTasks = [];
-  const rejectedTasks = [];
-  const supersededTasks = [];
-  const blockers = [];
-  if (!hasCharter) {
-    blockers.push("Missing project charter: call `tools.org.init_project` before shipping.");
-  }
-  if (lockedContractCount === 0) {
-    blockers.push("Zero locked contracts: `architect` must lock at least one contract via `tools.org.lock_contract`.");
-  }
-  const activeTasks = board.tasks.filter((t) => t.status !== "superseded");
-  if (activeTasks.length === 0) {
-    blockers.push("Zero engineering tasks registered on the board.");
-  }
-  for (const task of board.tasks) {
-    if (task.status === "superseded") {
-      supersededTasks.push(task.id);
-      continue;
-    }
-    const latestReceipt = task.qaReceipts[task.qaReceipts.length - 1];
-    if (task.status === "verified" && latestReceipt?.verdict === "PASS" && Array.isArray(latestReceipt.defects) && latestReceipt.defects.length === 0) {
-      verifiedTasks.push(task.id);
-    } else if (task.status === "qa_rejected" || latestReceipt?.verdict === "REJECT") {
-      rejectedTasks.push(task.id);
-      blockers.push(`Task [${task.id}] (${task.owner}) was REJECTED by qa-adversary: ${latestReceipt?.summary ?? "defects unresolved"}.`);
-    } else {
-      unverifiedTasks.push(task.id);
-      blockers.push(`Task [${task.id}] (${task.owner}) is "${task.status}" and lacks a signed PASS receipt from qa-adversary.`);
-    }
-  }
-  let latestFullVerifyRunId;
-  let verifyBlocked = false;
-  if (board.policy?.requireVerifiedReceipts) {
-    for (const id of verifiedTasks) {
-      const task = board.tasks.find((t) => t.id === id);
-      if (!task.qaReceipts[task.qaReceipts.length - 1]?.verifyRunId) {
-        verifyBlocked = true;
-        blockers.push(`Task [${id}] PASS receipt does not cite a \`tools.verify.run\` result.`);
-      }
-    }
-    const full = await loadLatestVerifyRun(rootDir, "full");
-    const fingerprint = await computeTreeFingerprint(rootDir);
-    if (!full) {
-      verifyBlocked = true;
-      blockers.push('No full verification run: call `tools.verify.run({ scope: "full" })` before release.');
-    } else if (!full.passed) {
-      verifyBlocked = true;
-      blockers.push(`Latest full verification run [${full.id}] FAILED.`);
-    } else if (fingerprint !== null && full.fingerprint !== fingerprint) {
-      verifyBlocked = true;
-      blockers.push(`Code changed since full verification run [${full.id}]: re-run \`tools.verify.run({ scope: "full" })\`.`);
-    } else {
-      latestFullVerifyRunId = full.id;
-    }
-  }
-  const tournaments = Array.isArray(board.tournaments) ? board.tournaments : [];
-  const activeTournaments = tournaments.filter((t) => t.status === "active").map((t) => t.id);
-  for (const tid of activeTournaments) {
-    blockers.push(`Tournament [${tid}] is still active: call \`tools.org.resolve_tournament\` after QA verification.`);
-  }
-  const ready = hasCharter && lockedContractCount > 0 && activeTasks.length > 0 && unverifiedTasks.length === 0 && rejectedTasks.length === 0 && activeTournaments.length === 0 && !verifyBlocked;
-  return {
-    ready,
-    hasCharter,
-    lockedContractCount,
-    verifiedTasks,
-    unverifiedTasks,
-    rejectedTasks,
-    supersededTasks,
-    activeTournaments,
-    blockers,
-    ...latestFullVerifyRunId ? { latestFullVerifyRunId } : {},
-    checkedAt: new Date().toISOString()
-  };
-}
+import * as path11 from "path";
 
 // src/agents/shell-parse.ts
 var OPERATOR_CHARS = new Set([";", "&", "|", `
@@ -2732,9 +4307,9 @@ function isReadOnly(analysis, allowVerify = false) {
 // src/agents/guard.ts
 function normalizeResourcePath(rootDir, resource) {
   const trimmed = resource.trim();
-  const absRoot = path5.resolve(rootDir);
-  const resolved = path5.isAbsolute(trimmed) ? path5.resolve(trimmed) : path5.resolve(absRoot, trimmed);
-  const rel = path5.relative(absRoot, resolved).split(path5.sep).join("/");
+  const absRoot = path11.resolve(rootDir);
+  const resolved = path11.isAbsolute(trimmed) ? path11.resolve(trimmed) : path11.resolve(absRoot, trimmed);
+  const rel = path11.relative(absRoot, resolved).split(path11.sep).join("/");
   return rel.startsWith("./") ? rel.slice(2) : rel;
 }
 function matchesPathPattern(relPath, pattern) {
@@ -2793,7 +4368,7 @@ function isTestPath(relPath) {
 var ACTIVE_TASK_STATUSES = new Set(["pending", "in_progress", "ready_for_qa", "qa_rejected"]);
 function evaluateFileMutation(rootDir, board, agent, rawPath) {
   let relPath = normalizeResourcePath(rootDir, rawPath);
-  if (relPath.startsWith("..") || path5.isAbsolute(relPath))
+  if (relPath.startsWith("..") || path11.isAbsolute(relPath))
     return { allowed: true };
   const wt = /^(\.worktrees\/[^/]+)\/(.+)$/.exec(relPath);
   let worktreeTask;
@@ -2977,11 +4552,11 @@ async function registerPermissionGuard(ctx, rootDir, evaluators = []) {
 }
 
 // src/codemode/fs-outline.ts
-import * as fs5 from "fs/promises";
-import * as path6 from "path";
+import * as fs11 from "fs/promises";
+import * as path12 from "path";
 async function extractOutline(rootDir, targetPath) {
-  const abs = path6.resolve(rootDir, targetPath);
-  const text = await fs5.readFile(abs, "utf8");
+  const abs = path12.resolve(rootDir, targetPath);
+  const text = await fs11.readFile(abs, "utf8");
   const lines = text.split(`
 `);
   const declRe = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|const|let|var|enum|struct|fn|def|impl)\s+([A-Za-z0-9_$]+)/;
@@ -3562,20 +5137,20 @@ function registerUITools(editor) {
 }
 
 // src/version.ts
-var SWARMOS_VERSION = "0.9.0";
+var SWARMOS_VERSION = "1.0.0";
 
 // src/omni/artifacts.ts
-import * as fs6 from "fs/promises";
-import * as path7 from "path";
+import * as fs12 from "fs/promises";
+import * as path13 from "path";
 function getArtifactsDir(rootDir) {
-  return path7.join(rootDir, ".opencode", "artifacts");
+  return path13.join(rootDir, ".opencode", "artifacts");
 }
 async function writeArtifact(rootDir, name, content) {
-  const safeName = path7.basename(name);
+  const safeName = path13.basename(name);
   const dir = getArtifactsDir(rootDir);
-  await fs6.mkdir(dir, { recursive: true });
-  const target = path7.join(dir, safeName);
-  await fs6.writeFile(target, content, "utf8");
+  await fs12.mkdir(dir, { recursive: true });
+  const target = path13.join(dir, safeName);
+  await fs12.writeFile(target, content, "utf8");
   return {
     name: safeName,
     path: target,
@@ -3584,10 +5159,10 @@ async function writeArtifact(rootDir, name, content) {
   };
 }
 async function readArtifact(rootDir, name) {
-  const safeName = path7.basename(name);
-  const target = path7.join(getArtifactsDir(rootDir), safeName);
+  const safeName = path13.basename(name);
+  const target = path13.join(getArtifactsDir(rootDir), safeName);
   try {
-    const content = await fs6.readFile(target, "utf8");
+    const content = await fs12.readFile(target, "utf8");
     return { name: safeName, exists: true, content };
   } catch {
     return { name: safeName, exists: false, content: "" };
@@ -3595,7 +5170,7 @@ async function readArtifact(rootDir, name) {
 }
 async function listArtifacts(rootDir) {
   try {
-    const entries = await fs6.readdir(getArtifactsDir(rootDir), { withFileTypes: true });
+    const entries = await fs12.readdir(getArtifactsDir(rootDir), { withFileTypes: true });
     return entries.filter((e) => e.isFile()).map((e) => e.name).sort();
   } catch {
     return [];
@@ -3694,21 +5269,21 @@ ${sections.join(`
 }
 
 // src/omni/checkpoints.ts
-import * as fs7 from "fs/promises";
-import * as path8 from "path";
+import * as fs13 from "fs/promises";
+import * as path14 from "path";
 function getCheckpointsDir(rootDir) {
-  return path8.join(rootDir, ".opencode", "checkpoints");
+  return path14.join(rootDir, ".opencode", "checkpoints");
 }
 async function createCheckpoint(rootDir, input) {
   const id = input.id ?? `chk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const dir = getCheckpointsDir(rootDir);
-  await fs7.mkdir(dir, { recursive: true });
+  await fs13.mkdir(dir, { recursive: true });
   const files = [];
   for (const rawPath of input.paths) {
-    const abs = path8.resolve(rootDir, rawPath);
-    const rel = path8.relative(rootDir, abs).split(path8.sep).join("/");
+    const abs = path14.resolve(rootDir, rawPath);
+    const rel = path14.relative(rootDir, abs).split(path14.sep).join("/");
     try {
-      const buf = await fs7.readFile(abs);
+      const buf = await fs13.readFile(abs);
       files.push({
         path: rel,
         exists: true,
@@ -3727,7 +5302,7 @@ async function createCheckpoint(rootDir, input) {
     createdAt: new Date().toISOString(),
     files
   };
-  await fs7.writeFile(path8.join(dir, `${id}.json`), JSON.stringify(manifest, null, 2), "utf8");
+  await fs13.writeFile(path14.join(dir, `${id}.json`), JSON.stringify(manifest, null, 2), "utf8");
   return {
     id: manifest.id,
     label: manifest.label,
@@ -3736,19 +5311,19 @@ async function createCheckpoint(rootDir, input) {
   };
 }
 async function rollbackCheckpoint(rootDir, checkpointId) {
-  const file = path8.join(getCheckpointsDir(rootDir), `${path8.basename(checkpointId)}.json`);
-  const raw = await fs7.readFile(file, "utf8");
+  const file = path14.join(getCheckpointsDir(rootDir), `${path14.basename(checkpointId)}.json`);
+  const raw = await fs13.readFile(file, "utf8");
   const manifest = JSON.parse(raw);
   const restoredFiles = [];
   const removedFiles = [];
   for (const entry of manifest.files) {
-    const abs = path8.resolve(rootDir, entry.path);
+    const abs = path14.resolve(rootDir, entry.path);
     if (entry.exists && typeof entry.contentBase64 === "string") {
-      await fs7.mkdir(path8.dirname(abs), { recursive: true });
-      await fs7.writeFile(abs, Buffer.from(entry.contentBase64, "base64"));
+      await fs13.mkdir(path14.dirname(abs), { recursive: true });
+      await fs13.writeFile(abs, Buffer.from(entry.contentBase64, "base64"));
       restoredFiles.push(entry.path);
     } else if (!entry.exists) {
-      await fs7.rm(abs, { force: true });
+      await fs13.rm(abs, { force: true });
       removedFiles.push(entry.path);
     }
   }
@@ -3757,13 +5332,13 @@ async function rollbackCheckpoint(rootDir, checkpointId) {
 async function listCheckpoints(rootDir) {
   try {
     const dir = getCheckpointsDir(rootDir);
-    const entries = await fs7.readdir(dir);
+    const entries = await fs13.readdir(dir);
     const results = [];
     for (const name of entries) {
       if (!name.endsWith(".json"))
         continue;
       try {
-        const raw = await fs7.readFile(path8.join(dir, name), "utf8");
+        const raw = await fs13.readFile(path14.join(dir, name), "utf8");
         const parsed = JSON.parse(raw);
         results.push({
           id: parsed.id,
@@ -3836,14 +5411,14 @@ function registerCheckpointTools(editor, rootDir) {
 }
 
 // src/omni/memory.ts
-import * as fs8 from "fs/promises";
-import * as path9 from "path";
+import * as fs14 from "fs/promises";
+import * as path15 from "path";
 function getMemoryFilePath(rootDir) {
-  return path9.join(rootDir, ".opencode", "memory", "lessons.json");
+  return path15.join(rootDir, ".opencode", "memory", "lessons.json");
 }
 async function loadLessons(rootDir) {
   try {
-    const raw = await fs8.readFile(getMemoryFilePath(rootDir), "utf8");
+    const raw = await fs14.readFile(getMemoryFilePath(rootDir), "utf8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -3852,14 +5427,14 @@ async function loadLessons(rootDir) {
 }
 async function saveLessons(rootDir, lessons) {
   const file = getMemoryFilePath(rootDir);
-  await fs8.mkdir(path9.dirname(file), { recursive: true });
+  await fs14.mkdir(path15.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
-  await fs8.writeFile(tmp, JSON.stringify(lessons, null, 2), "utf8");
-  await fs8.rename(tmp, file);
+  await fs14.writeFile(tmp, JSON.stringify(lessons, null, 2), "utf8");
+  await fs14.rename(tmp, file);
 }
 var memoryLocks = new Map;
 async function withLessons(rootDir, mutate) {
-  const key = path9.resolve(rootDir);
+  const key = path15.resolve(rootDir);
   const previous = memoryLocks.get(key) ?? Promise.resolve();
   const run = previous.then(async () => {
     const lessons = await loadLessons(rootDir);
@@ -3922,11 +5497,11 @@ async function recordLessonOutcome(rootDir, ids, outcome) {
   });
 }
 function getProposalsFilePath(rootDir) {
-  return path9.join(rootDir, ".opencode", "memory", "proposals.json");
+  return path15.join(rootDir, ".opencode", "memory", "proposals.json");
 }
 async function loadProposals(rootDir) {
   try {
-    const parsed = JSON.parse(await fs8.readFile(getProposalsFilePath(rootDir), "utf8"));
+    const parsed = JSON.parse(await fs14.readFile(getProposalsFilePath(rootDir), "utf8"));
     return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
@@ -3934,8 +5509,8 @@ async function loadProposals(rootDir) {
 }
 async function saveProposals(rootDir, proposals) {
   const file = getProposalsFilePath(rootDir);
-  await fs8.mkdir(path9.dirname(file), { recursive: true });
-  await fs8.writeFile(file, JSON.stringify(proposals, null, 2), "utf8");
+  await fs14.mkdir(path15.dirname(file), { recursive: true });
+  await fs14.writeFile(file, JSON.stringify(proposals, null, 2), "utf8");
 }
 async function proposeLesson(rootDir, proposal) {
   const proposals = await loadProposals(rootDir);
@@ -4156,14 +5731,14 @@ ${block}`
 }
 
 // src/omni/research.ts
-import * as fs9 from "fs/promises";
-import * as path10 from "path";
+import * as fs15 from "fs/promises";
+import * as path16 from "path";
 function getResearchLedgerPath(rootDir) {
-  return path10.join(rootDir, ".opencode", "artifacts", "research_sources.json");
+  return path16.join(rootDir, ".opencode", "artifacts", "research_sources.json");
 }
 async function loadResearchSources(rootDir) {
   try {
-    const raw = await fs9.readFile(getResearchLedgerPath(rootDir), "utf8");
+    const raw = await fs15.readFile(getResearchLedgerPath(rootDir), "utf8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -4183,8 +5758,8 @@ async function recordResearchSource(rootDir, input) {
     sources.push(entry);
   }
   const file = getResearchLedgerPath(rootDir);
-  await fs9.mkdir(path10.dirname(file), { recursive: true });
-  await fs9.writeFile(file, JSON.stringify(sources, null, 2), "utf8");
+  await fs15.mkdir(path16.dirname(file), { recursive: true });
+  await fs15.writeFile(file, JSON.stringify(sources, null, 2), "utf8");
   return entry;
 }
 async function auditMarkdownCitations(rootDir, markdownText) {
@@ -4400,6 +5975,65 @@ ${input.prompt?.text ?? input.prompt ?? ""}`,
         }
       }
     });
+    editor.add({
+      name: "dashboard",
+      description: "Render The Agency Live Swarm Command Center HTML5 WebUI (.opencode/artifacts/swarm-dashboard.html) and display status",
+      execute: async (input) => {
+        const res = await generateSwarmDashboardHtml(rootDir);
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input.sessionID,
+            text: `# SwarmOS Live Command Center WebUI Generated
+
+- **File**: \`${res.dashboardPath}\`
+- **Release Ready**: \`${res.readyToShip}\`
+- **Tasks**: ${res.taskCount} | **Contracts**: ${res.contractCount} | **UI/UX Score**: ${res.uxScore ?? "N/A"}
+
+Open \`${res.dashboardPath}\` in your browser or OpenCode preview pane to inspect the live Kanban board.`,
+            delivery: "steer"
+          });
+        }
+      }
+    });
+    editor.add({
+      name: "grill",
+      description: "Run the IUMBTEMS Socratic Epistemic & Dialectic Stress-Test against a design or specification",
+      execute: async (input) => {
+        const specText = String(input.prompt?.text ?? input.prompt ?? "Current workspace architecture");
+        const res = generateGrillQuestions(specText);
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input.sessionID,
+            text: `# Epistemic Socratic Grill (${res.topic})
+
+Before locking contracts or writing implementation code, answer or verify these ${res.questions.length} stress-test questions:
+
+${res.questions.map((q, i) => `${i + 1}. ${q}`).join(`
+`)}`,
+            delivery: "steer"
+          });
+        }
+      }
+    });
+    editor.add({
+      name: "pack",
+      description: "Inspect or activate SwarmOS Domain Packs (Godot 4, GDevelop 5, Reverse Engineering)",
+      execute: async (input) => {
+        const detection = await detectDomainPacks(rootDir);
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input.sessionID,
+            text: `# SwarmOS Domain Packs
+
+- **Auto-Detected Active Packs**: ${detection.recommendedPacks.join(", ") || "none (core only)"}
+- **Godot 4.x**: \`${detection.godot}\` (\`tools.packs.godot_inspect_scene\`)
+- **GDevelop 5**: \`${detection.gdevelop}\` (\`tools.packs.gdevelop_inspect_game\`)
+- **Reverse Engineering (REA)**: \`${detection.reverseEngineering}\` (\`tools.packs.re_inspect_binary\`)`,
+            delivery: "steer"
+          });
+        }
+      }
+    });
   });
 }
 
@@ -4482,7 +6116,7 @@ async function registerSwarmCommand(ctx, rootDir) {
 }
 
 // src/host/setup-report.ts
-import * as path11 from "path";
+import * as path17 from "path";
 
 // src/host/contract.ts
 var HOST_CONTRACT = [
@@ -4617,10 +6251,10 @@ function missingRequired(probe) {
 // src/host/setup-report.ts
 var reports = new Map;
 function getSetupReport(rootDir) {
-  return reports.get(path11.resolve(rootDir));
+  return reports.get(path17.resolve(rootDir));
 }
 function storeSetupReport(report) {
-  reports.set(path11.resolve(report.rootDir), report);
+  reports.set(path17.resolve(report.rootDir), report);
 }
 function newModuleReport(id) {
   return { id, status: "registered", agents: [], namespaces: [], tools: [], hooks: [], commands: [], skills: [], runtimeErrors: [], hookCalls: {} };
@@ -4784,15 +6418,15 @@ _SwarmOS setup has not run in this workspace._`;
 
 // src/omni/context-budget.ts
 var ROLE_NAMESPACES = {
-  director: ["org", "repo", "memory", "artifacts", "swarmos"],
-  architect: ["org", "repo", "fs", "checkpoints"],
+  director: ["org", "repo", "memory", "artifacts", "epistemic", "claude", "packs", "swarmos"],
+  architect: ["org", "repo", "fs", "epistemic", "checkpoints"],
   manager: ["org", "repo", "verify", "artifacts", "replay"],
   "staff-backend": ["fs", "repo", "lsp", "verify", "checkpoints", "memory", "artifacts"],
   "staff-ui": ["fs", "ui", "verify", "checkpoints", "artifacts", "gui"],
   "qa-adversary": ["verify", "org", "repo", "ui", "fs"],
   "release-ops": ["verify", "org", "repo"],
   "studio-gui": ["gui", "ui", "fs", "artifacts", "verify"],
-  researcher: ["research", "artifacts", "office"],
+  researcher: ["research", "epistemic", "artifacts", "office"],
   "office-analyst": ["office", "artifacts", "fs"]
 };
 var DEFAULT_ROLE_NAMESPACES = ["fs", "repo", "verify", "checkpoints", "artifacts", "memory"];
@@ -4963,8 +6597,8 @@ function withPinningProfile(editor, pinnedNamespaces) {
 }
 
 // src/omni/transactions.ts
-import * as fs10 from "fs/promises";
-import * as path12 from "path";
+import * as fs16 from "fs/promises";
+import * as path18 from "path";
 var MUTATING_TOOLS = new Set(["edit", "write", "patch", "multiedit", "apply_patch"]);
 var MAX_AUTO_CHECKPOINTS = 20;
 var byCallId = new Map;
@@ -5015,12 +6649,12 @@ function mutationTargets(tool, input) {
   return [...targets];
 }
 async function snapshot(rootDir, rawPath) {
-  const abs = path12.resolve(rootDir, rawPath);
-  const rel = path12.relative(rootDir, abs).split(path12.sep).join("/");
+  const abs = path18.resolve(rootDir, rawPath);
+  const rel = path18.relative(rootDir, abs).split(path18.sep).join("/");
   if (rel.startsWith(".."))
     return;
   try {
-    return { rel, existed: true, content: await fs10.readFile(abs) };
+    return { rel, existed: true, content: await fs16.readFile(abs) };
   } catch (err) {
     if (err?.code === "ENOENT")
       return { rel, existed: false };
@@ -5030,9 +6664,9 @@ async function snapshot(rootDir, rawPath) {
 async function pruneAutoCheckpoints(rootDir) {
   try {
     const dir = getCheckpointsDir(rootDir);
-    const autos = (await fs10.readdir(dir)).filter((f) => f.startsWith("auto-") && f.endsWith(".json")).sort();
+    const autos = (await fs16.readdir(dir)).filter((f) => f.startsWith("auto-") && f.endsWith(".json")).sort();
     for (const f of autos.slice(0, Math.max(0, autos.length - MAX_AUTO_CHECKPOINTS))) {
-      await fs10.rm(path12.join(dir, f), { force: true });
+      await fs16.rm(path18.join(dir, f), { force: true });
     }
   } catch {}
 }
@@ -5081,21 +6715,21 @@ function takeTransaction(event) {
 async function restore(rootDir, tx) {
   const restored = [];
   for (const s of tx.snapshots) {
-    const abs = path12.resolve(rootDir, s.rel);
+    const abs = path18.resolve(rootDir, s.rel);
     let current;
     try {
-      current = await fs10.readFile(abs);
+      current = await fs16.readFile(abs);
     } catch {
       current = undefined;
     }
     if (s.existed) {
       if (current && s.content && current.equals(s.content))
         continue;
-      await fs10.mkdir(path12.dirname(abs), { recursive: true });
-      await fs10.writeFile(abs, s.content);
+      await fs16.mkdir(path18.dirname(abs), { recursive: true });
+      await fs16.writeFile(abs, s.content);
       restored.push(s.rel);
     } else if (current !== undefined) {
-      await fs10.rm(abs, { force: true });
+      await fs16.rm(abs, { force: true });
       restored.push(s.rel);
     }
   }
@@ -5204,8 +6838,8 @@ async function registerDoctorCommand(ctx, rootDir) {
 }
 
 // src/host/config.ts
-import * as fs11 from "fs/promises";
-import * as path13 from "path";
+import * as fs17 from "fs/promises";
+import * as path19 from "path";
 var DEFAULT_PINNED_NAMESPACES = ["org", "fs", "repo", "verify", "artifacts"];
 var DEFAULT_CONFIG = {
   mode: "full",
@@ -5216,7 +6850,7 @@ var DEFAULT_CONFIG = {
   taintTracking: true
 };
 function getConfigPath(rootDir) {
-  return path13.join(rootDir, ".opencode", "swarmos.json");
+  return path19.join(rootDir, ".opencode", "swarmos.json");
 }
 function parseBool(value) {
   if (value === undefined)
@@ -5230,7 +6864,7 @@ function parseBool(value) {
 async function loadConfig(rootDir, env = process.env) {
   let fileConfig = {};
   try {
-    const raw = await fs11.readFile(getConfigPath(rootDir), "utf8");
+    const raw = await fs17.readFile(getConfigPath(rootDir), "utf8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object")
       fileConfig = parsed;
@@ -5260,210 +6894,8 @@ async function loadConfig(rootDir, env = process.env) {
   return config;
 }
 
-// src/host/telemetry.ts
-import { execFile as execFile3 } from "child_process";
-import * as fs12 from "fs/promises";
-import * as path14 from "path";
-import { promisify as promisify3 } from "util";
-var execFileAsync3 = promisify3(execFile3);
-function getTelemetryDir(rootDir) {
-  return path14.join(rootDir, ".opencode", "telemetry");
-}
-function safeSessionFile(sessionID) {
-  return `${sessionID.replace(/[^A-Za-z0-9_.-]/g, "_") || "default"}.jsonl`;
-}
-var writeQueues = new Map;
-async function appendTelemetry(rootDir, record) {
-  const file = path14.join(getTelemetryDir(rootDir), safeSessionFile(record.sessionID));
-  const previous = writeQueues.get(file) ?? Promise.resolve();
-  const next = previous.then(async () => {
-    await fs12.mkdir(path14.dirname(file), { recursive: true });
-    await fs12.appendFile(file, `${JSON.stringify(record)}
-`, "utf8");
-  });
-  writeQueues.set(file, next.catch(() => {}));
-  await next;
-}
-async function gitHead(rootDir) {
-  try {
-    const { stdout } = await execFileAsync3("git", ["rev-parse", "HEAD"], { cwd: rootDir, timeout: 3000 });
-    return stdout.trim() || undefined;
-  } catch {
-    return;
-  }
-}
-function extractUsage(event) {
-  const u = event?.usage ?? event?.tokens ?? event?.result?.usage;
-  if (!u || typeof u !== "object")
-    return;
-  const input = Number(u.input ?? u.inputTokens ?? u.prompt_tokens);
-  const output = Number(u.output ?? u.outputTokens ?? u.completion_tokens);
-  const cacheRead = Number(u.cacheRead ?? u.cache?.read ?? u.cache_read_input_tokens);
-  const usage = {};
-  if (Number.isFinite(input))
-    usage.input = input;
-  if (Number.isFinite(output))
-    usage.output = output;
-  if (Number.isFinite(cacheRead))
-    usage.cacheRead = cacheRead;
-  return Object.keys(usage).length ? usage : undefined;
-}
-function lastUserText(event) {
-  const messages = event?.messages;
-  if (!Array.isArray(messages))
-    return;
-  for (let i = messages.length - 1;i >= 0; i--) {
-    const m = messages[i];
-    if (m?.role !== "user")
-      continue;
-    if (typeof m.content === "string")
-      return m.content;
-    if (Array.isArray(m.content)) {
-      const text = m.content.map((p) => typeof p?.text === "string" ? p.text : "").join("");
-      if (text)
-        return text;
-    }
-    if (typeof m.text === "string")
-      return m.text;
-  }
-  return;
-}
-var startedSessions = new Set;
-async function ensureSessionStart(rootDir, sessionID, agent, prompt) {
-  if (startedSessions.has(sessionID))
-    return;
-  startedSessions.add(sessionID);
-  await appendTelemetry(rootDir, {
-    t: new Date().toISOString(),
-    kind: "session_start",
-    sessionID,
-    agent,
-    gitHead: await gitHead(rootDir),
-    prompt: prompt?.slice(0, 4000)
-  });
-}
-function trackToolEvent(event) {
-  const state = getSessionState(event?.sessionID);
-  if (event?.agent)
-    state.agent = event.agent;
-  state.toolCalls++;
-  if (isFailedEvent(event))
-    state.toolFailures++;
-  const target = eventTargetPath(event);
-  if (target)
-    touchFile(state, target);
-  const text = typeof event?.result?.content === "string" ? event.result.content : Array.isArray(event?.result?.content) ? event.result.content.map((p) => p?.text ?? "").join("") : String(event?.error?.message ?? "");
-  const breaker = text.includes("DOOM-LOOP CIRCUIT BREAKER");
-  if (breaker)
-    state.breakerFires++;
-  return { breaker };
-}
-async function registerTelemetryHooks(ctx, rootDir, writeFiles) {
-  if (ctx.tool?.hook) {
-    await ctx.tool.hook("execute.after", async (event) => {
-      const sessionID = event?.sessionID ?? "default";
-      const { breaker } = trackToolEvent(event);
-      if (!writeFiles)
-        return;
-      await ensureSessionStart(rootDir, sessionID, event?.agent);
-      await appendTelemetry(rootDir, {
-        t: new Date().toISOString(),
-        kind: "tool",
-        sessionID,
-        agent: event?.agent,
-        tool: event?.tool,
-        status: event?.status,
-        target: eventTargetPath(event) ?? (typeof event?.input?.command === "string" ? event.input.command.slice(0, 120) : undefined),
-        error: isFailedEvent(event) ? String(event?.error?.message ?? event?.error ?? "").slice(0, 300) : undefined,
-        breaker: breaker || undefined
-      });
-    });
-  }
-  if (ctx.session?.hook) {
-    await ctx.session.hook("generate", async (event) => {
-      if (event?.agent === "compaction" || event?.kind === "compaction")
-        return;
-      const sessionID = event?.sessionID ?? "default";
-      const state = getSessionState(sessionID);
-      state.turns++;
-      if (event?.agent)
-        state.agent = event.agent;
-      if (!writeFiles)
-        return;
-      await ensureSessionStart(rootDir, sessionID, event?.agent, lastUserText(event));
-      await appendTelemetry(rootDir, {
-        t: new Date().toISOString(),
-        kind: "turn",
-        sessionID,
-        agent: event?.agent,
-        usage: extractUsage(event)
-      });
-    });
-  }
-}
-function summarizeTelemetry(records) {
-  const start = records.find((r) => r.kind === "session_start");
-  let input = 0;
-  let output = 0;
-  let cacheRead = 0;
-  let sawUsage = false;
-  const summary = {
-    sessionID: records[0]?.sessionID ?? "unknown",
-    turns: 0,
-    toolCalls: 0,
-    toolFailures: 0,
-    breakerFires: 0,
-    tokens: null,
-    cacheHitRatio: null,
-    gitHead: start?.gitHead,
-    prompt: start?.prompt
-  };
-  for (const r of records) {
-    if (r.kind === "turn") {
-      summary.turns++;
-      if (r.usage) {
-        sawUsage = true;
-        input += r.usage.input ?? 0;
-        output += r.usage.output ?? 0;
-        cacheRead += r.usage.cacheRead ?? 0;
-      }
-    } else if (r.kind === "tool") {
-      summary.toolCalls++;
-      if (r.status === "error")
-        summary.toolFailures++;
-      if (r.breaker)
-        summary.breakerFires++;
-    }
-  }
-  if (sawUsage) {
-    summary.tokens = { input, output, cacheRead };
-    summary.cacheHitRatio = input + cacheRead > 0 ? +(cacheRead / (input + cacheRead)).toFixed(4) : null;
-  }
-  return summary;
-}
-async function readTelemetryFile(file) {
-  const raw = await fs12.readFile(file, "utf8");
-  return raw.split(`
-`).filter((l) => l.trim()).flatMap((l) => {
-    try {
-      return [JSON.parse(l)];
-    } catch {
-      return [];
-    }
-  });
-}
-async function listTelemetryFiles(rootDir) {
-  try {
-    const dir = getTelemetryDir(rootDir);
-    const entries = await fs12.readdir(dir);
-    return entries.filter((e) => e.endsWith(".jsonl")).map((e) => path14.join(dir, e));
-  } catch {
-    return [];
-  }
-}
-
 // src/omni/taint.ts
-import * as path15 from "path";
+import * as path20 from "path";
 var UNTRUSTED_TOOLS = /^(?:webfetch|websearch|fetch|web_search|web_fetch|browser[._-].*|mcp[._-].*|.*__.*)$/i;
 var CODEMODE_UNTRUSTED = /\btools\.(?:browser|opencode\.(?:webfetch|websearch)|research)\b|\b(?:webfetch|websearch)\s*\(/;
 var SENSITIVE_PATHS = [
@@ -5515,7 +6947,7 @@ function isSensitive(rootDir, raw) {
   if (HOME_SENSITIVE.test(raw))
     return "a credential or shell profile file";
   const rel = normalizeResourcePath(rootDir, raw);
-  if (rel.startsWith("..") || path15.isAbsolute(rel)) {
+  if (rel.startsWith("..") || path20.isAbsolute(rel)) {
     if (/^\/(?:tmp|var\/tmp)\//.test(raw) || raw === "/dev/null")
       return;
     return "a path outside the project";
@@ -5598,12 +7030,12 @@ async function registerUntaintCommand(ctx) {
 
 // src/diagnostics/runner.ts
 import { execFile as execFile4 } from "child_process";
-import * as path17 from "path";
+import * as path22 from "path";
 import { promisify as promisify4 } from "util";
 
 // src/diagnostics/warm-lsp.ts
-import * as fs13 from "fs/promises";
-import * as path16 from "path";
+import * as fs18 from "fs/promises";
+import * as path21 from "path";
 var diagCache = new Map;
 var warmDiagnosticStats = {
   cacheHits: 0,
@@ -5622,7 +7054,7 @@ function clearDiagnosticCache() {
 }
 async function getCachedDiagnostic(absPath, compute) {
   try {
-    const st = await fs13.stat(absPath);
+    const st = await fs18.stat(absPath);
     const cached = diagCache.get(absPath);
     if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
       warmDiagnosticStats.cacheHits++;
@@ -5653,7 +7085,7 @@ async function runParallelDiagnostics(rootDir, filePaths, runner, concurrency = 
     while (cursor < unique.length) {
       const idx = cursor++;
       const rel = unique[idx];
-      const abs = path16.resolve(rootDir, rel);
+      const abs = path21.resolve(rootDir, rel);
       results[idx] = await getCachedDiagnostic(abs, () => runner(rootDir, rel));
     }
   });
@@ -5673,7 +7105,7 @@ function shutdownWarmLspServers() {
 }
 function getWarmLspStatus(rootDir) {
   return {
-    rootDir: path16.resolve(rootDir),
+    rootDir: path21.resolve(rootDir),
     activeDaemons: warmServers.size,
     cachedFiles: diagCache.size,
     stats: { ...warmDiagnosticStats }
@@ -5684,20 +7116,20 @@ async function walkWorkspaceFiles(dir, rootDir, acc = [], max = 600) {
     return acc;
   let entries = [];
   try {
-    entries = await fs13.readdir(dir, { withFileTypes: true });
+    entries = await fs18.readdir(dir, { withFileTypes: true });
   } catch {
     return acc;
   }
   for (const e of entries) {
     if (acc.length >= max)
       break;
-    if (e.name.startsWith(".") || ["node_modules", "dist", "build", ".opencode", ".worktrees", "target"].includes(e.name))
+    if (e.name.startsWith(".") || ["node_modules", "dist", "build", ".opencode", ".worktrees", "target", "bench"].includes(e.name))
       continue;
-    const full = path16.join(dir, e.name);
+    const full = path21.join(dir, e.name);
     if (e.isDirectory())
       await walkWorkspaceFiles(full, rootDir, acc, max);
     else if (e.isFile() && /\.(?:[cm]?[jt]sx?|py|go|rs)$/.test(e.name)) {
-      acc.push(path16.relative(rootDir, full).split(path16.sep).join("/"));
+      acc.push(path21.relative(rootDir, full).split(path21.sep).join("/"));
     }
   }
   return acc;
@@ -5711,7 +7143,7 @@ async function findSymbolDefinitions(rootDir, symbolName) {
     if (hits.length >= 25)
       break;
     try {
-      const raw = await fs13.readFile(path16.resolve(rootDir, rel), "utf8");
+      const raw = await fs18.readFile(path21.resolve(rootDir, rel), "utf8");
       const lines = raw.split(`
 `);
       for (let i = 0;i < lines.length; i++) {
@@ -5738,7 +7170,7 @@ async function findSymbolReferences(rootDir, symbolName) {
     if (hits.length >= 60)
       break;
     try {
-      const raw = await fs13.readFile(path16.resolve(rootDir, rel), "utf8");
+      const raw = await fs18.readFile(path21.resolve(rootDir, rel), "utf8");
       const lines = raw.split(`
 `);
       for (let i = 0;i < lines.length; i++) {
@@ -5833,8 +7265,8 @@ function registerLspTools(editor, rootDir, runner) {
 // src/diagnostics/runner.ts
 var execFileAsync4 = promisify4(execFile4);
 async function runQuickDiagnostics(rootDir, filePath, options = {}) {
-  const abs = path17.resolve(rootDir, filePath);
-  const ext = path17.extname(abs).toLowerCase();
+  const abs = path22.resolve(rootDir, filePath);
+  const ext = path22.extname(abs).toLowerCase();
   const timeout = options.timeoutMs ?? 6000;
   const maxLines = options.maxLines ?? 30;
   try {
@@ -6044,8 +7476,8 @@ async function registerTaskBudgetHooks(ctx, rootDir) {
 }
 
 // src/omni/replay.ts
-import * as fs14 from "fs/promises";
-import * as path18 from "path";
+import * as fs19 from "fs/promises";
+import * as path23 from "path";
 var COPY_IGNORE = new Set([
   "node_modules",
   ".git",
@@ -6058,22 +7490,22 @@ var COPY_IGNORE = new Set([
   "bench"
 ]);
 async function copyWorkspaceSnapshot(srcDir, destDir) {
-  await fs14.mkdir(destDir, { recursive: true });
+  await fs19.mkdir(destDir, { recursive: true });
   let entries = [];
   try {
-    entries = await fs14.readdir(srcDir, { withFileTypes: true });
+    entries = await fs19.readdir(srcDir, { withFileTypes: true });
   } catch {
     return;
   }
   for (const entry of entries) {
     if (COPY_IGNORE.has(entry.name))
       continue;
-    const s = path18.join(srcDir, entry.name);
-    const d = path18.join(destDir, entry.name);
+    const s = path23.join(srcDir, entry.name);
+    const d = path23.join(destDir, entry.name);
     if (entry.isDirectory()) {
       await copyWorkspaceSnapshot(s, d);
     } else if (entry.isFile()) {
-      await fs14.copyFile(s, d);
+      await fs19.copyFile(s, d);
     }
   }
 }
@@ -6095,7 +7527,7 @@ async function listReplayableSessions(rootDir) {
 }
 async function loadSessionTelemetry(rootDir, sessionID) {
   const safe = `${sessionID.replace(/[^A-Za-z0-9_.-]/g, "_") || "default"}.jsonl`;
-  const direct = path18.join(getTelemetryDir(rootDir), safe);
+  const direct = path23.join(getTelemetryDir(rootDir), safe);
   try {
     return await readTelemetryFile(direct);
   } catch {
@@ -6115,11 +7547,11 @@ async function exportSessionToBenchmark(rootDir, input) {
   }
   const summary = summarizeTelemetry(records);
   const slug = (input.taskId ?? `replay-${input.sessionID}`).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
-  const outTasksDir = input.outTasksDir ? path18.resolve(rootDir, input.outTasksDir) : path18.join(rootDir, "bench", "tasks");
-  const taskDir = path18.join(outTasksDir, slug);
-  const repoDir = path18.join(taskDir, "repo");
-  const solutionDir = path18.join(taskDir, "solution");
-  await fs14.rm(taskDir, { recursive: true, force: true });
+  const outTasksDir = input.outTasksDir ? path23.resolve(rootDir, input.outTasksDir) : path23.join(rootDir, "bench", "tasks");
+  const taskDir = path23.join(outTasksDir, slug);
+  const repoDir = path23.join(taskDir, "repo");
+  const solutionDir = path23.join(taskDir, "solution");
+  await fs19.rm(taskDir, { recursive: true, force: true });
   await copyWorkspaceSnapshot(rootDir, repoDir);
   await copyWorkspaceSnapshot(rootDir, solutionDir);
   let verifyCommand = input.verifyCommand;
@@ -6139,10 +7571,10 @@ async function exportSessionToBenchmark(rootDir, input) {
     sourceSessionID: input.sessionID,
     ...summary.gitHead ? { gitHead: summary.gitHead } : {}
   };
-  const taskJsonPath = path18.join(taskDir, "task.json");
-  const tracePath = path18.join(taskDir, "replay-trace.json");
-  await fs14.writeFile(taskJsonPath, JSON.stringify(taskMeta, null, 2), "utf8");
-  await fs14.writeFile(tracePath, JSON.stringify(records, null, 2), "utf8");
+  const taskJsonPath = path23.join(taskDir, "task.json");
+  const tracePath = path23.join(taskDir, "replay-trace.json");
+  await fs19.writeFile(taskJsonPath, JSON.stringify(taskMeta, null, 2), "utf8");
+  await fs19.writeFile(tracePath, JSON.stringify(records, null, 2), "utf8");
   return {
     taskId: slug,
     taskDir,
@@ -6438,8 +7870,8 @@ async function registerCircuitBreakerHook(ctx) {
 
 // src/omni/gui-studio.ts
 import { execFile as execFile5 } from "child_process";
-import * as fs15 from "fs/promises";
-import * as path19 from "path";
+import * as fs20 from "fs/promises";
+import * as path24 from "path";
 import { promisify as promisify5 } from "util";
 var execFileAsync5 = promisify5(execFile5);
 var VISUAL_QUALITY_CHECKLIST = {
@@ -6463,9 +7895,9 @@ var VISUAL_QUALITY_CHECKLIST = {
   ]
 };
 async function captureDesktopWindow(rootDir, outputName = "desktop_gui_preview.png") {
-  const previewDir = path19.join(rootDir, ".opencode", "artifacts", "previews");
-  await fs15.mkdir(previewDir, { recursive: true });
-  const outPath = path19.join(previewDir, path19.basename(outputName));
+  const previewDir = path24.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs20.mkdir(previewDir, { recursive: true });
+  const outPath = path24.join(previewDir, path24.basename(outputName));
   const platform = process.platform;
   if (platform === "darwin") {
     await execFileAsync5("screencapture", ["-x", outPath], { cwd: rootDir, timeout: 1e4 });
@@ -6522,8 +7954,8 @@ function registerGuiStudioTools(editor, rootDir) {
 }
 
 // src/omni/hashline.ts
-import * as fs16 from "fs/promises";
-import * as path20 from "path";
+import * as fs21 from "fs/promises";
+import * as path25 from "path";
 function computeLineHash(line) {
   const trimmed = line.trim();
   if (trimmed.length === 0)
@@ -6536,8 +7968,8 @@ function computeLineHash(line) {
   return (hash >>> 0 & 255).toString(16).padStart(2, "0");
 }
 async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
-  const abs = path20.resolve(rootDir, targetPath);
-  const raw = await fs16.readFile(abs, "utf8");
+  const abs = path25.resolve(rootDir, targetPath);
+  const raw = await fs21.readFile(abs, "utf8");
   const lines = raw.replace(/\r\n/g, `
 `).split(`
 `);
@@ -6558,8 +7990,8 @@ async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
   };
 }
 async function hashEditFile(rootDir, targetPath, hunks) {
-  const abs = path20.resolve(rootDir, targetPath);
-  const raw = await fs16.readFile(abs, "utf8");
+  const abs = path25.resolve(rootDir, targetPath);
+  const raw = await fs21.readFile(abs, "utf8");
   const hasCrlf = raw.includes(`\r
 `);
   const lines = raw.replace(/\r\n/g, `
@@ -6614,7 +8046,7 @@ async function hashEditFile(rootDir, targetPath, hunks) {
   const outputText = lines.join(hasCrlf ? `\r
 ` : `
 `);
-  await fs16.writeFile(abs, outputText, "utf8");
+  await fs21.writeFile(abs, outputText, "utf8");
   const diagnostics = await runQuickDiagnostics(rootDir, targetPath);
   return {
     path: targetPath,
@@ -6679,8 +8111,8 @@ function registerHashlineTools(editor, rootDir) {
 
 // src/omni/office.ts
 import { execFile as execFile6 } from "child_process";
-import * as fs17 from "fs/promises";
-import * as path21 from "path";
+import * as fs22 from "fs/promises";
+import * as path26 from "path";
 import { promisify as promisify6 } from "util";
 var execFileAsync6 = promisify6(execFile6);
 var SUPPORTED_OFFICE_EXTENSIONS = new Set([
@@ -6788,8 +8220,8 @@ elif ext in (".sqlite", ".sqlite3", ".db"):
     print(NL.join(out))
 `;
 async function extractOfficeOrDataFile(rootDir, targetPath) {
-  const abs = path21.resolve(rootDir, targetPath);
-  const ext = path21.extname(abs).toLowerCase();
+  const abs = path26.resolve(rootDir, targetPath);
+  const ext = path26.extname(abs).toLowerCase();
   if (!SUPPORTED_OFFICE_EXTENSIONS.has(ext))
     return;
   const { stdout } = await execFileAsync6("python3", ["-c", PYTHON_UNIVERSAL_EXTRACTOR, abs], {
@@ -6799,17 +8231,17 @@ async function extractOfficeOrDataFile(rootDir, targetPath) {
   return stdout.trim();
 }
 async function renderDocumentPreviews(rootDir, targetPath) {
-  const abs = path21.resolve(rootDir, targetPath);
-  const ext = path21.extname(abs).toLowerCase();
-  const previewDir = path21.join(rootDir, ".opencode", "artifacts", "previews");
-  await fs17.mkdir(previewDir, { recursive: true });
+  const abs = path26.resolve(rootDir, targetPath);
+  const ext = path26.extname(abs).toLowerCase();
+  const previewDir = path26.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs22.mkdir(previewDir, { recursive: true });
   let pdfPath = abs;
   if ([".docx", ".pptx", ".xlsx"].includes(ext)) {
     await execFileAsync6("libreoffice", ["--headless", "--nologo", "--nolockcheck", "--norestore", "--convert-to", "pdf", "--outdir", previewDir, abs], { cwd: rootDir, timeout: 30000 });
-    const stem = path21.basename(abs, ext);
-    pdfPath = path21.join(previewDir, `${stem}.pdf`);
+    const stem = path26.basename(abs, ext);
+    pdfPath = path26.join(previewDir, `${stem}.pdf`);
   }
-  const stem = path21.basename(pdfPath, ".pdf");
+  const stem = path26.basename(pdfPath, ".pdf");
   const pyRender = `
 import sys, os, json, pypdfium2 as pdfium
 pdf_path, out_dir, stem = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -6885,7 +8317,7 @@ ${res.previewPngs.join(`
         const origExecute = tool.execute;
         tool.execute = async (input, context) => {
           if (typeof input?.path === "string") {
-            const ext = path21.extname(input.path).toLowerCase();
+            const ext = path26.extname(input.path).toLowerCase();
             if ([".docx", ".xlsx", ".xls", ".pptx", ".sqlite", ".sqlite3", ".db"].includes(ext)) {
               const extracted = await extractOfficeOrDataFile(rootDir, input.path);
               if (extracted !== undefined) {
@@ -6904,8 +8336,8 @@ ${res.previewPngs.join(`
 }
 
 // src/omni/pty-tap.ts
-import * as fs18 from "fs/promises";
-import * as path22 from "path";
+import * as fs23 from "fs/promises";
+import * as path27 from "path";
 var ERROR_LINE_RE = /\b(?:error|exception|fatal|panic|uncaught|failed|syntaxerror|typeerror|referenceerror|enoent|eaddrinuse)\b/i;
 async function readDevServerLogs(ctx, rootDir, input = {}) {
   const maxLines = Math.min(Math.max(input.lines ?? 80, 10), 500);
@@ -6920,14 +8352,14 @@ async function readDevServerLogs(ctx, rootDir, input = {}) {
   }
   if (!rawText) {
     const candidateFiles = [
-      ...input.logFile ? [path22.resolve(rootDir, input.logFile)] : [],
-      path22.join(rootDir, ".opencode", "artifacts", "devserver.log"),
-      path22.join(rootDir, "dev.log")
+      ...input.logFile ? [path27.resolve(rootDir, input.logFile)] : [],
+      path27.join(rootDir, ".opencode", "artifacts", "devserver.log"),
+      path27.join(rootDir, "dev.log")
     ];
     for (const file of candidateFiles) {
       try {
-        rawText = await fs18.readFile(file, "utf8");
-        source = path22.relative(rootDir, file).split(path22.sep).join("/");
+        rawText = await fs23.readFile(file, "utf8");
+        source = path27.relative(rootDir, file).split(path27.sep).join("/");
         break;
       } catch {}
     }
@@ -6974,8 +8406,8 @@ function registerPtyTapTools(editor, ctx, rootDir) {
 }
 
 // src/skills/ui-craft/skill.ts
-import * as fs19 from "fs/promises";
-import * as path23 from "path";
+import * as fs24 from "fs/promises";
+import * as path28 from "path";
 var UI_CRAFT_SKILL_ID = "ui-craft";
 var UI_CRAFT_SKILL_NAME = "UI Craft & Spatial Architecture";
 var EMBEDDED_UI_CRAFT_SKILL_MD = `---
@@ -7088,9 +8520,9 @@ Before handing off any UI milestone:
    - \`row-baseline-jitter\`: Align sibling card and button top edges to exact pixels.`;
 async function loadSkillContent(fallbackDir) {
   const targetDir = fallbackDir ?? process.cwd();
-  const candidate = path23.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
+  const candidate = path28.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
   try {
-    return await fs19.readFile(candidate, "utf8");
+    return await fs24.readFile(candidate, "utf8");
   } catch {
     return EMBEDDED_UI_CRAFT_SKILL_MD;
   }
@@ -7099,7 +8531,7 @@ async function registerUICraftSkill(ctx, rootDir) {
   if (!ctx.skill?.transform)
     return;
   const content = await loadSkillContent(rootDir);
-  const absoluteSkillPath = path23.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
+  const absoluteSkillPath = path28.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
   await ctx.skill.transform((editor) => {
     editor.add({
       id: UI_CRAFT_SKILL_ID,
@@ -7145,6 +8577,10 @@ function buildSetupModules(rootDir, config) {
         const editor = withPinningProfile(rawEditor, config.pinnedNamespaces);
         registerOrgTools(editor, rootDir);
         registerUITools(editor);
+        registerUXJudgeTools(editor, rootDir);
+        registerEpistemicTools(editor, rootDir);
+        registerClaudeCompatTools(editor, rootDir);
+        registerDashboardTools(editor, rootDir);
         registerFSTools(editor, rootDir);
         registerHashlineTools(editor, rootDir);
         registerArtifactTools(editor, rootDir);
@@ -7230,6 +8666,19 @@ function buildSetupModules(rootDir, config) {
         await registerReplayCommand(c, rootDir);
       }
     },
+    {
+      id: "claude-compat-bridge",
+      requires: ["command.transform", "tool.transform"],
+      run: async (c) => {
+        await c.tool.transform((editor) => registerClaudeCompatTools(editor, rootDir));
+        await registerClaudeCodeBridge(c, rootDir);
+      }
+    },
+    {
+      id: "domain-packs",
+      requires: ["tool.transform"],
+      run: (c) => registerDomainPacks(c, rootDir)
+    },
     ...observe
   ];
 }
@@ -7259,6 +8708,7 @@ var plugin = SwarmOSPlugin;
 export {
   BOARD_VERSION,
   DEFAULT_CONFIG,
+  DOMAIN_PACK_ROLES,
   DOM_GEOMETRY_AUDIT_SCRIPT,
   EMBEDDED_UI_CRAFT_SKILL_MD,
   HOST_CONTRACT,
@@ -7282,6 +8732,7 @@ export {
   SwarmOSPlugin,
   UI_CRAFT_SKILL_ID,
   UI_CRAFT_SKILL_NAME,
+  UX_SCORECARD_BROWSER_SCRIPT,
   VISUAL_QUALITY_CHECKLIST,
   acceptProposal,
   analyzeBlastRadius,
@@ -7294,8 +8745,10 @@ export {
   buildRepoGraph,
   buildRepoMap,
   buildSetupModules,
+  cacheEpistemicSource,
   captureDesktopWindow,
   claimTask,
+  classifySpdxLicense,
   cleanupTournamentWorktrees,
   clearDiagnosticCache,
   clearTaint,
@@ -7308,7 +8761,9 @@ export {
   createTask,
   createTaskBudgetEvaluator,
   src_default as default,
+  detectDomainPacks,
   discoverChecks,
+  discoverClaudeCodeAssets,
   estimateTokens,
   evaluateBoardGuard,
   evaluateFileMutation,
@@ -7326,6 +8781,8 @@ export {
   forgetLesson,
   formatDoctorReport,
   formatVerifyRun,
+  generateGrillQuestions,
+  generateSwarmDashboardHtml,
   getArtifactsDir,
   getBoardPath,
   getCachedDiagnostic,
@@ -7344,6 +8801,9 @@ export {
   hashEditFile,
   hashReadFile,
   initProject,
+  inspectBinaryTarget,
+  inspectGDevelopProject,
+  inspectGodotScene,
   instrumentHost,
   isGitRepo,
   isReadOnly,
@@ -7353,6 +8813,7 @@ export {
   listArtifacts,
   listChangedFiles,
   listCheckpoints,
+  listEpistemicSources,
   listReplayableSessions,
   listSessionStates,
   listTelemetryFiles,
@@ -7393,9 +8854,14 @@ export {
   registerArtifactTools,
   registerCheckpointTools,
   registerCircuitBreakerHook,
+  registerClaudeCodeBridge,
+  registerClaudeCompatTools,
   registerContextBudgetHook,
+  registerDashboardTools,
   registerDoctorCommand,
   registerDoctorTools,
+  registerDomainPacks,
+  registerEpistemicTools,
   registerGuiStudioTools,
   registerHashlineTools,
   registerLspTools,
@@ -7415,6 +8881,7 @@ export {
   registerTaskBudgetHooks,
   registerTelemetryHooks,
   registerTransactionHooks,
+  registerUXJudgeTools,
   registerUntaintCommand,
   registerVerifyTools,
   rejectProposal,
@@ -7432,8 +8899,10 @@ export {
   runVerify,
   saveBoard,
   saveLessons,
+  saveUXScorecard,
   scoreLesson,
   scoreTournament,
+  scoreUXMetrics,
   setTaskBudget,
   setup,
   shutdownWarmLspServers,
@@ -7445,6 +8914,7 @@ export {
   taskWorkdir,
   transactionStats,
   updateTaskStatus,
+  verifyEpistemicClaims,
   verifyReleaseReady,
   warmDiagnosticStats,
   withBoardLock,

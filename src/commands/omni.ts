@@ -1,3 +1,6 @@
+import { generateSwarmDashboardHtml } from "../webui/dashboard.js"
+import { generateGrillQuestions } from "../epistemic/dialectic.js"
+import { detectDomainPacks } from "../packs/index.js"
 import { SWARMOS_VERSION } from "../version.js"
 import { listArtifacts, readArtifact } from "../omni/artifacts.js"
 import { listCheckpoints } from "../omni/checkpoints.js"
@@ -121,6 +124,52 @@ export async function registerOmniCommands(ctx: any, rootDir: string): Promise<v
           await ctx.session.prompt({
             sessionID: input.sessionID,
             text: summary,
+            delivery: "steer",
+          })
+        }
+      },
+    })
+
+    editor.add({
+      name: "dashboard",
+      description: "Render The Agency Live Swarm Command Center HTML5 WebUI (.opencode/artifacts/swarm-dashboard.html) and display status",
+      execute: async (input: any) => {
+        const res = await generateSwarmDashboardHtml(rootDir)
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input.sessionID,
+            text: `# SwarmOS Live Command Center WebUI Generated\n\n- **File**: \`${res.dashboardPath}\`\n- **Release Ready**: \`${res.readyToShip}\`\n- **Tasks**: ${res.taskCount} | **Contracts**: ${res.contractCount} | **UI/UX Score**: ${res.uxScore ?? "N/A"}\n\nOpen \`${res.dashboardPath}\` in your browser or OpenCode preview pane to inspect the live Kanban board.`,
+            delivery: "steer",
+          })
+        }
+      },
+    })
+
+    editor.add({
+      name: "grill",
+      description: "Run the IUMBTEMS Socratic Epistemic & Dialectic Stress-Test against a design or specification",
+      execute: async (input: any) => {
+        const specText = String(input.prompt?.text ?? input.prompt ?? "Current workspace architecture")
+        const res = generateGrillQuestions(specText)
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input.sessionID,
+            text: `# Epistemic Socratic Grill (${res.topic})\n\nBefore locking contracts or writing implementation code, answer or verify these ${res.questions.length} stress-test questions:\n\n${res.questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}`,
+            delivery: "steer",
+          })
+        }
+      },
+    })
+
+    editor.add({
+      name: "pack",
+      description: "Inspect or activate SwarmOS Domain Packs (Godot 4, GDevelop 5, Reverse Engineering)",
+      execute: async (input: any) => {
+        const detection = await detectDomainPacks(rootDir)
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input.sessionID,
+            text: `# SwarmOS Domain Packs\n\n- **Auto-Detected Active Packs**: ${detection.recommendedPacks.join(", ") || "none (core only)"}\n- **Godot 4.x**: \`${detection.godot}\` (\`tools.packs.godot_inspect_scene\`)\n- **GDevelop 5**: \`${detection.gdevelop}\` (\`tools.packs.gdevelop_inspect_game\`)\n- **Reverse Engineering (REA)**: \`${detection.reverseEngineering}\` (\`tools.packs.re_inspect_binary\`)`,
             delivery: "steer",
           })
         }

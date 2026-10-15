@@ -167,24 +167,24 @@ describe("SwarmOS v0.9.0 Complete Roadmap (Task Budgets, Session Replay, Warm Pa
 
   it("caches unchanged file diagnostics in 0ms and locates symbol definitions & references", async () => {
     await fs.mkdir(path.join(tmpDir, "src"), { recursive: true })
-    const fileA = path.join(tmpDir, "src/alpha.js")
-    const fileB = path.join(tmpDir, "src/beta.js")
+    const fileA = path.join(tmpDir, "src/alpha.mjs")
+    const fileB = path.join(tmpDir, "src/beta.mjs")
     await fs.writeFile(fileA, "export function computeMetric(x) { return x * 2; }\n", "utf8")
-    await fs.writeFile(fileB, "import { computeMetric } from './alpha.js';\nexport const res = computeMetric(21);\n", "utf8")
+    await fs.writeFile(fileB, "import { computeMetric } from './alpha.mjs';\nexport const res = computeMetric(21);\n", "utf8")
 
-    const firstPass = await runParallelDiagnostics(tmpDir, ["src/alpha.js", "src/beta.js"], (r, p) => runQuickDiagnostics(r, p))
+    const firstPass = await runParallelDiagnostics(tmpDir, ["src/alpha.mjs", "src/beta.mjs"], (r, p) => runQuickDiagnostics(r, p))
     expect(firstPass).toEqual([])
     expect(warmDiagnosticStats.cacheMisses).toBe(2)
     expect(warmDiagnosticStats.cacheHits).toBe(0)
 
     // Second pass on unchanged files hits the warm mtime+size cache
-    const secondPass = await runParallelDiagnostics(tmpDir, ["src/alpha.js", "src/beta.js"], (r, p) => runQuickDiagnostics(r, p))
+    const secondPass = await runParallelDiagnostics(tmpDir, ["src/alpha.mjs", "src/beta.mjs"], (r, p) => runQuickDiagnostics(r, p))
     expect(secondPass).toEqual([])
     expect(warmDiagnosticStats.cacheHits).toBe(2)
 
     const defs = await findSymbolDefinitions(tmpDir, "computeMetric")
     expect(defs.length).toBe(1)
-    expect(defs[0].file).toBe("src/alpha.js")
+    expect(defs[0].file).toBe("src/alpha.mjs")
 
     const refs = await findSymbolReferences(tmpDir, "computeMetric")
     expect(refs.length).toBeGreaterThanOrEqual(2)

@@ -1,3 +1,35 @@
+import {
+  cacheEpistemicSource,
+  classifySpdxLicense,
+  generateGrillQuestions,
+  listEpistemicSources,
+  registerEpistemicTools,
+  verifyEpistemicClaims,
+} from "./epistemic/dialectic.js";
+import {
+  discoverClaudeCodeAssets,
+  registerClaudeCodeBridge,
+  registerClaudeCompatTools,
+} from "./compat/claude-code.js";
+import {
+  UX_SCORECARD_BROWSER_SCRIPT,
+  registerUXJudgeTools,
+  saveUXScorecard,
+  scoreUXMetrics,
+} from "./omni/ux-judge.js";
+import {
+  DOMAIN_PACK_ROLES,
+  detectDomainPacks,
+  inspectBinaryTarget,
+  inspectGDevelopProject,
+  inspectGodotScene,
+  registerDomainPacks,
+} from "./packs/index.js";
+import {
+  generateSwarmDashboardHtml,
+  registerDashboardTools,
+} from "./webui/dashboard.js";
+
 import { registerSwarmOSAgents, SWARMOS_ROLES } from "./agents/roles.js";
 import {
   evaluateBoardGuard,
@@ -336,6 +368,27 @@ import {
 } from "./skills/ui-craft/skill.js";
 
 export {
+  cacheEpistemicSource,
+  classifySpdxLicense,
+  generateGrillQuestions,
+  listEpistemicSources,
+  registerEpistemicTools,
+  verifyEpistemicClaims,
+  discoverClaudeCodeAssets,
+  registerClaudeCodeBridge,
+  registerClaudeCompatTools,
+  UX_SCORECARD_BROWSER_SCRIPT,
+  registerUXJudgeTools,
+  saveUXScorecard,
+  scoreUXMetrics,
+  DOMAIN_PACK_ROLES,
+  detectDomainPacks,
+  inspectBinaryTarget,
+  inspectGDevelopProject,
+  inspectGodotScene,
+  registerDomainPacks,
+  generateSwarmDashboardHtml,
+  registerDashboardTools,
   // Agent roles, prompts & runtime guard
   SWARMOS_ROLES,
   PROMPT_DIRECTOR,
@@ -685,6 +738,10 @@ export function buildSetupModules(
           const editor = withPinningProfile(rawEditor, config.pinnedNamespaces);
           registerOrgTools(editor, rootDir);
           registerUITools(editor);
+          registerUXJudgeTools(editor, rootDir);
+          registerEpistemicTools(editor, rootDir);
+          registerClaudeCompatTools(editor, rootDir);
+          registerDashboardTools(editor, rootDir);
           registerFSTools(editor, rootDir);
           registerHashlineTools(editor, rootDir);
           registerArtifactTools(editor, rootDir);
@@ -778,6 +835,21 @@ export function buildSetupModules(
         await registerOmniCommands(c, rootDir);
         await registerReplayCommand(c, rootDir);
       },
+    },
+    {
+      id: "claude-compat-bridge",
+      requires: ["command.transform", "tool.transform"],
+      run: async (c) => {
+        await c.tool.transform((editor: any) =>
+          registerClaudeCompatTools(editor, rootDir),
+        );
+        await registerClaudeCodeBridge(c, rootDir);
+      },
+    },
+    {
+      id: "domain-packs",
+      requires: ["tool.transform"],
+      run: (c) => registerDomainPacks(c, rootDir),
     },
     // Telemetry runs last so its execute.after hook sees interventions appended by earlier hooks.
     ...observe,
