@@ -191,6 +191,26 @@ SwarmOS v0.5.0 adds five engines that keep long-running agents oriented, recover
 - **Cross-Session Episodic Memory (`tools.memory.record_lesson` / `recall`)**: Stores repository lessons (`id`, `trigger`, `lesson`, optional `scopePaths`) in `.opencode/memory/lessons.json` and injects them as `<episodic-repository-memory>` into every non-compaction turn.
 - **Live PTY & Dev-Server Log Tap (`tools.pty.read_logs`)**: Reads a persistent terminal (`ptyID`, via `ctx.experimental.terminal.read`) or a log file (`logFile`, default `.opencode/artifacts/devserver.log`), with `lines` (10–500, default 80) and `filterErrorsOnly` so agents can check HMR/SSR/runtime errors right after an edit.
 
+### Measurement & Verification (v0.6.0+): `/doctor`, `tools.verify.*`, telemetry & benchmarks
+
+SwarmOS v0.6.0 makes it possible to check that SwarmOS is actually running and actually helping:
+
+- **Host contract check & `/doctor`**: At startup SwarmOS probes every OpenCode V2 capability it uses (`src/host/contract.ts`) and runs each module separately. `/doctor` (or `tools.swarmos.doctor`) lists which capabilities exist, which modules registered, which were skipped and why (for example `permission-guard: skipped (host lacks permission.hook)`), and any exceptions thrown inside SwarmOS hooks, which are caught instead of breaking the host's tool call. `bun run contract:check <opencode-checkout>` scans an OpenCode V2 source tree for the hook names and APIs SwarmOS relies on; `OPENCODE_V2_SRC=<checkout> bun test` runs the same check in the test suite.
+- **`tools.verify.run` / `tools.verify.checks`**: Finds the repository's own typecheck, lint and test commands (from a `verifier` field in `.opencode/swarmos.json` or `opencode.json`, `AGENTS.md` lines like ``- test: `bun test` ``, `package.json` scripts, or Cargo/Go/pytest defaults). With `scope: "changed"` (default) it runs typecheck and lint plus only the tests that import changed files (via the RepoMap), strips colour codes, and returns pass/fail counts and `file:line` failures. Runs are saved in `.opencode/verify/` along with a fingerprint of the working tree.
+- **Verified QA receipts**: For projects created with `tools.org.init_project`, a `PASS` receipt must cite the `verifyRunId` of a passing run taken on the task's current code, and `verify_release_ready` requires a passing `scope: "full"` run on the current tree. Editing anything afterwards makes both stale. Pass `requireVerifiedReceipts: false` to `init_project` to opt out.
+- **Telemetry & observe mode**: Each session's tool calls, failures, circuit-breaker fires, turns and (when the host reports it) token usage are written to `.opencode/telemetry/<sessionID>.jsonl`. `{"mode": "observe"}` in `.opencode/swarmos.json` (or `SWARMOS_MODE=observe`) loads only telemetry and `/doctor`.
+- **Benchmark harness (`bench/`)**: 12 tasks (bugs, multi-file refactors, constraint-heavy features, UI fixes, one Python task), each with hidden tests and a reference solution. `bun run bench:check` proves every task fails untouched and passes when solved; `bun bench/run.ts --driver agent` runs a real agent on each task with SwarmOS on and in observe mode, and reports success rate, turns, tool failure rate, breaker fires, tokens and cache hits. See `bench/README.md`.
+
+#### Configuration (`.opencode/swarmos.json`)
+
+```jsonc
+{
+  "mode": "full",                 // or "observe"; env: SWARMOS_MODE
+  "telemetry": true,              // env: SWARMOS_TELEMETRY
+  "verifier": { "typecheck": "bun run typecheck", "test": "bun test" }
+}
+```
+
 ---
 
 ## 8. Development & Testing
@@ -201,6 +221,9 @@ bun install
 
 # Run automated test suite
 bun test
+
+# Check every benchmark task is solvable and not already passing
+bun run bench:check
 
 # Typecheck source
 bun run typecheck

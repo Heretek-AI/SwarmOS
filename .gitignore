@@ -40,3 +40,6 @@ Thumbs.db
 # Coverage / Test
 coverage/
 .turbo/
+
+# Benchmark output
+bench/results/

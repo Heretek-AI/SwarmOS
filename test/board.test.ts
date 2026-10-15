@@ -209,6 +209,8 @@ describe("SwarmOS Board Persistence", () => {
       name: "Release Gate App",
       vision: "Ship with zero defects",
       aestheticArchetype: "Swiss Grid / Data-Dense Workbench",
+      // Legacy receipt flow; the verify-backed gate is covered in verify.test.ts.
+      requireVerifiedReceipts: false,
     })
     await lockContract(tmpDir, {
       id: "contract-api",

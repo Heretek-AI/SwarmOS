@@ -85,18 +85,18 @@ var PROMPT_QA_ADVERSARY = `You are the **Adversarial QA, E2E & Security Lead** (
 
 # Verification Checklist
 1. **Contract & Diff Audit**: Run \`git status --short\` and \`git diff\` (or read modified files). Verify zero stubbed functions, zero hardcoded fake data, zero swallowed errors, and 100% adherence to locked contracts.
-2. **Automated Test Execution**: Run the package typecheck, linter, and unit/integration test suite via \`shell\`. Write additional edge-case tests (empty inputs, malformed payloads, concurrent calls, boundary values) to test resilience.
+2. **Automated Test Execution**: Call \`execute\` -> \`tools.verify.run({})\` (typecheck, lint, and the tests that import the changed files; use \`scope: "full"\` for cross-cutting changes). For tournament candidates, run it inside the candidate's worktree. Write additional edge-case tests (empty inputs, malformed payloads, concurrent calls, boundary values) to test resilience.
 3. **Live Browser & UI Audit (for Frontend/Full-Stack Tasks)**:
    - Inspect \`tools.browser.console\` (must have 0 uncaught errors) and \`tools.browser.network.list\` (must have 0 unexpected 4xx/5xx failures).
    - Run the DOM Geometry Auditor script via \`tools.browser.evaluate\` and inspect \`tools.browser.screenshot\`.
 4. **Verdict**:
-   - Call \`execute\` -> \`tools.org.submit_qa_receipt({ taskId, verdict: "PASS" | "REJECT", defects, testCommand, summary })\`.
-   - Issue \`PASS\` ONLY when all checks, tests, and geometry audits succeed with zero critical defects.`;
+   - Call \`execute\` -> \`tools.org.submit_qa_receipt({ taskId, verdict: "PASS" | "REJECT", defects, testCommand, summary, verifyRunId })\`.
+   - Issue \`PASS\` ONLY when all checks, tests, and geometry audits succeed with zero critical defects. A PASS must cite the \`id\` of a passing \`tools.verify.run\` taken after the last edit; the board rejects PASS receipts without one.`;
 var PROMPT_RELEASE_OPS = `You are the **Staff Release & Integration Engineer** (\`release-ops\`) at OpenCode SwarmOS.
 
 # Your Role & Release Verification
 - Audit \`tools.org.get_board\` to verify that all required tasks have a verified \`PASS\` QA receipt.
-- If work was performed across multiple Git worktrees (\`tools.opencode.worktree_list\`), integrate/merge them cleanly, resolve any cross-module conflicts, and run the canonical full-repository verification suite (e.g., \`bun test\`, \`bun run check\`, \`npm test\`, \`cargo test\`).
+- If work was performed across multiple Git worktrees (\`tools.opencode.worktree_list\`), integrate/merge them cleanly, resolve any cross-module conflicts, and run the canonical full-repository verification via \`tools.verify.run({ scope: "full" })\`. \`tools.org.verify_release_ready\` blocks release until a full run passes on the current tree.
 - Produce a clean release readiness report detailing verified features, test coverage, and startup instructions.`;
 var PROMPT_STUDIO_GUI = `You are the **Principal GUI & Spatial Design Studio** (\`studio-gui\`) at OpenCode SwarmOS.
 You design and engineer world-class Web, Electron, Tauri, and Native Desktop GUIs (PyQt, Tkinter, Swift, GTK, Rust Iced/Slint).
@@ -309,15 +309,620 @@ function registerSwarmOSAgents(editor) {
 }
 
 // src/agents/guard.ts
-import * as path2 from "path";
+import * as path4 from "path";
 
 // src/board/board.ts
+import * as fs3 from "fs/promises";
+import * as path3 from "path";
+
+// src/omni/verify.ts
+import { exec, execFile } from "child_process";
+import { createHash } from "crypto";
+import * as fs2 from "fs/promises";
+import * as path2 from "path";
+import { promisify } from "util";
+
+// src/omni/repomap.ts
 import * as fs from "fs/promises";
 import * as path from "path";
+var SOURCE_EXTS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".py", ".rs", ".go"]);
+var IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", ".opencode", ".worktrees", "target", "__pycache__"]);
+async function walkSourceFiles(dir, rootDir, maxFiles = 400, acc = []) {
+  if (acc.length >= maxFiles)
+    return acc;
+  let entries = [];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const entry of entries) {
+    if (acc.length >= maxFiles)
+      break;
+    if (entry.name.startsWith(".") && entry.name !== ".github")
+      continue;
+    if (entry.isDirectory()) {
+      if (IGNORED_DIRS.has(entry.name))
+        continue;
+      await walkSourceFiles(path.join(dir, entry.name), rootDir, maxFiles, acc);
+    } else if (entry.isFile()) {
+      const ext = path.extname(entry.name).toLowerCase();
+      if (SOURCE_EXTS.has(ext)) {
+        const rel = path.relative(rootDir, path.join(dir, entry.name)).split(path.sep).join("/");
+        acc.push(rel);
+      }
+    }
+  }
+  return acc;
+}
+function resolveRelativeImport(fromFile, spec, knownSet) {
+  if (!spec.startsWith("."))
+    return;
+  const fromDir = path.posix.dirname(fromFile);
+  const base = path.posix.normalize(path.posix.join(fromDir, spec));
+  const candidates = [
+    base,
+    base.replace(/\.js$/, ".ts"),
+    base.replace(/\.js$/, ".tsx"),
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.js`,
+    `${base}/index.ts`,
+    `${base}/index.js`
+  ];
+  return candidates.find((c) => knownSet.has(c));
+}
+async function buildRepoMap(rootDir, topN = 25) {
+  const files = await walkSourceFiles(rootDir, rootDir, 400);
+  const knownSet = new Set(files);
+  const nodes = new Map;
+  for (const f of files) {
+    nodes.set(f, { path: f, imports: [], importedBy: [], centralityScore: 1, symbols: [] });
+  }
+  const importRe = /(?:import\s+[^'"]*from\s+|import\s*\(|export\s+[^'"]*from\s+)['"]([^'"]+)['"]/g;
+  const declRe = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|const|enum|struct|fn|def)\s+([A-Za-z0-9_$]+)/;
+  for (const f of files) {
+    const node = nodes.get(f);
+    try {
+      const raw = await fs.readFile(path.resolve(rootDir, f), "utf8");
+      let match;
+      importRe.lastIndex = 0;
+      while ((match = importRe.exec(raw)) !== null) {
+        const resolved = resolveRelativeImport(f, match[1], knownSet);
+        if (resolved && resolved !== f && !node.imports.includes(resolved)) {
+          node.imports.push(resolved);
+          const targetNode = nodes.get(resolved);
+          if (targetNode && !targetNode.importedBy.includes(f)) {
+            targetNode.importedBy.push(f);
+          }
+        }
+      }
+      for (const line of raw.split(`
+`).slice(0, 300)) {
+        const m = declRe.exec(line);
+        if (m && node.symbols.length < 12 && !node.symbols.includes(m[1])) {
+          node.symbols.push(m[1]);
+        }
+      }
+    } catch {}
+  }
+  const damping = 0.85;
+  for (let iter = 0;iter < 3; iter++) {
+    const nextScores = new Map;
+    for (const [f, node] of nodes.entries()) {
+      let sum = 0;
+      for (const caller of node.importedBy) {
+        const callerNode = nodes.get(caller);
+        const outDegree = Math.max(1, callerNode.imports.length);
+        sum += callerNode.centralityScore / outDegree;
+      }
+      nextScores.set(f, +(1 - damping + damping * (sum + node.importedBy.length)).toFixed(3));
+    }
+    for (const [f, score] of nextScores.entries()) {
+      nodes.get(f).centralityScore = score;
+    }
+  }
+  const sorted = Array.from(nodes.values()).sort((a, b) => b.centralityScore - a.centralityScore || b.importedBy.length - a.importedBy.length);
+  return {
+    totalFilesScanned: files.length,
+    topFiles: sorted.slice(0, topN)
+  };
+}
+async function analyzeBlastRadius(rootDir, targetFile) {
+  const relTarget = path.relative(rootDir, path.resolve(rootDir, targetFile)).split(path.sep).join("/");
+  const fullMap = await buildRepoMap(rootDir, 400);
+  const byPath = new Map(fullMap.topFiles.map((n) => [n.path, n]));
+  const direct = byPath.get(relTarget)?.importedBy ?? [];
+  const visited = new Set(direct);
+  const queue = [...direct];
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    const callers = byPath.get(cur)?.importedBy ?? [];
+    for (const c of callers) {
+      if (c !== relTarget && !visited.has(c)) {
+        visited.add(c);
+        queue.push(c);
+      }
+    }
+  }
+  const transitive = Array.from(visited);
+  return {
+    targetFile: relTarget,
+    directDependents: direct,
+    transitiveDependents: transitive,
+    impactScore: direct.length * 2 + transitive.length
+  };
+}
+function registerRepoMapTools(editor, rootDir) {
+  editor.namespace({
+    name: "repo",
+    description: "Aider-style PageRank Repository Map & Reverse-Import Blast-Radius Analyzer for instant architectural orientation."
+  });
+  editor.add({
+    name: "map",
+    description: "Build a PageRank-weighted repository dependency map showing the highest-centrality files, their exported symbols, and their importers/dependents.",
+    options: { namespace: "repo", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        topN: { type: "number", description: "Number of top-ranked files to return (default 25)" }
+      }
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const report = await buildRepoMap(rootDir, input?.topN ?? 25);
+      return { output: report, content: JSON.stringify(report, null, 2) };
+    }
+  });
+  editor.add({
+    name: "blast_radius",
+    description: "Compute the direct and transitive reverse-import blast radius (all files that directly or indirectly import `targetFile`) before or after modifying an interface.",
+    options: { namespace: "repo", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Target file path to analyze" }
+      },
+      required: ["path"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const report = await analyzeBlastRadius(rootDir, input.path);
+      return { output: report, content: JSON.stringify(report, null, 2) };
+    }
+  });
+}
+
+// src/omni/verify.ts
+var execFileAsync = promisify(execFile);
+var ANSI_RE = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*\u0007/g;
+function stripAnsi(text) {
+  return text.replace(ANSI_RE, "").replace(/\r(?!\n)/g, `
+`);
+}
+function getVerifyDir(rootDir) {
+  return path2.join(rootDir, ".opencode", "verify");
+}
+async function readJson(file) {
+  try {
+    return JSON.parse(await fs2.readFile(file, "utf8"));
+  } catch {
+    return;
+  }
+}
+async function exists(file) {
+  try {
+    await fs2.access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function detectRunner(command) {
+  if (/\bbun\s+test\b/.test(command))
+    return "bun";
+  if (/\bvitest\b/.test(command))
+    return "vitest";
+  if (/\bjest\b/.test(command))
+    return "jest";
+  if (/\bnode\s+--test\b/.test(command))
+    return "node";
+  if (/\bpytest\b/.test(command))
+    return "pytest";
+  if (/\bgo\s+test\b/.test(command))
+    return "go";
+  if (/\bcargo\s+test\b/.test(command))
+    return "cargo";
+  return "unknown";
+}
+async function packageManager(rootDir) {
+  if (await exists(path2.join(rootDir, "bun.lock")) || await exists(path2.join(rootDir, "bun.lockb")))
+    return "bun";
+  if (await exists(path2.join(rootDir, "pnpm-lock.yaml")))
+    return "pnpm";
+  if (await exists(path2.join(rootDir, "yarn.lock")))
+    return "yarn";
+  return "npm";
+}
+var AGENTS_LINE_RE = /^\s*(?:[-*]\s*)?\**(typecheck|type-check|lint|test)\**\s*[:=]\s*`([^`]+)`/i;
+function normalizeKind(raw) {
+  const k = raw.toLowerCase();
+  return k === "type-check" ? "typecheck" : k;
+}
+async function discoverChecks(rootDir) {
+  const found = new Map;
+  const add = (kind, command, source) => {
+    if (found.has(kind) || !command.trim())
+      return;
+    found.set(kind, { kind, command: command.trim(), source, ...kind === "test" ? { runner: detectRunner(command) } : {} });
+  };
+  for (const [file, label] of [
+    [path2.join(rootDir, ".opencode", "swarmos.json"), ".opencode/swarmos.json"],
+    [path2.join(rootDir, "opencode.json"), "opencode.json"]
+  ]) {
+    const verifier = (await readJson(file))?.verifier;
+    if (verifier && typeof verifier === "object") {
+      for (const [k, v] of Object.entries(verifier)) {
+        if (typeof v === "string" && /^(typecheck|type-check|lint|test)$/i.test(k))
+          add(normalizeKind(k), v, label);
+      }
+    }
+  }
+  try {
+    const agentsMd = await fs2.readFile(path2.join(rootDir, "AGENTS.md"), "utf8");
+    for (const line of agentsMd.split(`
+`)) {
+      const m = AGENTS_LINE_RE.exec(line);
+      if (m)
+        add(normalizeKind(m[1]), m[2], "AGENTS.md");
+    }
+  } catch {}
+  const pkg = await readJson(path2.join(rootDir, "package.json"));
+  if (pkg?.scripts && typeof pkg.scripts === "object") {
+    const pm = await packageManager(rootDir);
+    const scripts = pkg.scripts;
+    const typecheckScript = ["typecheck", "type-check", "check-types", "tsc"].find((s) => scripts[s]);
+    if (typecheckScript)
+      add("typecheck", `${pm} run ${typecheckScript}`, "package.json");
+    else if (await exists(path2.join(rootDir, "tsconfig.json")))
+      add("typecheck", "npx --no-install tsc --noEmit", "tsconfig.json");
+    if (scripts.lint)
+      add("lint", `${pm} run lint`, "package.json");
+    if (scripts.test && !/no test specified/.test(scripts.test)) {
+      if (!found.has("test")) {
+        found.set("test", { kind: "test", command: `${pm} run test`, source: "package.json", runner: detectRunner(scripts.test) });
+      }
+    }
+  }
+  if (await exists(path2.join(rootDir, "Cargo.toml"))) {
+    add("typecheck", "cargo check --quiet", "Cargo.toml");
+    add("test", "cargo test --quiet", "Cargo.toml");
+  }
+  if (await exists(path2.join(rootDir, "go.mod"))) {
+    add("typecheck", "go vet ./...", "go.mod");
+    add("test", "go test ./...", "go.mod");
+  }
+  if (await exists(path2.join(rootDir, "pyproject.toml")) || await exists(path2.join(rootDir, "pytest.ini")) || await exists(path2.join(rootDir, "setup.py"))) {
+    add("test", "python3 -m pytest -q", "python project");
+  }
+  const order = ["typecheck", "lint", "test"];
+  return order.flatMap((k) => found.has(k) ? [found.get(k)] : []);
+}
+async function git(rootDir, args) {
+  try {
+    const { stdout } = await execFileAsync("git", args, { cwd: rootDir, timeout: 1e4, maxBuffer: 32 * 1024 * 1024 });
+    return stdout;
+  } catch {
+    return;
+  }
+}
+async function listChangedFiles(rootDir) {
+  const tracked = await git(rootDir, ["diff", "--name-only", "HEAD"]);
+  if (tracked === undefined)
+    return;
+  const untracked = await git(rootDir, ["ls-files", "--others", "--exclude-standard"]) ?? "";
+  const files = [...tracked.split(`
+`), ...untracked.split(`
+`)].map((f) => f.trim()).filter(Boolean);
+  return [...new Set(files)].filter((f) => !f.startsWith(".opencode/"));
+}
+async function computeTreeFingerprint(rootDir) {
+  const head = await git(rootDir, ["rev-parse", "HEAD"]);
+  if (head === undefined)
+    return null;
+  const hash = createHash("sha256");
+  hash.update(head.trim());
+  hash.update(await git(rootDir, ["diff", "HEAD", "--", ".", ":(exclude).opencode"]) ?? "");
+  const untracked = (await git(rootDir, ["ls-files", "--others", "--exclude-standard"]) ?? "").split(`
+`).map((f) => f.trim()).filter((f) => f && !f.startsWith(".opencode/")).sort();
+  for (const f of untracked) {
+    hash.update(`\x00${f}\x00`);
+    try {
+      hash.update(await fs2.readFile(path2.join(rootDir, f)));
+    } catch {}
+  }
+  return hash.digest("hex").slice(0, 32);
+}
+var TEST_FILE_RE = /(?:\.(?:test|spec)\.[cm]?[jt]sx?$)|(?:(?:^|\/)test_[^/]+\.py$)|(?:_test\.py$)|(?:_test\.go$)/;
+function isTestFile(file) {
+  return TEST_FILE_RE.test(file);
+}
+function scopedTestCommand(check, testFiles, goPackages) {
+  const quoted = testFiles.map((f) => JSON.stringify(f)).join(" ");
+  switch (check.runner) {
+    case "bun":
+      return `bun test ${testFiles.map((f) => JSON.stringify(f.startsWith(".") ? f : `./${f}`)).join(" ")}`;
+    case "vitest":
+      return `npx --no-install vitest run ${quoted}`;
+    case "jest":
+      return `npx --no-install jest ${quoted}`;
+    case "node":
+      return `node --test ${quoted}`;
+    case "pytest":
+      return `python3 -m pytest -q ${quoted}`;
+    case "go":
+      return goPackages.length ? `go test ${goPackages.join(" ")}` : undefined;
+    default:
+      return;
+  }
+}
+var FAILURE_LOC_RES = [
+  /(?:^|[\s(])((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?|py|go|rs|vue|svelte|css))[:](\d+)(?::(\d+))?/,
+  /(?:^|\s)((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?))\((\d+),(\d+)\)/,
+  /File "([^"]+\.py)", line (\d+)/
+];
+var TEST_HEADER_RE = /^((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?)):$/;
+var NAMED_FAILURE_RES = [
+  /^\s*FAIL\s+((?:\.{0,2}\/)?[\w@./-]+\.(?:[cm]?[jt]sx?))(.*)$/,
+  /^FAILED\s+([\w@./-]+\.py)::(\S+)(.*)$/
+];
+function extractFailures(output, rootDir, max = 30) {
+  const failures = [];
+  const seen = new Set;
+  let currentTestFile;
+  for (const line of output.split(`
+`)) {
+    if (failures.length >= max)
+      break;
+    const header = TEST_HEADER_RE.exec(line.trim());
+    if (header) {
+      currentTestFile = header[1];
+      continue;
+    }
+    const bunFail = /^\(fail\)\s+(.+?)(?:\s+\[[\d.]+m?s\])?$/.exec(line.trim());
+    if (bunFail && currentTestFile) {
+      const key = `${currentTestFile}#${bunFail[1]}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        failures.push({ file: currentTestFile, message: `(fail) ${bunFail[1]}` });
+      }
+      continue;
+    }
+    let named = false;
+    for (const re of NAMED_FAILURE_RES) {
+      const m = re.exec(line);
+      if (!m)
+        continue;
+      named = true;
+      const key = `${m[1]}#${m[2]}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        failures.push({ file: m[1], message: line.trim().slice(0, 240) });
+      }
+      break;
+    }
+    if (named)
+      continue;
+    if (!/(error|fail|assert|expect|exception|panic|warning|\u2717|\u00D7)/i.test(line) && !/File "|^\s*at\s/.test(line))
+      continue;
+    for (const re of FAILURE_LOC_RES) {
+      const m = re.exec(line);
+      if (!m)
+        continue;
+      let file = m[1];
+      if (file.includes("node_modules") || file.startsWith("internal/"))
+        break;
+      if (rootDir && path2.isAbsolute(file))
+        file = path2.relative(rootDir, file).split(path2.sep).join("/");
+      const key = `${file}:${m[2]}`;
+      if (seen.has(key))
+        break;
+      seen.add(key);
+      failures.push({ file, line: Number(m[2]), ...m[3] ? { col: Number(m[3]) } : {}, message: line.trim().slice(0, 240) });
+      break;
+    }
+  }
+  return failures;
+}
+function lastInt(text, re) {
+  let last;
+  for (const m of text.matchAll(re))
+    last = Number(m[1]);
+  return last;
+}
+function sumInt(text, re) {
+  let total = 0;
+  for (const m of text.matchAll(re))
+    total += Number(m[1]);
+  return total;
+}
+function parseCounts(output, runner = "unknown") {
+  if (runner === "cargo") {
+    const passed = sumInt(output, /(\d+) passed;/g);
+    const failed = sumInt(output, /(\d+) failed;/g);
+    return /test result:/.test(output) ? { passed, failed } : undefined;
+  }
+  if (runner === "go") {
+    const failed = (output.match(/^--- FAIL:/gm) ?? []).length;
+    const passed = (output.match(/^--- PASS:/gm) ?? []).length;
+    const okPkgs = (output.match(/^ok\s+/gm) ?? []).length;
+    return failed + passed + okPkgs > 0 ? { passed: passed || okPkgs, failed } : undefined;
+  }
+  const passed = lastInt(output, /(\d+)\s+(?:pass|passed|passing)\b/gi);
+  const failed = lastInt(output, /(\d+)\s+(?:fail|failed|failing)\b/gi);
+  if (passed === undefined && failed === undefined)
+    return;
+  return { passed: passed ?? 0, failed: failed ?? 0 };
+}
+function runShell(command, cwd, timeoutMs) {
+  return new Promise((resolve) => {
+    exec(command, { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, env: { ...process.env, CI: "1", FORCE_COLOR: "0", NO_COLOR: "1" } }, (err, stdout, stderr) => {
+      const output = stripAnsi(`${stdout ?? ""}
+${stderr ?? ""}`);
+      const timedOut = Boolean(err?.killed && err?.signal);
+      resolve({ exitCode: err ? typeof err.code === "number" ? err.code : 1 : 0, output, timedOut });
+    });
+  });
+}
+async function resolveScope(rootDir, input) {
+  const changed = input.paths?.length ? input.paths : await listChangedFiles(rootDir) ?? [];
+  if (changed.length === 0)
+    return { changedFiles: [], scopedTests: [], goPackages: [], note: "no changed files; ran full suite" };
+  const candidates = new Set(changed);
+  for (const file of changed.filter((f) => !isTestFile(f)).slice(0, 20)) {
+    try {
+      const radius = await analyzeBlastRadius(rootDir, file);
+      for (const dep of radius.transitiveDependents)
+        candidates.add(dep);
+    } catch {}
+  }
+  const scopedTests = [];
+  for (const f of candidates) {
+    if (isTestFile(f) && await exists(path2.join(rootDir, f)))
+      scopedTests.push(f);
+  }
+  const goPackages = [...new Set(changed.filter((f) => f.endsWith(".go")).map((f) => `./${path2.posix.dirname(f)}`))];
+  return { changedFiles: changed, scopedTests: scopedTests.sort(), goPackages };
+}
+async function runVerify(rootDir, input = {}) {
+  const checks = (await discoverChecks(rootDir)).filter((c) => !input.kinds || input.kinds.includes(c.kind));
+  const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 300000, 5000), 1800000);
+  let scope = input.scope ?? "changed";
+  const scoping = scope === "changed" ? await resolveScope(rootDir, input) : { changedFiles: [], scopedTests: [], goPackages: [] };
+  let scopeNote = scoping.note;
+  const results = [];
+  for (const check of checks) {
+    let command = check.command;
+    if (check.kind === "test" && scope === "changed") {
+      const scoped = scoping.scopedTests.length || scoping.goPackages.length ? scopedTestCommand(check, scoping.scopedTests, scoping.goPackages) : undefined;
+      if (scoped)
+        command = scoped;
+      else if (scoping.changedFiles.length > 0) {
+        scopeNote = scoping.scopedTests.length ? `runner "${check.runner}" cannot be scoped; ran full test command` : "no tests import the changed files; ran full test command";
+      }
+    }
+    const started = Date.now();
+    const { exitCode, output, timedOut } = await runShell(command, rootDir, timeoutMs);
+    const lines = output.split(`
+`).filter((l) => l.trim());
+    results.push({
+      kind: check.kind,
+      command,
+      source: check.source,
+      exitCode,
+      passed: exitCode === 0 && !timedOut,
+      timedOut,
+      durationMs: Date.now() - started,
+      ...check.kind === "test" ? { counts: parseCounts(output, check.runner) } : {},
+      failures: exitCode === 0 ? [] : extractFailures(output, rootDir),
+      outputTail: lines.slice(-40).join(`
+`)
+    });
+  }
+  if (scope === "changed" && scoping.changedFiles.length === 0)
+    scope = "full";
+  const run = {
+    id: `verify-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    createdAt: new Date().toISOString(),
+    rootDir: path2.resolve(rootDir),
+    scope,
+    ...scopeNote ? { scopeNote } : {},
+    fingerprint: await computeTreeFingerprint(rootDir),
+    changedFiles: scoping.changedFiles,
+    scopedTests: scoping.scopedTests,
+    checks: results,
+    passed: results.length > 0 && results.every((r) => r.passed)
+  };
+  await saveVerifyRun(rootDir, run);
+  return run;
+}
+async function saveVerifyRun(rootDir, run) {
+  const dir = path2.join(getVerifyDir(rootDir), "runs");
+  await fs2.mkdir(dir, { recursive: true });
+  const payload = JSON.stringify(run, null, 2);
+  await fs2.writeFile(path2.join(dir, `${run.id}.json`), payload, "utf8");
+  await fs2.writeFile(path2.join(getVerifyDir(rootDir), "latest.json"), payload, "utf8");
+  if (run.scope === "full")
+    await fs2.writeFile(path2.join(getVerifyDir(rootDir), "latest-full.json"), payload, "utf8");
+}
+async function loadVerifyRun(rootDir, runId) {
+  return readJson(path2.join(getVerifyDir(rootDir), "runs", `${path2.basename(runId)}.json`));
+}
+async function loadLatestVerifyRun(rootDir, scope) {
+  return readJson(path2.join(getVerifyDir(rootDir), scope === "full" ? "latest-full.json" : "latest.json"));
+}
+function formatVerifyRun(run) {
+  const lines = [
+    `Verify ${run.passed ? "PASSED" : "FAILED"} [${run.id}] scope=${run.scope}${run.scopeNote ? ` (${run.scopeNote})` : ""}`
+  ];
+  if (run.checks.length === 0)
+    lines.push("No verification commands discovered. Add a `verifier` field to .opencode/swarmos.json.");
+  for (const c of run.checks) {
+    const counts = c.counts ? ` ${c.counts.passed} passed / ${c.counts.failed} failed` : "";
+    lines.push(`- ${c.kind}: ${c.passed ? "pass" : c.timedOut ? "TIMEOUT" : `FAIL (exit ${c.exitCode})`}${counts} \u2014 \`${c.command}\` (${c.durationMs}ms)`);
+    for (const f of c.failures.slice(0, 15)) {
+      lines.push(`    ${f.file}${f.line ? `:${f.line}` : ""}${f.col ? `:${f.col}` : ""} ${f.message}`);
+    }
+    if (!c.passed && c.failures.length === 0)
+      lines.push(c.outputTail.split(`
+`).slice(-15).map((l) => `    ${l}`).join(`
+`));
+  }
+  return lines.join(`
+`);
+}
+function registerVerifyTools(editor, rootDir, pinned = true) {
+  editor.namespace({
+    name: "verify",
+    description: "Run the repository's own typecheck, lint and test commands scoped to changed files, with structured pass/fail counts and file:line failures."
+  });
+  editor.add({
+    name: "run",
+    description: "Run the repo's verification commands. scope 'changed' (default) runs typecheck/lint plus only the tests that import changed files; 'full' runs everything. Returns a run ID that QA receipts must cite.",
+    options: { namespace: "verify", codemode: true, pinned },
+    input: {
+      type: "object",
+      properties: {
+        scope: { type: "string", enum: ["changed", "full"], description: "Scope of the run (default 'changed')" },
+        kinds: { type: "array", items: { type: "string", enum: ["typecheck", "lint", "test"] }, description: "Subset of checks to run" },
+        paths: { type: "array", items: { type: "string" }, description: "Override the changed-file set" },
+        timeoutMs: { type: "number", description: "Per-check timeout (default 300000)" }
+      }
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const run = await runVerify(rootDir, input ?? {});
+      return { output: run, content: formatVerifyRun(run) };
+    }
+  });
+  editor.add({
+    name: "checks",
+    description: "List the verification commands SwarmOS discovered for this repository and where each came from.",
+    options: { namespace: "verify", codemode: true, pinned },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const checks = await discoverChecks(rootDir);
+      return { output: { checks }, content: JSON.stringify(checks, null, 2) };
+    }
+  });
+}
+
+// src/board/board.ts
 var BOARD_VERSION = "4.1.0";
 var boardLocks = new Map;
 function getBoardPath(rootDir) {
-  return path.join(rootDir, ".opencode", "org", "board.json");
+  return path3.join(rootDir, ".opencode", "org", "board.json");
 }
 function createEmptyBoard() {
   return {
@@ -331,10 +936,11 @@ function createEmptyBoard() {
 async function loadBoard(rootDir) {
   const file = getBoardPath(rootDir);
   try {
-    const raw = await fs.readFile(file, "utf8");
+    const raw = await fs3.readFile(file, "utf8");
     const parsed = JSON.parse(raw);
     return {
       version: parsed.version ?? BOARD_VERSION,
+      ...parsed.policy ? { policy: parsed.policy } : {},
       project: parsed.project ?? null,
       contracts: Array.isArray(parsed.contracts) ? parsed.contracts : [],
       tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
@@ -345,16 +951,16 @@ async function loadBoard(rootDir) {
   }
 }
 async function saveBoard(rootDir, board) {
-  const dir = path.join(rootDir, ".opencode", "org");
-  await fs.mkdir(dir, { recursive: true });
-  const targetFile = path.join(dir, "board.json");
-  const tempFile = path.join(dir, `board.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`);
+  const dir = path3.join(rootDir, ".opencode", "org");
+  await fs3.mkdir(dir, { recursive: true });
+  const targetFile = path3.join(dir, "board.json");
+  const tempFile = path3.join(dir, `board.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`);
   const payload = JSON.stringify(board, null, 2);
-  await fs.writeFile(tempFile, payload, "utf8");
-  await fs.rename(tempFile, targetFile);
+  await fs3.writeFile(tempFile, payload, "utf8");
+  await fs3.rename(tempFile, targetFile);
 }
 async function withBoardLock(rootDir, mutator) {
-  const key = path.resolve(rootDir);
+  const key = path3.resolve(rootDir);
   const previous = boardLocks.get(key) ?? Promise.resolve();
   let release;
   const gate = new Promise((resolve) => {
@@ -384,6 +990,9 @@ async function initProject(rootDir, input) {
       updatedAt: new Date().toISOString()
     };
     board.project = charter;
+    if (!board.policy || input.requireVerifiedReceipts !== undefined) {
+      board.policy = { requireVerifiedReceipts: input.requireVerifiedReceipts ?? true };
+    }
     return charter;
   });
 }
@@ -441,7 +1050,36 @@ async function updateTaskStatus(rootDir, taskId, status) {
     return task;
   });
 }
+function taskWorkdir(rootDir, task) {
+  return task.worktree ? path3.resolve(rootDir, task.worktree) : path3.resolve(rootDir);
+}
+async function assertVerifiedPass(rootDir, task, verifyRunId) {
+  if (!verifyRunId) {
+    throw new Error(`SwarmOS Verify Gate: PASS for task [${task.id}] must cite a passing \`tools.verify.run\` (pass \`verifyRunId\`). Run verification instead of asserting it.`);
+  }
+  const workdir = taskWorkdir(rootDir, task);
+  const run = await loadVerifyRun(workdir, verifyRunId) ?? await loadVerifyRun(rootDir, verifyRunId);
+  if (!run)
+    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] not found for task [${task.id}].`);
+  if (!run.passed) {
+    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] FAILED; a failing run cannot back a PASS receipt.`);
+  }
+  if (path3.resolve(run.rootDir) !== workdir) {
+    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] ran in ${run.rootDir}, but task [${task.id}] lives in ${workdir}.`);
+  }
+  const current = await computeTreeFingerprint(workdir);
+  if (current !== null && run.fingerprint !== current) {
+    throw new Error(`SwarmOS Verify Gate: code changed since verify run [${verifyRunId}]. Re-run \`tools.verify.run\` on the current tree.`);
+  }
+  return current;
+}
 async function submitQAReceipt(rootDir, input) {
+  const snapshot = await loadBoard(rootDir);
+  const target = snapshot.tasks.find((t) => t.id === input.taskId);
+  let fingerprint;
+  if (target && input.verdict === "PASS" && snapshot.policy?.requireVerifiedReceipts) {
+    fingerprint = await assertVerifiedPass(rootDir, target, input.verifyRunId);
+  }
   return withBoardLock(rootDir, (board) => {
     const task = board.tasks.find((t) => t.id === input.taskId);
     if (!task) {
@@ -452,6 +1090,8 @@ async function submitQAReceipt(rootDir, input) {
       summary: input.summary,
       defects: input.defects,
       testCommand: input.testCommand,
+      ...input.verifyRunId ? { verifyRunId: input.verifyRunId } : {},
+      ...fingerprint !== undefined ? { fingerprint } : {},
       timestamp: new Date().toISOString()
     };
     task.qaReceipts.push(receipt);
@@ -582,12 +1222,37 @@ async function verifyReleaseReady(rootDir) {
       blockers.push(`Task [${task.id}] (${task.owner}) is "${task.status}" and lacks a signed PASS receipt from qa-adversary.`);
     }
   }
+  let latestFullVerifyRunId;
+  let verifyBlocked = false;
+  if (board.policy?.requireVerifiedReceipts) {
+    for (const id of verifiedTasks) {
+      const task = board.tasks.find((t) => t.id === id);
+      if (!task.qaReceipts[task.qaReceipts.length - 1]?.verifyRunId) {
+        verifyBlocked = true;
+        blockers.push(`Task [${id}] PASS receipt does not cite a \`tools.verify.run\` result.`);
+      }
+    }
+    const full = await loadLatestVerifyRun(rootDir, "full");
+    const fingerprint = await computeTreeFingerprint(rootDir);
+    if (!full) {
+      verifyBlocked = true;
+      blockers.push('No full verification run: call `tools.verify.run({ scope: "full" })` before release.');
+    } else if (!full.passed) {
+      verifyBlocked = true;
+      blockers.push(`Latest full verification run [${full.id}] FAILED.`);
+    } else if (fingerprint !== null && full.fingerprint !== fingerprint) {
+      verifyBlocked = true;
+      blockers.push(`Code changed since full verification run [${full.id}]: re-run \`tools.verify.run({ scope: "full" })\`.`);
+    } else {
+      latestFullVerifyRunId = full.id;
+    }
+  }
   const tournaments = Array.isArray(board.tournaments) ? board.tournaments : [];
   const activeTournaments = tournaments.filter((t) => t.status === "active").map((t) => t.id);
   for (const tid of activeTournaments) {
     blockers.push(`Tournament [${tid}] is still active: call \`tools.org.resolve_tournament\` after QA verification.`);
   }
-  const ready = hasCharter && lockedContractCount > 0 && activeTasks.length > 0 && unverifiedTasks.length === 0 && rejectedTasks.length === 0 && activeTournaments.length === 0;
+  const ready = hasCharter && lockedContractCount > 0 && activeTasks.length > 0 && unverifiedTasks.length === 0 && rejectedTasks.length === 0 && activeTournaments.length === 0 && !verifyBlocked;
   return {
     ready,
     hasCharter,
@@ -598,6 +1263,7 @@ async function verifyReleaseReady(rootDir) {
     supersededTasks,
     activeTournaments,
     blockers,
+    ...latestFullVerifyRunId ? { latestFullVerifyRunId } : {},
     checkedAt: new Date().toISOString()
   };
 }
@@ -605,9 +1271,9 @@ async function verifyReleaseReady(rootDir) {
 // src/agents/guard.ts
 function normalizeResourcePath(rootDir, resource) {
   const trimmed = resource.trim();
-  const absRoot = path2.resolve(rootDir);
-  const resolved = path2.isAbsolute(trimmed) ? path2.resolve(trimmed) : path2.resolve(absRoot, trimmed);
-  const rel = path2.relative(absRoot, resolved).split(path2.sep).join("/");
+  const absRoot = path4.resolve(rootDir);
+  const resolved = path4.isAbsolute(trimmed) ? path4.resolve(trimmed) : path4.resolve(absRoot, trimmed);
+  const rel = path4.relative(absRoot, resolved).split(path4.sep).join("/");
   return rel.startsWith("./") ? rel.slice(2) : rel;
 }
 function matchesPathPattern(relPath, pattern) {
@@ -732,11 +1398,11 @@ async function registerPermissionGuard(ctx, rootDir) {
 }
 
 // src/codemode/fs-outline.ts
-import * as fs2 from "fs/promises";
-import * as path3 from "path";
+import * as fs4 from "fs/promises";
+import * as path5 from "path";
 async function extractOutline(rootDir, targetPath) {
-  const abs = path3.resolve(rootDir, targetPath);
-  const text = await fs2.readFile(abs, "utf8");
+  const abs = path5.resolve(rootDir, targetPath);
+  const text = await fs4.readFile(abs, "utf8");
   const lines = text.split(`
 `);
   const declRe = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|const|let|var|enum|struct|fn|def|impl)\s+([A-Za-z0-9_$]+)/;
@@ -890,7 +1556,7 @@ function registerOrgTools(editor, rootDir) {
   });
   editor.add({
     name: "submit_qa_receipt",
-    description: "Record an adversarial QA PASS or REJECT receipt for a task. Only tasks with a PASS receipt can be released.",
+    description: "Record an adversarial QA PASS or REJECT receipt for a task. PASS must cite a passing `tools.verify.run` (verifyRunId) taken on the task's current code. Only tasks with a PASS receipt can be released.",
     options: { namespace: "org", codemode: true, pinned: true },
     input: {
       type: "object",
@@ -899,7 +1565,11 @@ function registerOrgTools(editor, rootDir) {
         verdict: { type: "string", enum: ["PASS", "REJECT"], description: "PASS or REJECT verdict" },
         summary: { type: "string", description: "Executive summary of verification findings" },
         defects: { type: "array", items: { type: "string" }, description: "List of defects or regressions found (must be empty for PASS)" },
-        testCommand: { type: "string", description: "Exact command executed to verify" }
+        testCommand: { type: "string", description: "Exact command executed to verify" },
+        verifyRunId: {
+          type: "string",
+          description: "ID of a passing `tools.verify.run` taken on the task's current tree (required for PASS when the board policy demands it)"
+        }
       },
       required: ["taskId", "verdict", "summary", "defects"]
     },
@@ -1227,18 +1897,21 @@ function registerUITools(editor) {
   });
 }
 
+// src/version.ts
+var SWARMOS_VERSION = "0.6.0";
+
 // src/omni/artifacts.ts
-import * as fs3 from "fs/promises";
-import * as path4 from "path";
+import * as fs5 from "fs/promises";
+import * as path6 from "path";
 function getArtifactsDir(rootDir) {
-  return path4.join(rootDir, ".opencode", "artifacts");
+  return path6.join(rootDir, ".opencode", "artifacts");
 }
 async function writeArtifact(rootDir, name, content) {
-  const safeName = path4.basename(name);
+  const safeName = path6.basename(name);
   const dir = getArtifactsDir(rootDir);
-  await fs3.mkdir(dir, { recursive: true });
-  const target = path4.join(dir, safeName);
-  await fs3.writeFile(target, content, "utf8");
+  await fs5.mkdir(dir, { recursive: true });
+  const target = path6.join(dir, safeName);
+  await fs5.writeFile(target, content, "utf8");
   return {
     name: safeName,
     path: target,
@@ -1247,10 +1920,10 @@ async function writeArtifact(rootDir, name, content) {
   };
 }
 async function readArtifact(rootDir, name) {
-  const safeName = path4.basename(name);
-  const target = path4.join(getArtifactsDir(rootDir), safeName);
+  const safeName = path6.basename(name);
+  const target = path6.join(getArtifactsDir(rootDir), safeName);
   try {
-    const content = await fs3.readFile(target, "utf8");
+    const content = await fs5.readFile(target, "utf8");
     return { name: safeName, exists: true, content };
   } catch {
     return { name: safeName, exists: false, content: "" };
@@ -1258,7 +1931,7 @@ async function readArtifact(rootDir, name) {
 }
 async function listArtifacts(rootDir) {
   try {
-    const entries = await fs3.readdir(getArtifactsDir(rootDir), { withFileTypes: true });
+    const entries = await fs5.readdir(getArtifactsDir(rootDir), { withFileTypes: true });
     return entries.filter((e) => e.isFile()).map((e) => e.name).sort();
   } catch {
     return [];
@@ -1357,21 +2030,21 @@ ${sections.join(`
 }
 
 // src/omni/checkpoints.ts
-import * as fs4 from "fs/promises";
-import * as path5 from "path";
+import * as fs6 from "fs/promises";
+import * as path7 from "path";
 function getCheckpointsDir(rootDir) {
-  return path5.join(rootDir, ".opencode", "checkpoints");
+  return path7.join(rootDir, ".opencode", "checkpoints");
 }
 async function createCheckpoint(rootDir, input) {
   const id = input.id ?? `chk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const dir = getCheckpointsDir(rootDir);
-  await fs4.mkdir(dir, { recursive: true });
+  await fs6.mkdir(dir, { recursive: true });
   const files = [];
   for (const rawPath of input.paths) {
-    const abs = path5.resolve(rootDir, rawPath);
-    const rel = path5.relative(rootDir, abs).split(path5.sep).join("/");
+    const abs = path7.resolve(rootDir, rawPath);
+    const rel = path7.relative(rootDir, abs).split(path7.sep).join("/");
     try {
-      const buf = await fs4.readFile(abs);
+      const buf = await fs6.readFile(abs);
       files.push({
         path: rel,
         exists: true,
@@ -1390,7 +2063,7 @@ async function createCheckpoint(rootDir, input) {
     createdAt: new Date().toISOString(),
     files
   };
-  await fs4.writeFile(path5.join(dir, `${id}.json`), JSON.stringify(manifest, null, 2), "utf8");
+  await fs6.writeFile(path7.join(dir, `${id}.json`), JSON.stringify(manifest, null, 2), "utf8");
   return {
     id: manifest.id,
     label: manifest.label,
@@ -1399,19 +2072,19 @@ async function createCheckpoint(rootDir, input) {
   };
 }
 async function rollbackCheckpoint(rootDir, checkpointId) {
-  const file = path5.join(getCheckpointsDir(rootDir), `${path5.basename(checkpointId)}.json`);
-  const raw = await fs4.readFile(file, "utf8");
+  const file = path7.join(getCheckpointsDir(rootDir), `${path7.basename(checkpointId)}.json`);
+  const raw = await fs6.readFile(file, "utf8");
   const manifest = JSON.parse(raw);
   const restoredFiles = [];
   const removedFiles = [];
   for (const entry of manifest.files) {
-    const abs = path5.resolve(rootDir, entry.path);
+    const abs = path7.resolve(rootDir, entry.path);
     if (entry.exists && typeof entry.contentBase64 === "string") {
-      await fs4.mkdir(path5.dirname(abs), { recursive: true });
-      await fs4.writeFile(abs, Buffer.from(entry.contentBase64, "base64"));
+      await fs6.mkdir(path7.dirname(abs), { recursive: true });
+      await fs6.writeFile(abs, Buffer.from(entry.contentBase64, "base64"));
       restoredFiles.push(entry.path);
     } else if (!entry.exists) {
-      await fs4.rm(abs, { force: true });
+      await fs6.rm(abs, { force: true });
       removedFiles.push(entry.path);
     }
   }
@@ -1420,13 +2093,13 @@ async function rollbackCheckpoint(rootDir, checkpointId) {
 async function listCheckpoints(rootDir) {
   try {
     const dir = getCheckpointsDir(rootDir);
-    const entries = await fs4.readdir(dir);
+    const entries = await fs6.readdir(dir);
     const results = [];
     for (const name of entries) {
       if (!name.endsWith(".json"))
         continue;
       try {
-        const raw = await fs4.readFile(path5.join(dir, name), "utf8");
+        const raw = await fs6.readFile(path7.join(dir, name), "utf8");
         const parsed = JSON.parse(raw);
         results.push({
           id: parsed.id,
@@ -1499,14 +2172,14 @@ function registerCheckpointTools(editor, rootDir) {
 }
 
 // src/omni/memory.ts
-import * as fs5 from "fs/promises";
-import * as path6 from "path";
+import * as fs7 from "fs/promises";
+import * as path8 from "path";
 function getMemoryFilePath(rootDir) {
-  return path6.join(rootDir, ".opencode", "memory", "lessons.json");
+  return path8.join(rootDir, ".opencode", "memory", "lessons.json");
 }
 async function loadLessons(rootDir) {
   try {
-    const raw = await fs5.readFile(getMemoryFilePath(rootDir), "utf8");
+    const raw = await fs7.readFile(getMemoryFilePath(rootDir), "utf8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -1525,8 +2198,8 @@ async function recordLesson(rootDir, input) {
   else
     lessons.push(entry);
   const file = getMemoryFilePath(rootDir);
-  await fs5.mkdir(path6.dirname(file), { recursive: true });
-  await fs5.writeFile(file, JSON.stringify(lessons, null, 2), "utf8");
+  await fs7.mkdir(path8.dirname(file), { recursive: true });
+  await fs7.writeFile(file, JSON.stringify(lessons, null, 2), "utf8");
   return entry;
 }
 function registerMemoryTools(editor, rootDir) {
@@ -1597,186 +2270,15 @@ ${block}`
   await ctx.session.hook("context", injectMemory);
 }
 
-// src/omni/repomap.ts
-import * as fs6 from "fs/promises";
-import * as path7 from "path";
-var SOURCE_EXTS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".py", ".rs", ".go"]);
-var IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", ".opencode", ".worktrees", "target", "__pycache__"]);
-async function walkSourceFiles(dir, rootDir, maxFiles = 400, acc = []) {
-  if (acc.length >= maxFiles)
-    return acc;
-  let entries = [];
-  try {
-    entries = await fs6.readdir(dir, { withFileTypes: true });
-  } catch {
-    return acc;
-  }
-  for (const entry of entries) {
-    if (acc.length >= maxFiles)
-      break;
-    if (entry.name.startsWith(".") && entry.name !== ".github")
-      continue;
-    if (entry.isDirectory()) {
-      if (IGNORED_DIRS.has(entry.name))
-        continue;
-      await walkSourceFiles(path7.join(dir, entry.name), rootDir, maxFiles, acc);
-    } else if (entry.isFile()) {
-      const ext = path7.extname(entry.name).toLowerCase();
-      if (SOURCE_EXTS.has(ext)) {
-        const rel = path7.relative(rootDir, path7.join(dir, entry.name)).split(path7.sep).join("/");
-        acc.push(rel);
-      }
-    }
-  }
-  return acc;
-}
-function resolveRelativeImport(fromFile, spec, knownSet) {
-  if (!spec.startsWith("."))
-    return;
-  const fromDir = path7.posix.dirname(fromFile);
-  const base = path7.posix.normalize(path7.posix.join(fromDir, spec));
-  const candidates = [
-    base,
-    base.replace(/\.js$/, ".ts"),
-    base.replace(/\.js$/, ".tsx"),
-    `${base}.ts`,
-    `${base}.tsx`,
-    `${base}.js`,
-    `${base}/index.ts`,
-    `${base}/index.js`
-  ];
-  return candidates.find((c) => knownSet.has(c));
-}
-async function buildRepoMap(rootDir, topN = 25) {
-  const files = await walkSourceFiles(rootDir, rootDir, 400);
-  const knownSet = new Set(files);
-  const nodes = new Map;
-  for (const f of files) {
-    nodes.set(f, { path: f, imports: [], importedBy: [], centralityScore: 1, symbols: [] });
-  }
-  const importRe = /(?:import\s+[^'"]*from\s+|import\s*\(|export\s+[^'"]*from\s+)['"]([^'"]+)['"]/g;
-  const declRe = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|const|enum|struct|fn|def)\s+([A-Za-z0-9_$]+)/;
-  for (const f of files) {
-    const node = nodes.get(f);
-    try {
-      const raw = await fs6.readFile(path7.resolve(rootDir, f), "utf8");
-      let match;
-      importRe.lastIndex = 0;
-      while ((match = importRe.exec(raw)) !== null) {
-        const resolved = resolveRelativeImport(f, match[1], knownSet);
-        if (resolved && resolved !== f && !node.imports.includes(resolved)) {
-          node.imports.push(resolved);
-          const targetNode = nodes.get(resolved);
-          if (targetNode && !targetNode.importedBy.includes(f)) {
-            targetNode.importedBy.push(f);
-          }
-        }
-      }
-      for (const line of raw.split(`
-`).slice(0, 300)) {
-        const m = declRe.exec(line);
-        if (m && node.symbols.length < 12 && !node.symbols.includes(m[1])) {
-          node.symbols.push(m[1]);
-        }
-      }
-    } catch {}
-  }
-  const damping = 0.85;
-  for (let iter = 0;iter < 3; iter++) {
-    const nextScores = new Map;
-    for (const [f, node] of nodes.entries()) {
-      let sum = 0;
-      for (const caller of node.importedBy) {
-        const callerNode = nodes.get(caller);
-        const outDegree = Math.max(1, callerNode.imports.length);
-        sum += callerNode.centralityScore / outDegree;
-      }
-      nextScores.set(f, +(1 - damping + damping * (sum + node.importedBy.length)).toFixed(3));
-    }
-    for (const [f, score] of nextScores.entries()) {
-      nodes.get(f).centralityScore = score;
-    }
-  }
-  const sorted = Array.from(nodes.values()).sort((a, b) => b.centralityScore - a.centralityScore || b.importedBy.length - a.importedBy.length);
-  return {
-    totalFilesScanned: files.length,
-    topFiles: sorted.slice(0, topN)
-  };
-}
-async function analyzeBlastRadius(rootDir, targetFile) {
-  const relTarget = path7.relative(rootDir, path7.resolve(rootDir, targetFile)).split(path7.sep).join("/");
-  const fullMap = await buildRepoMap(rootDir, 400);
-  const byPath = new Map(fullMap.topFiles.map((n) => [n.path, n]));
-  const direct = byPath.get(relTarget)?.importedBy ?? [];
-  const visited = new Set(direct);
-  const queue = [...direct];
-  while (queue.length > 0) {
-    const cur = queue.shift();
-    const callers = byPath.get(cur)?.importedBy ?? [];
-    for (const c of callers) {
-      if (c !== relTarget && !visited.has(c)) {
-        visited.add(c);
-        queue.push(c);
-      }
-    }
-  }
-  const transitive = Array.from(visited);
-  return {
-    targetFile: relTarget,
-    directDependents: direct,
-    transitiveDependents: transitive,
-    impactScore: direct.length * 2 + transitive.length
-  };
-}
-function registerRepoMapTools(editor, rootDir) {
-  editor.namespace({
-    name: "repo",
-    description: "Aider-style PageRank Repository Map & Reverse-Import Blast-Radius Analyzer for instant architectural orientation."
-  });
-  editor.add({
-    name: "map",
-    description: "Build a PageRank-weighted repository dependency map showing the highest-centrality files, their exported symbols, and their importers/dependents.",
-    options: { namespace: "repo", codemode: true, pinned: true },
-    input: {
-      type: "object",
-      properties: {
-        topN: { type: "number", description: "Number of top-ranked files to return (default 25)" }
-      }
-    },
-    output: { type: "object" },
-    execute: async (input) => {
-      const report = await buildRepoMap(rootDir, input?.topN ?? 25);
-      return { output: report, content: JSON.stringify(report, null, 2) };
-    }
-  });
-  editor.add({
-    name: "blast_radius",
-    description: "Compute the direct and transitive reverse-import blast radius (all files that directly or indirectly import `targetFile`) before or after modifying an interface.",
-    options: { namespace: "repo", codemode: true, pinned: true },
-    input: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Target file path to analyze" }
-      },
-      required: ["path"]
-    },
-    output: { type: "object" },
-    execute: async (input) => {
-      const report = await analyzeBlastRadius(rootDir, input.path);
-      return { output: report, content: JSON.stringify(report, null, 2) };
-    }
-  });
-}
-
 // src/omni/research.ts
-import * as fs7 from "fs/promises";
-import * as path8 from "path";
+import * as fs8 from "fs/promises";
+import * as path9 from "path";
 function getResearchLedgerPath(rootDir) {
-  return path8.join(rootDir, ".opencode", "artifacts", "research_sources.json");
+  return path9.join(rootDir, ".opencode", "artifacts", "research_sources.json");
 }
 async function loadResearchSources(rootDir) {
   try {
-    const raw = await fs7.readFile(getResearchLedgerPath(rootDir), "utf8");
+    const raw = await fs8.readFile(getResearchLedgerPath(rootDir), "utf8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -1796,8 +2298,8 @@ async function recordResearchSource(rootDir, input) {
     sources.push(entry);
   }
   const file = getResearchLedgerPath(rootDir);
-  await fs7.mkdir(path8.dirname(file), { recursive: true });
-  await fs7.writeFile(file, JSON.stringify(sources, null, 2), "utf8");
+  await fs8.mkdir(path9.dirname(file), { recursive: true });
+  await fs8.writeFile(file, JSON.stringify(sources, null, 2), "utf8");
   return entry;
 }
 async function auditMarkdownCitations(rootDir, markdownText) {
@@ -1973,7 +2475,7 @@ ${input.prompt?.text ?? input.prompt ?? ""}`,
           listCheckpoints(rootDir)
         ]);
         const summary = [
-          "# SwarmOS Omni-Harness Artifacts, Memory & Checkpoints (v0.5.0)",
+          `# SwarmOS Omni-Harness Artifacts, Memory & Checkpoints (v${SWARMOS_VERSION})`,
           "",
           `**Files in \`.opencode/artifacts/\` (${files.length})**: ${files.length ? files.join(", ") : "_none_"}`,
           `**Episodic Memory Lessons (${lessons.length})**: ${lessons.length ? lessons.map((l) => `\`${l.id}\``).join(", ") : "_none_"}`,
@@ -2055,7 +2557,7 @@ async function registerSwarmCommand(ctx, rootDir) {
         const [board, readiness] = await Promise.all([loadBoard(rootDir), verifyReleaseReady(rootDir)]);
         const tournaments = Array.isArray(board.tournaments) ? board.tournaments : [];
         const summary = [
-          "# SwarmOS Organizational Status (v0.3.0)",
+          `# SwarmOS Organizational Status (v${SWARMOS_VERSION})`,
           "",
           board.project ? `**Project**: ${board.project.name} (${board.project.aestheticArchetype})
 **Vision**: ${board.project.vision}` : "_No active project charter. Run `/ship <spec>` to initialize._",
@@ -2094,36 +2596,683 @@ async function registerSwarmCommand(ctx, rootDir) {
   });
 }
 
+// src/host/session-state.ts
+var sessions = new Map;
+var MAX_TOUCHED = 50;
+function getSessionState(sessionID) {
+  const sid = sessionID ?? "default";
+  let state = sessions.get(sid);
+  if (!state) {
+    state = {
+      sessionID: sid,
+      startedAt: Date.now(),
+      toolCalls: 0,
+      toolFailures: 0,
+      breakerFires: 0,
+      turns: 0,
+      touchedFiles: [],
+      taint: [],
+      openIncidents: [],
+      injectedLessons: new Set
+    };
+    sessions.set(sid, state);
+  }
+  return state;
+}
+function listSessionStates() {
+  return Array.from(sessions.values());
+}
+function resetSessionStates() {
+  sessions.clear();
+}
+function touchFile(state, file) {
+  const idx = state.touchedFiles.indexOf(file);
+  if (idx >= 0)
+    state.touchedFiles.splice(idx, 1);
+  state.touchedFiles.push(file);
+  if (state.touchedFiles.length > MAX_TOUCHED)
+    state.touchedFiles.shift();
+}
+function eventTargetPath(event) {
+  const input = event?.input;
+  if (!input || typeof input !== "object")
+    return;
+  for (const key of ["path", "filePath", "file", "target"]) {
+    if (typeof input[key] === "string" && input[key])
+      return input[key];
+  }
+  return;
+}
+function isFailedEvent(event) {
+  return event?.status === "error";
+}
+
+// src/host/setup-report.ts
+import * as path10 from "path";
+
+// src/host/contract.ts
+var HOST_CONTRACT = [
+  {
+    id: "location.directory",
+    path: ["location", "directory"],
+    kind: "value",
+    required: false,
+    usedBy: "workspace root (falls back to process.cwd())",
+    evidence: ["directory"]
+  },
+  {
+    id: "agent.transform",
+    path: ["agent", "transform"],
+    kind: "function",
+    required: true,
+    usedBy: "10 SwarmOS agent roles",
+    evidence: ["transform", "permissions"]
+  },
+  {
+    id: "agent.get",
+    path: ["agent", "get"],
+    kind: "function",
+    required: false,
+    usedBy: "Muse overlay (skips agents with their own system prompt)",
+    evidence: ["agentID"]
+  },
+  {
+    id: "tool.transform",
+    path: ["tool", "transform"],
+    kind: "function",
+    required: true,
+    usedBy: "Code Mode namespaces (tools.org.*, tools.fs.*, tools.verify.*, ...)",
+    evidence: ["transform", "codemode", "pinned"]
+  },
+  {
+    id: "tool.hook",
+    path: ["tool", "hook"],
+    kind: "function",
+    required: true,
+    usedBy: "diagnostics, circuit breaker, transactions, taint tracking, telemetry",
+    hookNames: ["execute.before", "execute.after"],
+    evidence: ['"execute.after"', '"execute.before"']
+  },
+  {
+    id: "permission.hook",
+    path: ["permission", "hook"],
+    kind: "function",
+    required: true,
+    usedBy: "contract, ownership, shell, taint and budget guards",
+    hookNames: ["evaluate"],
+    evidence: ['"evaluate"']
+  },
+  {
+    id: "session.hook",
+    path: ["session", "hook"],
+    kind: "function",
+    required: true,
+    usedBy: "Muse overlay and the budgeted context injector",
+    hookNames: ["context", "generate"],
+    evidence: ['"context"', '"generate"']
+  },
+  {
+    id: "session.prompt",
+    path: ["session", "prompt"],
+    kind: "function",
+    required: false,
+    usedBy: "slash commands that post reports or kick off protocols",
+    evidence: ["delivery"]
+  },
+  {
+    id: "session.switchAgent",
+    path: ["session", "switchAgent"],
+    kind: "function",
+    required: false,
+    usedBy: "/ship, /gui, /research, /office",
+    evidence: ["switchAgent"]
+  },
+  {
+    id: "command.transform",
+    path: ["command", "transform"],
+    kind: "function",
+    required: true,
+    usedBy: "slash commands",
+    evidence: ["transform"]
+  },
+  {
+    id: "skill.transform",
+    path: ["skill", "transform"],
+    kind: "function",
+    required: false,
+    usedBy: "ui-craft skill",
+    evidence: ["transform"]
+  },
+  {
+    id: "experimental.terminal.read",
+    path: ["experimental", "terminal", "read"],
+    kind: "function",
+    required: false,
+    usedBy: "tools.pty.read_logs (falls back to log files)",
+    evidence: ["terminal"]
+  }
+];
+function getPath(obj, segments) {
+  let cur = obj;
+  for (const seg of segments) {
+    if (cur === null || cur === undefined)
+      return;
+    cur = cur[seg];
+  }
+  return cur;
+}
+function hasCapability(ctx, id) {
+  const cap = HOST_CONTRACT.find((c) => c.id === id);
+  if (!cap)
+    return false;
+  const value = getPath(ctx, cap.path);
+  return cap.kind === "function" ? typeof value === "function" : value !== undefined && value !== null;
+}
+function probeHost(ctx) {
+  return HOST_CONTRACT.map((cap) => ({
+    id: cap.id,
+    present: hasCapability(ctx, cap.id),
+    required: cap.required,
+    usedBy: cap.usedBy
+  }));
+}
+function missingRequired(probe) {
+  return probe.filter((p) => p.required && !p.present).map((p) => p.id);
+}
+
+// src/host/setup-report.ts
+var reports = new Map;
+function getSetupReport(rootDir) {
+  return reports.get(path10.resolve(rootDir));
+}
+function storeSetupReport(report) {
+  reports.set(path10.resolve(report.rootDir), report);
+}
+function newModuleReport(id) {
+  return { id, status: "registered", agents: [], namespaces: [], tools: [], hooks: [], commands: [], skills: [], runtimeErrors: [] };
+}
+var MAX_RUNTIME_ERRORS = 20;
+function guardHandler(rec, hookId, handler) {
+  if (typeof handler !== "function")
+    return handler;
+  return async (...args) => {
+    try {
+      return await handler(...args);
+    } catch (err) {
+      rec.runtimeErrors.push({ hook: hookId, message: String(err?.message ?? err).slice(0, 300), at: new Date().toISOString() });
+      if (rec.runtimeErrors.length > MAX_RUNTIME_ERRORS)
+        rec.runtimeErrors.shift();
+      return;
+    }
+  };
+}
+function wrapEditor(editor, domain, rec) {
+  if (!editor || typeof editor !== "object")
+    return editor;
+  return new Proxy(editor, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== "function")
+        return value;
+      return (...args) => {
+        const arg = args[0];
+        if (domain === "tool" && prop === "add" && arg?.name) {
+          const ns = arg.options?.namespace;
+          rec.tools.push(ns ? `${ns}.${arg.name}` : String(arg.name));
+        } else if (domain === "tool" && prop === "namespace" && arg?.name) {
+          rec.namespaces.push(String(arg.name));
+        } else if (domain === "command" && prop === "add" && arg?.name) {
+          rec.commands.push(String(arg.name));
+        } else if (domain === "agent" && prop === "update" && typeof arg === "string") {
+          rec.agents.push(arg);
+        } else if (domain === "skill" && prop === "add" && (arg?.id || arg?.name)) {
+          rec.skills.push(String(arg.id ?? arg.name));
+        }
+        return value.apply(target, args);
+      };
+    }
+  });
+}
+var INSTRUMENTED_DOMAINS = new Set(["agent", "tool", "command", "skill", "permission", "session"]);
+function instrumentHost(ctx, rec) {
+  return new Proxy(ctx, {
+    get(target, prop, receiver) {
+      const domainValue = Reflect.get(target, prop, receiver);
+      if (typeof prop !== "string" || !INSTRUMENTED_DOMAINS.has(prop) || !domainValue || typeof domainValue !== "object") {
+        return domainValue;
+      }
+      const domain = prop;
+      return new Proxy(domainValue, {
+        get(dTarget, dProp, dReceiver) {
+          const fn = Reflect.get(dTarget, dProp, dReceiver);
+          if (typeof fn !== "function")
+            return fn;
+          if (dProp === "transform") {
+            return (callback) => fn.call(dTarget, (editor, ...rest) => callback(wrapEditor(editor, domain, rec), ...rest));
+          }
+          if (dProp === "hook") {
+            return (hookName, handler, ...rest) => {
+              const hookId = `${domain}.${hookName}`;
+              rec.hooks.push(hookId);
+              return fn.call(dTarget, hookName, guardHandler(rec, hookId, handler), ...rest);
+            };
+          }
+          return fn.bind(dTarget);
+        }
+      });
+    }
+  });
+}
+function registeredSomething(rec) {
+  return rec.agents.length + rec.namespaces.length + rec.tools.length + rec.hooks.length + rec.commands.length + rec.skills.length > 0;
+}
+async function runSetupModules(ctx, modules, report) {
+  for (const mod of modules) {
+    const rec = newModuleReport(mod.id);
+    report.modules.push(rec);
+    const missing = mod.requires.filter((cap) => !hasCapability(ctx, cap));
+    if (missing.length > 0) {
+      rec.status = "skipped";
+      rec.detail = `host lacks ${missing.join(", ")}`;
+      continue;
+    }
+    try {
+      await mod.run(instrumentHost(ctx, rec));
+      if (!registeredSomething(rec)) {
+        rec.status = "skipped";
+        rec.detail = "module ran but registered nothing";
+      }
+    } catch (err) {
+      rec.status = "failed";
+      rec.detail = String(err?.message ?? err).slice(0, 300);
+    }
+  }
+}
+function formatDoctorReport(report, extras = []) {
+  if (!report)
+    return `# SwarmOS Doctor
+
+_SwarmOS setup has not run in this workspace._`;
+  const missingRequired = report.host.filter((h) => h.required && !h.present);
+  const lines = [
+    `# SwarmOS Doctor (v${report.version}, mode: ${report.mode})`,
+    "",
+    `Workspace: \`${report.rootDir}\` \xB7 setup at ${report.startedAt}`,
+    "",
+    missingRequired.length === 0 ? "**Host contract: OK.** Every required OpenCode V2 capability is present." : `**Host contract: BROKEN.** Missing required capabilities: ${missingRequired.map((m) => `\`${m.id}\``).join(", ")}. Modules depending on them are not active.`,
+    "",
+    "## Host capabilities",
+    "| Capability | Present | Required | Used by |",
+    "| :--- | :--- | :--- | :--- |",
+    ...report.host.map((h) => `| \`${h.id}\` | ${h.present ? "yes" : "**no**"} | ${h.required ? "yes" : "no"} | ${h.usedBy} |`),
+    "",
+    "## Modules",
+    "| Module | Status | Registered | Runtime errors |",
+    "| :--- | :--- | :--- | :--- |",
+    ...report.modules.map((m) => {
+      const parts = [
+        m.agents.length ? `${m.agents.length} agent(s)` : "",
+        m.tools.length ? `${m.tools.length} tool(s)` : "",
+        m.hooks.length ? `hooks: ${[...new Set(m.hooks)].join(", ")}` : "",
+        m.commands.length ? `commands: ${m.commands.map((c) => `/${c}`).join(", ")}` : "",
+        m.skills.length ? `skills: ${m.skills.join(", ")}` : ""
+      ].filter(Boolean);
+      const status = m.status === "registered" ? "registered" : `**${m.status}**${m.detail ? ` (${m.detail})` : ""}`;
+      return `| ${m.id} | ${status} | ${parts.join("; ") || "-"} | ${m.runtimeErrors.length} |`;
+    })
+  ];
+  const errored = report.modules.filter((m) => m.runtimeErrors.length > 0);
+  if (errored.length > 0) {
+    lines.push("", "## Recent hook errors");
+    for (const m of errored) {
+      for (const e of m.runtimeErrors.slice(-3)) {
+        lines.push(`- \`${m.id}\` ${e.hook} @ ${e.at}: ${e.message}`);
+      }
+    }
+  }
+  if (extras.length > 0)
+    lines.push("", ...extras);
+  return lines.join(`
+`);
+}
+
+// src/commands/doctor.ts
+function sessionLines() {
+  const states = listSessionStates();
+  if (states.length === 0)
+    return [];
+  return [
+    "## Live sessions",
+    "| Session | Agent | Turns | Tool calls | Failures | Breaker fires | Untrusted content | Task |",
+    "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ...states.map((s) => `| \`${s.sessionID}\` | ${s.agent ?? "-"} | ${s.turns} | ${s.toolCalls} | ${s.toolFailures} | ${s.breakerFires} | ${s.taint.length ? s.taint.map((t) => `${t.tool}`).join(", ") : "none"} | ${s.taskId ?? "-"} |`)
+  ];
+}
+function buildDoctorText(rootDir) {
+  return formatDoctorReport(getSetupReport(rootDir), sessionLines());
+}
+function registerDoctorTools(editor, rootDir) {
+  editor.namespace({
+    name: "swarmos",
+    description: "SwarmOS self-diagnostics: which host capabilities exist and which SwarmOS modules are active."
+  });
+  editor.add({
+    name: "doctor",
+    description: "Report which OpenCode V2 capabilities SwarmOS found, which modules registered or were skipped (and why), and hook errors caught at runtime.",
+    options: { namespace: "swarmos", codemode: true, pinned: false },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const report = getSetupReport(rootDir);
+      return { output: report ?? null, content: buildDoctorText(rootDir) };
+    }
+  });
+}
+async function registerDoctorCommand(ctx, rootDir) {
+  if (!ctx.command?.transform)
+    return;
+  await ctx.command.transform((editor) => {
+    editor.add({
+      name: "doctor",
+      description: "Show which SwarmOS modules are active in this OpenCode session and which host capabilities are missing",
+      execute: async (input) => {
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({ sessionID: input.sessionID, text: buildDoctorText(rootDir), delivery: "steer" });
+        }
+      }
+    });
+  });
+}
+
+// src/host/config.ts
+import * as fs9 from "fs/promises";
+import * as path11 from "path";
+var DEFAULT_PINNED_NAMESPACES = ["org", "fs", "repo", "verify", "artifacts"];
+var DEFAULT_CONFIG = {
+  mode: "full",
+  telemetry: true,
+  contextBudgetTokens: 6000,
+  pinnedNamespaces: DEFAULT_PINNED_NAMESPACES,
+  autoTransactions: true,
+  taintTracking: true
+};
+function getConfigPath(rootDir) {
+  return path11.join(rootDir, ".opencode", "swarmos.json");
+}
+function parseBool(value) {
+  if (value === undefined)
+    return;
+  if (/^(1|true|yes|on)$/i.test(value))
+    return true;
+  if (/^(0|false|no|off)$/i.test(value))
+    return false;
+  return;
+}
+async function loadConfig(rootDir, env = process.env) {
+  let fileConfig = {};
+  try {
+    const raw = await fs9.readFile(getConfigPath(rootDir), "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object")
+      fileConfig = parsed;
+  } catch {}
+  const config = { ...DEFAULT_CONFIG, ...fileConfig };
+  if (env.SWARMOS_MODE === "observe" || env.SWARMOS_MODE === "full")
+    config.mode = env.SWARMOS_MODE;
+  const telemetry = parseBool(env.SWARMOS_TELEMETRY);
+  if (telemetry !== undefined)
+    config.telemetry = telemetry;
+  const budget = Number(env.SWARMOS_CONTEXT_BUDGET);
+  if (Number.isFinite(budget) && budget > 0)
+    config.contextBudgetTokens = budget;
+  if (env.SWARMOS_PINNED) {
+    config.pinnedNamespaces = env.SWARMOS_PINNED.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  const tx = parseBool(env.SWARMOS_AUTO_TRANSACTIONS);
+  if (tx !== undefined)
+    config.autoTransactions = tx;
+  const taint = parseBool(env.SWARMOS_TAINT_TRACKING);
+  if (taint !== undefined)
+    config.taintTracking = taint;
+  if (config.mode !== "full" && config.mode !== "observe")
+    config.mode = "full";
+  if (!Array.isArray(config.pinnedNamespaces))
+    config.pinnedNamespaces = DEFAULT_PINNED_NAMESPACES;
+  return config;
+}
+
+// src/host/telemetry.ts
+import { execFile as execFile2 } from "child_process";
+import * as fs10 from "fs/promises";
+import * as path12 from "path";
+import { promisify as promisify2 } from "util";
+var execFileAsync2 = promisify2(execFile2);
+function getTelemetryDir(rootDir) {
+  return path12.join(rootDir, ".opencode", "telemetry");
+}
+function safeSessionFile(sessionID) {
+  return `${sessionID.replace(/[^A-Za-z0-9_.-]/g, "_") || "default"}.jsonl`;
+}
+var writeQueues = new Map;
+async function appendTelemetry(rootDir, record) {
+  const file = path12.join(getTelemetryDir(rootDir), safeSessionFile(record.sessionID));
+  const previous = writeQueues.get(file) ?? Promise.resolve();
+  const next = previous.then(async () => {
+    await fs10.mkdir(path12.dirname(file), { recursive: true });
+    await fs10.appendFile(file, `${JSON.stringify(record)}
+`, "utf8");
+  });
+  writeQueues.set(file, next.catch(() => {}));
+  await next;
+}
+async function gitHead(rootDir) {
+  try {
+    const { stdout } = await execFileAsync2("git", ["rev-parse", "HEAD"], { cwd: rootDir, timeout: 3000 });
+    return stdout.trim() || undefined;
+  } catch {
+    return;
+  }
+}
+function extractUsage(event) {
+  const u = event?.usage ?? event?.tokens ?? event?.result?.usage;
+  if (!u || typeof u !== "object")
+    return;
+  const input = Number(u.input ?? u.inputTokens ?? u.prompt_tokens);
+  const output = Number(u.output ?? u.outputTokens ?? u.completion_tokens);
+  const cacheRead = Number(u.cacheRead ?? u.cache?.read ?? u.cache_read_input_tokens);
+  const usage = {};
+  if (Number.isFinite(input))
+    usage.input = input;
+  if (Number.isFinite(output))
+    usage.output = output;
+  if (Number.isFinite(cacheRead))
+    usage.cacheRead = cacheRead;
+  return Object.keys(usage).length ? usage : undefined;
+}
+function lastUserText(event) {
+  const messages = event?.messages;
+  if (!Array.isArray(messages))
+    return;
+  for (let i = messages.length - 1;i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== "user")
+      continue;
+    if (typeof m.content === "string")
+      return m.content;
+    if (Array.isArray(m.content)) {
+      const text = m.content.map((p) => typeof p?.text === "string" ? p.text : "").join("");
+      if (text)
+        return text;
+    }
+    if (typeof m.text === "string")
+      return m.text;
+  }
+  return;
+}
+var startedSessions = new Set;
+async function ensureSessionStart(rootDir, sessionID, agent, prompt) {
+  if (startedSessions.has(sessionID))
+    return;
+  startedSessions.add(sessionID);
+  await appendTelemetry(rootDir, {
+    t: new Date().toISOString(),
+    kind: "session_start",
+    sessionID,
+    agent,
+    gitHead: await gitHead(rootDir),
+    prompt: prompt?.slice(0, 4000)
+  });
+}
+function trackToolEvent(event) {
+  const state = getSessionState(event?.sessionID);
+  if (event?.agent)
+    state.agent = event.agent;
+  state.toolCalls++;
+  if (isFailedEvent(event))
+    state.toolFailures++;
+  const target = eventTargetPath(event);
+  if (target)
+    touchFile(state, target);
+  const text = typeof event?.result?.content === "string" ? event.result.content : Array.isArray(event?.result?.content) ? event.result.content.map((p) => p?.text ?? "").join("") : String(event?.error?.message ?? "");
+  const breaker = text.includes("DOOM-LOOP CIRCUIT BREAKER");
+  if (breaker)
+    state.breakerFires++;
+  return { breaker };
+}
+async function registerTelemetryHooks(ctx, rootDir, writeFiles) {
+  if (ctx.tool?.hook) {
+    await ctx.tool.hook("execute.after", async (event) => {
+      const sessionID = event?.sessionID ?? "default";
+      const { breaker } = trackToolEvent(event);
+      if (!writeFiles)
+        return;
+      await ensureSessionStart(rootDir, sessionID, event?.agent);
+      await appendTelemetry(rootDir, {
+        t: new Date().toISOString(),
+        kind: "tool",
+        sessionID,
+        agent: event?.agent,
+        tool: event?.tool,
+        status: event?.status,
+        target: eventTargetPath(event) ?? (typeof event?.input?.command === "string" ? event.input.command.slice(0, 120) : undefined),
+        error: isFailedEvent(event) ? String(event?.error?.message ?? event?.error ?? "").slice(0, 300) : undefined,
+        breaker: breaker || undefined
+      });
+    });
+  }
+  if (ctx.session?.hook) {
+    await ctx.session.hook("generate", async (event) => {
+      if (event?.agent === "compaction" || event?.kind === "compaction")
+        return;
+      const sessionID = event?.sessionID ?? "default";
+      const state = getSessionState(sessionID);
+      state.turns++;
+      if (event?.agent)
+        state.agent = event.agent;
+      if (!writeFiles)
+        return;
+      await ensureSessionStart(rootDir, sessionID, event?.agent, lastUserText(event));
+      await appendTelemetry(rootDir, {
+        t: new Date().toISOString(),
+        kind: "turn",
+        sessionID,
+        agent: event?.agent,
+        usage: extractUsage(event)
+      });
+    });
+  }
+}
+function summarizeTelemetry(records) {
+  const start = records.find((r) => r.kind === "session_start");
+  let input = 0;
+  let output = 0;
+  let cacheRead = 0;
+  let sawUsage = false;
+  const summary = {
+    sessionID: records[0]?.sessionID ?? "unknown",
+    turns: 0,
+    toolCalls: 0,
+    toolFailures: 0,
+    breakerFires: 0,
+    tokens: null,
+    cacheHitRatio: null,
+    gitHead: start?.gitHead,
+    prompt: start?.prompt
+  };
+  for (const r of records) {
+    if (r.kind === "turn") {
+      summary.turns++;
+      if (r.usage) {
+        sawUsage = true;
+        input += r.usage.input ?? 0;
+        output += r.usage.output ?? 0;
+        cacheRead += r.usage.cacheRead ?? 0;
+      }
+    } else if (r.kind === "tool") {
+      summary.toolCalls++;
+      if (r.status === "error")
+        summary.toolFailures++;
+      if (r.breaker)
+        summary.breakerFires++;
+    }
+  }
+  if (sawUsage) {
+    summary.tokens = { input, output, cacheRead };
+    summary.cacheHitRatio = input + cacheRead > 0 ? +(cacheRead / (input + cacheRead)).toFixed(4) : null;
+  }
+  return summary;
+}
+async function readTelemetryFile(file) {
+  const raw = await fs10.readFile(file, "utf8");
+  return raw.split(`
+`).filter((l) => l.trim()).flatMap((l) => {
+    try {
+      return [JSON.parse(l)];
+    } catch {
+      return [];
+    }
+  });
+}
+async function listTelemetryFiles(rootDir) {
+  try {
+    const dir = getTelemetryDir(rootDir);
+    const entries = await fs10.readdir(dir);
+    return entries.filter((e) => e.endsWith(".jsonl")).map((e) => path12.join(dir, e));
+  } catch {
+    return [];
+  }
+}
+
 // src/diagnostics/runner.ts
-import { execFile } from "child_process";
-import * as path9 from "path";
-import { promisify } from "util";
-var execFileAsync = promisify(execFile);
+import { execFile as execFile3 } from "child_process";
+import * as path13 from "path";
+import { promisify as promisify3 } from "util";
+var execFileAsync3 = promisify3(execFile3);
 async function runQuickDiagnostics(rootDir, filePath, options = {}) {
-  const abs = path9.resolve(rootDir, filePath);
-  const ext = path9.extname(abs).toLowerCase();
+  const abs = path13.resolve(rootDir, filePath);
+  const ext = path13.extname(abs).toLowerCase();
   const timeout = options.timeoutMs ?? 6000;
   const maxLines = options.maxLines ?? 30;
   try {
     if (ext === ".py") {
-      await execFileAsync("python3", ["-m", "py_compile", abs], { cwd: rootDir, timeout });
+      await execFileAsync3("python3", ["-m", "py_compile", abs], { cwd: rootDir, timeout });
       return;
     }
     if (ext === ".rs") {
-      await execFileAsync("cargo", ["check", "--message-format=short", "--quiet"], { cwd: rootDir, timeout: 12000 });
+      await execFileAsync3("cargo", ["check", "--message-format=short", "--quiet"], { cwd: rootDir, timeout: 12000 });
       return;
     }
     if (ext === ".go") {
-      await execFileAsync("go", ["vet", abs], { cwd: rootDir, timeout: 8000 });
+      await execFileAsync3("go", ["vet", abs], { cwd: rootDir, timeout: 8000 });
       return;
     }
     if ([".js", ".cjs", ".mjs"].includes(ext)) {
-      await execFileAsync("node", ["--check", abs], { cwd: rootDir, timeout });
+      await execFileAsync3("node", ["--check", abs], { cwd: rootDir, timeout });
       return;
     }
     if ([".ts", ".tsx", ".jsx"].includes(ext)) {
       try {
-        await execFileAsync("oxlint", ["--quiet", abs], { cwd: rootDir, timeout });
+        await execFileAsync3("oxlint", ["--quiet", abs], { cwd: rootDir, timeout });
         return;
       } catch (oxErr) {
         if (oxErr?.code !== "ENOENT") {
@@ -2344,11 +3493,11 @@ async function registerCircuitBreakerHook(ctx) {
 }
 
 // src/omni/gui-studio.ts
-import { execFile as execFile2 } from "child_process";
-import * as fs8 from "fs/promises";
-import * as path10 from "path";
-import { promisify as promisify2 } from "util";
-var execFileAsync2 = promisify2(execFile2);
+import { execFile as execFile4 } from "child_process";
+import * as fs11 from "fs/promises";
+import * as path14 from "path";
+import { promisify as promisify4 } from "util";
+var execFileAsync4 = promisify4(execFile4);
 var VISUAL_QUALITY_CHECKLIST = {
   macroBalance: [
     "Balanced vertical & horizontal visual weight across the viewport (not top-heavy or clipped).",
@@ -2370,12 +3519,12 @@ var VISUAL_QUALITY_CHECKLIST = {
   ]
 };
 async function captureDesktopWindow(rootDir, outputName = "desktop_gui_preview.png") {
-  const previewDir = path10.join(rootDir, ".opencode", "artifacts", "previews");
-  await fs8.mkdir(previewDir, { recursive: true });
-  const outPath = path10.join(previewDir, path10.basename(outputName));
+  const previewDir = path14.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs11.mkdir(previewDir, { recursive: true });
+  const outPath = path14.join(previewDir, path14.basename(outputName));
   const platform = process.platform;
   if (platform === "darwin") {
-    await execFileAsync2("screencapture", ["-x", outPath], { cwd: rootDir, timeout: 1e4 });
+    await execFileAsync4("screencapture", ["-x", outPath], { cwd: rootDir, timeout: 1e4 });
     return { path: outPath, method: "macos-screencapture" };
   }
   const commands = [
@@ -2385,7 +3534,7 @@ async function captureDesktopWindow(rootDir, outputName = "desktop_gui_preview.p
   ];
   for (const cmd of commands) {
     try {
-      await execFileAsync2(cmd.bin, cmd.args, { cwd: rootDir, timeout: 1e4 });
+      await execFileAsync4(cmd.bin, cmd.args, { cwd: rootDir, timeout: 1e4 });
       return { path: outPath, method: cmd.method };
     } catch {}
   }
@@ -2429,8 +3578,8 @@ function registerGuiStudioTools(editor, rootDir) {
 }
 
 // src/omni/hashline.ts
-import * as fs9 from "fs/promises";
-import * as path11 from "path";
+import * as fs12 from "fs/promises";
+import * as path15 from "path";
 function computeLineHash(line) {
   const trimmed = line.trim();
   if (trimmed.length === 0)
@@ -2443,8 +3592,8 @@ function computeLineHash(line) {
   return (hash >>> 0 & 255).toString(16).padStart(2, "0");
 }
 async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
-  const abs = path11.resolve(rootDir, targetPath);
-  const raw = await fs9.readFile(abs, "utf8");
+  const abs = path15.resolve(rootDir, targetPath);
+  const raw = await fs12.readFile(abs, "utf8");
   const lines = raw.replace(/\r\n/g, `
 `).split(`
 `);
@@ -2465,8 +3614,8 @@ async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
   };
 }
 async function hashEditFile(rootDir, targetPath, hunks) {
-  const abs = path11.resolve(rootDir, targetPath);
-  const raw = await fs9.readFile(abs, "utf8");
+  const abs = path15.resolve(rootDir, targetPath);
+  const raw = await fs12.readFile(abs, "utf8");
   const hasCrlf = raw.includes(`\r
 `);
   const lines = raw.replace(/\r\n/g, `
@@ -2521,7 +3670,7 @@ async function hashEditFile(rootDir, targetPath, hunks) {
   const outputText = lines.join(hasCrlf ? `\r
 ` : `
 `);
-  await fs9.writeFile(abs, outputText, "utf8");
+  await fs12.writeFile(abs, outputText, "utf8");
   const diagnostics = await runQuickDiagnostics(rootDir, targetPath);
   return {
     path: targetPath,
@@ -2585,11 +3734,11 @@ function registerHashlineTools(editor, rootDir) {
 }
 
 // src/omni/office.ts
-import { execFile as execFile3 } from "child_process";
-import * as fs10 from "fs/promises";
-import * as path12 from "path";
-import { promisify as promisify3 } from "util";
-var execFileAsync3 = promisify3(execFile3);
+import { execFile as execFile5 } from "child_process";
+import * as fs13 from "fs/promises";
+import * as path16 from "path";
+import { promisify as promisify5 } from "util";
+var execFileAsync5 = promisify5(execFile5);
 var SUPPORTED_OFFICE_EXTENSIONS = new Set([
   ".docx",
   ".xlsx",
@@ -2695,28 +3844,28 @@ elif ext in (".sqlite", ".sqlite3", ".db"):
     print(NL.join(out))
 `;
 async function extractOfficeOrDataFile(rootDir, targetPath) {
-  const abs = path12.resolve(rootDir, targetPath);
-  const ext = path12.extname(abs).toLowerCase();
+  const abs = path16.resolve(rootDir, targetPath);
+  const ext = path16.extname(abs).toLowerCase();
   if (!SUPPORTED_OFFICE_EXTENSIONS.has(ext))
     return;
-  const { stdout } = await execFileAsync3("python3", ["-c", PYTHON_UNIVERSAL_EXTRACTOR, abs], {
+  const { stdout } = await execFileAsync5("python3", ["-c", PYTHON_UNIVERSAL_EXTRACTOR, abs], {
     cwd: rootDir,
     timeout: 15000
   });
   return stdout.trim();
 }
 async function renderDocumentPreviews(rootDir, targetPath) {
-  const abs = path12.resolve(rootDir, targetPath);
-  const ext = path12.extname(abs).toLowerCase();
-  const previewDir = path12.join(rootDir, ".opencode", "artifacts", "previews");
-  await fs10.mkdir(previewDir, { recursive: true });
+  const abs = path16.resolve(rootDir, targetPath);
+  const ext = path16.extname(abs).toLowerCase();
+  const previewDir = path16.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs13.mkdir(previewDir, { recursive: true });
   let pdfPath = abs;
   if ([".docx", ".pptx", ".xlsx"].includes(ext)) {
-    await execFileAsync3("libreoffice", ["--headless", "--nologo", "--nolockcheck", "--norestore", "--convert-to", "pdf", "--outdir", previewDir, abs], { cwd: rootDir, timeout: 30000 });
-    const stem = path12.basename(abs, ext);
-    pdfPath = path12.join(previewDir, `${stem}.pdf`);
+    await execFileAsync5("libreoffice", ["--headless", "--nologo", "--nolockcheck", "--norestore", "--convert-to", "pdf", "--outdir", previewDir, abs], { cwd: rootDir, timeout: 30000 });
+    const stem = path16.basename(abs, ext);
+    pdfPath = path16.join(previewDir, `${stem}.pdf`);
   }
-  const stem = path12.basename(pdfPath, ".pdf");
+  const stem = path16.basename(pdfPath, ".pdf");
   const pyRender = `
 import sys, os, json, pypdfium2 as pdfium
 pdf_path, out_dir, stem = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -2729,7 +3878,7 @@ for i, page in enumerate(pdf, start=1):
 pdf.close()
 print(json.dumps(paths))
 `;
-  const { stdout } = await execFileAsync3("python3", ["-c", pyRender, pdfPath, previewDir, stem], {
+  const { stdout } = await execFileAsync5("python3", ["-c", pyRender, pdfPath, previewDir, stem], {
     cwd: rootDir,
     timeout: 20000
   });
@@ -2792,7 +3941,7 @@ ${res.previewPngs.join(`
         const origExecute = tool.execute;
         tool.execute = async (input, context) => {
           if (typeof input?.path === "string") {
-            const ext = path12.extname(input.path).toLowerCase();
+            const ext = path16.extname(input.path).toLowerCase();
             if ([".docx", ".xlsx", ".xls", ".pptx", ".sqlite", ".sqlite3", ".db"].includes(ext)) {
               const extracted = await extractOfficeOrDataFile(rootDir, input.path);
               if (extracted !== undefined) {
@@ -2811,8 +3960,8 @@ ${res.previewPngs.join(`
 }
 
 // src/omni/pty-tap.ts
-import * as fs11 from "fs/promises";
-import * as path13 from "path";
+import * as fs14 from "fs/promises";
+import * as path17 from "path";
 var ERROR_LINE_RE = /\b(?:error|exception|fatal|panic|uncaught|failed|syntaxerror|typeerror|referenceerror|enoent|eaddrinuse)\b/i;
 async function readDevServerLogs(ctx, rootDir, input = {}) {
   const maxLines = Math.min(Math.max(input.lines ?? 80, 10), 500);
@@ -2827,14 +3976,14 @@ async function readDevServerLogs(ctx, rootDir, input = {}) {
   }
   if (!rawText) {
     const candidateFiles = [
-      ...input.logFile ? [path13.resolve(rootDir, input.logFile)] : [],
-      path13.join(rootDir, ".opencode", "artifacts", "devserver.log"),
-      path13.join(rootDir, "dev.log")
+      ...input.logFile ? [path17.resolve(rootDir, input.logFile)] : [],
+      path17.join(rootDir, ".opencode", "artifacts", "devserver.log"),
+      path17.join(rootDir, "dev.log")
     ];
     for (const file of candidateFiles) {
       try {
-        rawText = await fs11.readFile(file, "utf8");
-        source = path13.relative(rootDir, file).split(path13.sep).join("/");
+        rawText = await fs14.readFile(file, "utf8");
+        source = path17.relative(rootDir, file).split(path17.sep).join("/");
         break;
       } catch {}
     }
@@ -2881,8 +4030,8 @@ function registerPtyTapTools(editor, ctx, rootDir) {
 }
 
 // src/skills/ui-craft/skill.ts
-import * as fs12 from "fs/promises";
-import * as path14 from "path";
+import * as fs15 from "fs/promises";
+import * as path18 from "path";
 var UI_CRAFT_SKILL_ID = "ui-craft";
 var UI_CRAFT_SKILL_NAME = "UI Craft & Spatial Architecture";
 var EMBEDDED_UI_CRAFT_SKILL_MD = `---
@@ -2995,9 +4144,9 @@ Before handing off any UI milestone:
    - \`row-baseline-jitter\`: Align sibling card and button top edges to exact pixels.`;
 async function loadSkillContent(fallbackDir) {
   const targetDir = fallbackDir ?? process.cwd();
-  const candidate = path14.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
+  const candidate = path18.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
   try {
-    return await fs12.readFile(candidate, "utf8");
+    return await fs15.readFile(candidate, "utf8");
   } catch {
     return EMBEDDED_UI_CRAFT_SKILL_MD;
   }
@@ -3006,7 +4155,7 @@ async function registerUICraftSkill(ctx, rootDir) {
   if (!ctx.skill?.transform)
     return;
   const content = await loadSkillContent(rootDir);
-  const absoluteSkillPath = path14.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
+  const absoluteSkillPath = path18.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
   await ctx.skill.transform((editor) => {
     editor.add({
       id: UI_CRAFT_SKILL_ID,
@@ -3021,42 +4170,81 @@ async function registerUICraftSkill(ctx, rootDir) {
 
 // src/index.ts
 var SWARMOS_PLUGIN_ID = "heretek.swarmos";
+function buildSetupModules(rootDir, config) {
+  const observe = [
+    {
+      id: "telemetry",
+      requires: ["tool.hook"],
+      run: (c) => registerTelemetryHooks(c, rootDir, config.telemetry)
+    },
+    {
+      id: "doctor",
+      requires: ["tool.transform", "command.transform"],
+      run: async (c) => {
+        await c.tool.transform((editor) => registerDoctorTools(editor, rootDir));
+        await registerDoctorCommand(c, rootDir);
+      }
+    }
+  ];
+  if (config.mode === "observe")
+    return observe;
+  return [
+    { id: "agents", requires: ["agent.transform"], run: (c) => c.agent.transform((editor) => registerSwarmOSAgents(editor)) },
+    {
+      id: "codemode-tools",
+      requires: ["tool.transform"],
+      run: (c) => c.tool.transform((editor) => {
+        registerOrgTools(editor, rootDir);
+        registerUITools(editor);
+        registerFSTools(editor, rootDir);
+        registerHashlineTools(editor, rootDir);
+        registerArtifactTools(editor, rootDir);
+        registerOfficeTools(editor, rootDir);
+        registerResearchTools(editor, rootDir);
+        registerGuiStudioTools(editor, rootDir);
+        registerRepoMapTools(editor, rootDir);
+        registerCheckpointTools(editor, rootDir);
+        registerMemoryTools(editor, rootDir);
+        registerPtyTapTools(editor, c, rootDir);
+        registerVerifyTools(editor, rootDir);
+      })
+    },
+    { id: "permission-guard", requires: ["permission.hook"], run: (c) => registerPermissionGuard(c, rootDir) },
+    { id: "diagnostics", requires: ["tool.hook"], run: (c) => registerDiagnosticHook(c, rootDir) },
+    { id: "circuit-breaker", requires: ["tool.hook"], run: (c) => registerCircuitBreakerHook(c) },
+    { id: "ui-craft-skill", requires: ["skill.transform"], run: (c) => registerUICraftSkill(c, rootDir) },
+    { id: "muse-overlay", requires: ["session.hook"], run: (c) => registerMuseOverlay(c) },
+    { id: "artifact-context", requires: ["session.hook"], run: (c) => registerArtifactContextHook(c, rootDir) },
+    { id: "memory-context", requires: ["session.hook"], run: (c) => registerMemoryContextHook(c, rootDir) },
+    {
+      id: "commands",
+      requires: ["command.transform"],
+      run: async (c) => {
+        await registerShipCommand(c);
+        await registerSwarmCommand(c, rootDir);
+        await registerOmniCommands(c, rootDir);
+      }
+    },
+    ...observe
+  ];
+}
 async function setup(ctx) {
   const rootDir = ctx.location?.directory ?? process.cwd();
-  if (ctx.agent?.transform) {
-    await ctx.agent.transform((editor) => {
-      registerSwarmOSAgents(editor);
-    });
-  }
-  if (ctx.tool?.transform) {
-    await ctx.tool.transform((editor) => {
-      registerOrgTools(editor, rootDir);
-      registerUITools(editor);
-      registerFSTools(editor, rootDir);
-      registerHashlineTools(editor, rootDir);
-      registerArtifactTools(editor, rootDir);
-      registerOfficeTools(editor, rootDir);
-      registerResearchTools(editor, rootDir);
-      registerGuiStudioTools(editor, rootDir);
-      registerRepoMapTools(editor, rootDir);
-      registerCheckpointTools(editor, rootDir);
-      registerMemoryTools(editor, rootDir);
-      registerPtyTapTools(editor, ctx, rootDir);
-    });
-  }
-  await registerPermissionGuard(ctx, rootDir);
-  await registerDiagnosticHook(ctx, rootDir);
-  await registerCircuitBreakerHook(ctx);
-  await registerUICraftSkill(ctx, rootDir);
-  await registerMuseOverlay(ctx);
-  await registerArtifactContextHook(ctx, rootDir);
-  await registerMemoryContextHook(ctx, rootDir);
-  await registerShipCommand(ctx);
-  await registerSwarmCommand(ctx, rootDir);
-  await registerOmniCommands(ctx, rootDir);
+  const config = await loadConfig(rootDir);
+  const report = {
+    version: SWARMOS_VERSION,
+    mode: config.mode,
+    rootDir,
+    startedAt: new Date().toISOString(),
+    host: probeHost(ctx),
+    modules: []
+  };
+  storeSetupReport(report);
+  await runSetupModules(ctx, buildSetupModules(rootDir, config), report);
+  return report;
 }
 var SwarmOSPlugin = Object.assign(async function SwarmOSPlugin(ctx) {
-  return setup(ctx);
+  await setup(ctx);
 }, {
   id: SWARMOS_PLUGIN_ID,
   setup
@@ -3065,8 +4253,10 @@ var src_default = SwarmOSPlugin;
 var plugin = SwarmOSPlugin;
 export {
   BOARD_VERSION,
+  DEFAULT_CONFIG,
   DOM_GEOMETRY_AUDIT_SCRIPT,
   EMBEDDED_UI_CRAFT_SKILL_MD,
+  HOST_CONTRACT,
   MUSE_SOTA_BASE_PROMPT,
   PROMPT_ARCHITECT,
   PROMPT_DIRECTOR,
@@ -3082,45 +4272,72 @@ export {
   SUPPORTED_OFFICE_EXTENSIONS,
   SWARMOS_PLUGIN_ID,
   SWARMOS_ROLES,
+  SWARMOS_VERSION,
   SwarmOSPlugin,
   UI_CRAFT_SKILL_ID,
   UI_CRAFT_SKILL_NAME,
   VISUAL_QUALITY_CHECKLIST,
   analyzeBlastRadius,
+  appendTelemetry,
   auditMarkdownCitations,
+  buildDoctorText,
   buildRepoMap,
+  buildSetupModules,
   captureDesktopWindow,
   computeLineHash,
+  computeTreeFingerprint,
   createCheckpoint,
   createEmptyBoard,
   createTask,
   src_default as default,
+  discoverChecks,
   evaluateBoardGuard,
   evaluatePermissionGuard,
+  extractFailures,
   extractMutatedPaths,
   extractOfficeOrDataFile,
   extractOutline,
+  formatDoctorReport,
+  formatVerifyRun,
   getArtifactsDir,
   getBoardPath,
   getCheckpointsDir,
+  getConfigPath,
   getMemoryFilePath,
   getResearchLedgerPath,
+  getSessionState,
+  getSetupReport,
+  getTelemetryDir,
+  getVerifyDir,
+  hasCapability,
   hashEditFile,
   hashReadFile,
   initProject,
+  instrumentHost,
+  isTestFile,
   listArtifacts,
+  listChangedFiles,
   listCheckpoints,
+  listSessionStates,
+  listTelemetryFiles,
   loadBoard,
+  loadConfig,
+  loadLatestVerifyRun,
   loadLessons,
   loadResearchSources,
   loadSkillContent,
+  loadVerifyRun,
   lockContract,
   matchesPathPattern,
+  missingRequired,
   normalizeResourcePath,
+  parseCounts,
   planTournament,
   plugin,
+  probeHost,
   readArtifact,
   readDevServerLogs,
+  readTelemetryFile,
   recordAndEvaluateCircuitBreaker,
   recordLesson,
   recordResearchSource,
@@ -3128,6 +4345,8 @@ export {
   registerArtifactTools,
   registerCheckpointTools,
   registerCircuitBreakerHook,
+  registerDoctorCommand,
+  registerDoctorTools,
   registerGuiStudioTools,
   registerHashlineTools,
   registerMemoryContextHook,
@@ -3139,14 +4358,23 @@ export {
   registerPtyTapTools,
   registerRepoMapTools,
   registerResearchTools,
+  registerTelemetryHooks,
+  registerVerifyTools,
   renderDocumentPreviews,
   resetCircuitBreaker,
+  resetSessionStates,
   resolveTournament,
   rollbackCheckpoint,
   runQuickDiagnostics,
+  runSetupModules,
+  runVerify,
   saveBoard,
   setup,
+  storeSetupReport,
+  stripAnsi,
   submitQAReceipt,
+  summarizeTelemetry,
+  taskWorkdir,
   updateTaskStatus,
   verifyReleaseReady,
   withBoardLock,

@@ -32,12 +32,14 @@ import {
   resolveTournament,
   saveBoard,
   submitQAReceipt,
+  taskWorkdir,
   updateTaskStatus,
   verifyReleaseReady,
   withBoardLock,
 } from "./board/board.js"
 import type {
   AestheticArchetype,
+  BoardPolicy,
   Contract,
   CreateTaskInput,
   InitProjectInput,
@@ -60,6 +62,52 @@ import { registerUITools } from "./codemode/ui-tools.js"
 import { registerOmniCommands } from "./commands/omni.js"
 import { registerShipCommand } from "./commands/ship.js"
 import { registerSwarmCommand } from "./commands/swarm.js"
+import { buildDoctorText, registerDoctorCommand, registerDoctorTools } from "./commands/doctor.js"
+import { DEFAULT_CONFIG, getConfigPath, loadConfig, type SwarmOSConfig, type SwarmOSMode } from "./host/config.js"
+import { HOST_CONTRACT, hasCapability, missingRequired, probeHost, type HostCapability, type HostProbeResult } from "./host/contract.js"
+import {
+  formatDoctorReport,
+  getSetupReport,
+  instrumentHost,
+  runSetupModules,
+  storeSetupReport,
+  type ModuleReport,
+  type SetupModule,
+  type SetupReport,
+} from "./host/setup-report.js"
+import { getSessionState, listSessionStates, resetSessionStates, type SessionState } from "./host/session-state.js"
+import {
+  appendTelemetry,
+  getTelemetryDir,
+  listTelemetryFiles,
+  readTelemetryFile,
+  registerTelemetryHooks,
+  summarizeTelemetry,
+  type TelemetryRecord,
+  type TelemetrySummary,
+} from "./host/telemetry.js"
+import { SWARMOS_VERSION } from "./version.js"
+import {
+  computeTreeFingerprint,
+  discoverChecks,
+  extractFailures,
+  formatVerifyRun,
+  getVerifyDir,
+  isTestFile,
+  listChangedFiles,
+  loadLatestVerifyRun,
+  loadVerifyRun,
+  parseCounts,
+  registerVerifyTools,
+  runVerify,
+  stripAnsi,
+  type VerifyCheck,
+  type VerifyCheckResult,
+  type VerifyFailure,
+  type VerifyKind,
+  type VerifyRun,
+  type VerifyRunInput,
+} from "./omni/verify.js"
 import { extractMutatedPaths, registerDiagnosticHook, runQuickDiagnostics } from "./diagnostics/runner.js"
 import { DOM_GEOMETRY_AUDIT_SCRIPT, type DOMAuditResult, type DOMDefect } from "./geometry/audit-script.js"
 import { STANDARD_VIEWPORTS, type ViewportDefinition } from "./geometry/viewports.js"
@@ -256,9 +304,69 @@ export {
   EMBEDDED_UI_CRAFT_SKILL_MD,
   loadSkillContent,
   registerOmniCommands,
+
+  // v0.6.0: Host contract, /doctor, config & telemetry
+  SWARMOS_VERSION,
+  HOST_CONTRACT,
+  hasCapability,
+  probeHost,
+  missingRequired,
+  instrumentHost,
+  runSetupModules,
+  storeSetupReport,
+  getSetupReport,
+  formatDoctorReport,
+  buildDoctorText,
+  registerDoctorTools,
+  registerDoctorCommand,
+  DEFAULT_CONFIG,
+  getConfigPath,
+  loadConfig,
+  getSessionState,
+  listSessionStates,
+  resetSessionStates,
+  appendTelemetry,
+  getTelemetryDir,
+  listTelemetryFiles,
+  readTelemetryFile,
+  registerTelemetryHooks,
+  summarizeTelemetry,
+
+  // v0.6.0: tools.verify
+  discoverChecks,
+  runVerify,
+  loadVerifyRun,
+  loadLatestVerifyRun,
+  formatVerifyRun,
+  computeTreeFingerprint,
+  listChangedFiles,
+  extractFailures,
+  parseCounts,
+  stripAnsi,
+  isTestFile,
+  getVerifyDir,
+  registerVerifyTools,
+  taskWorkdir,
 }
 
 export type {
+  SwarmOSConfig,
+  SwarmOSMode,
+  HostCapability,
+  HostProbeResult,
+  ModuleReport,
+  SetupModule,
+  SetupReport,
+  SessionState,
+  TelemetryRecord,
+  TelemetrySummary,
+  VerifyCheck,
+  VerifyCheckResult,
+  VerifyFailure,
+  VerifyKind,
+  VerifyRun,
+  VerifyRunInput,
+  BoardPolicy,
   AestheticArchetype,
   OrgBoard,
   ProjectCharter,
@@ -299,66 +407,98 @@ export type {
 export const SWARMOS_PLUGIN_ID = "heretek.swarmos"
 
 /**
- * OpenCode SwarmOS Omni-Harness Plugin Setup Function (v0.5.0).
+ * Builds the ordered list of SwarmOS setup modules. Each module declares the host
+ * capabilities it needs so `/doctor` can explain exactly why it is or is not active.
  */
-export async function setup(ctx: any): Promise<void> {
+export function buildSetupModules(rootDir: string, config: SwarmOSConfig): SetupModule[] {
+  const observe: SetupModule[] = [
+    {
+      id: "telemetry",
+      requires: ["tool.hook"],
+      run: (c) => registerTelemetryHooks(c, rootDir, config.telemetry),
+    },
+    {
+      id: "doctor",
+      requires: ["tool.transform", "command.transform"],
+      run: async (c) => {
+        await c.tool.transform((editor: any) => registerDoctorTools(editor, rootDir))
+        await registerDoctorCommand(c, rootDir)
+      },
+    },
+  ]
+  if (config.mode === "observe") return observe
+
+  return [
+    { id: "agents", requires: ["agent.transform"], run: (c) => c.agent.transform((editor: any) => registerSwarmOSAgents(editor)) },
+    {
+      id: "codemode-tools",
+      requires: ["tool.transform"],
+      run: (c) =>
+        c.tool.transform((editor: any) => {
+          registerOrgTools(editor, rootDir)
+          registerUITools(editor)
+          registerFSTools(editor, rootDir)
+          registerHashlineTools(editor, rootDir)
+          registerArtifactTools(editor, rootDir)
+          registerOfficeTools(editor, rootDir)
+          registerResearchTools(editor, rootDir)
+          registerGuiStudioTools(editor, rootDir)
+          registerRepoMapTools(editor, rootDir)
+          registerCheckpointTools(editor, rootDir)
+          registerMemoryTools(editor, rootDir)
+          registerPtyTapTools(editor, c, rootDir)
+          registerVerifyTools(editor, rootDir)
+        }),
+    },
+    { id: "permission-guard", requires: ["permission.hook"], run: (c) => registerPermissionGuard(c, rootDir) },
+    { id: "diagnostics", requires: ["tool.hook"], run: (c) => registerDiagnosticHook(c, rootDir) },
+    { id: "circuit-breaker", requires: ["tool.hook"], run: (c) => registerCircuitBreakerHook(c) },
+    { id: "ui-craft-skill", requires: ["skill.transform"], run: (c) => registerUICraftSkill(c, rootDir) },
+    { id: "muse-overlay", requires: ["session.hook"], run: (c) => registerMuseOverlay(c) },
+    { id: "artifact-context", requires: ["session.hook"], run: (c) => registerArtifactContextHook(c, rootDir) },
+    { id: "memory-context", requires: ["session.hook"], run: (c) => registerMemoryContextHook(c, rootDir) },
+    {
+      id: "commands",
+      requires: ["command.transform"],
+      run: async (c) => {
+        await registerShipCommand(c)
+        await registerSwarmCommand(c, rootDir)
+        await registerOmniCommands(c, rootDir)
+      },
+    },
+    // Telemetry runs last so its execute.after hook sees interventions appended by earlier hooks.
+    ...observe,
+  ]
+}
+
+/**
+ * OpenCode SwarmOS Omni-Harness Plugin Setup Function.
+ */
+export async function setup(ctx: any): Promise<SetupReport> {
   const rootDir = ctx.location?.directory ?? process.cwd()
-
-  // 1. Register 10 Specialized Roles (7 Swarm Engineering + 3 Domain Product Adapters)
-  if (ctx.agent?.transform) {
-    await ctx.agent.transform((editor: any) => {
-      registerSwarmOSAgents(editor)
-    })
+  const config = await loadConfig(rootDir)
+  const report: SetupReport = {
+    version: SWARMOS_VERSION,
+    mode: config.mode,
+    rootDir,
+    startedAt: new Date().toISOString(),
+    host: probeHost(ctx),
+    modules: [],
   }
-
-  // 2. Register Code Mode namespaces & in-place tool upgrades (`read`, `websearch`, `webfetch`)
-  if (ctx.tool?.transform) {
-    await ctx.tool.transform((editor: any) => {
-      registerOrgTools(editor, rootDir)
-      registerUITools(editor)
-      registerFSTools(editor, rootDir)
-      registerHashlineTools(editor, rootDir)
-      registerArtifactTools(editor, rootDir)
-      registerOfficeTools(editor, rootDir)
-      registerResearchTools(editor, rootDir)
-      registerGuiStudioTools(editor, rootDir)
-      registerRepoMapTools(editor, rootDir)
-      registerCheckpointTools(editor, rootDir)
-      registerMemoryTools(editor, rootDir)
-      registerPtyTapTools(editor, ctx, rootDir)
-    })
-  }
-
-  // 3. Register runtime Contract Lock, Disjoint OwnedPaths & Shell Mutation Guard
-  await registerPermissionGuard(ctx, rootDir)
-
-  // 4. Register live post-mutation compiler & linter diagnostic feedback loop + Doom-Loop Circuit Breaker
-  await registerDiagnosticHook(ctx, rootDir)
-  await registerCircuitBreakerHook(ctx)
-
-  // 5. Register Anti-Slop UI Craft & Spatial Architecture Skill
-  await registerUICraftSkill(ctx, rootDir)
-
-  // 6. Register Muse 1.3 Overlay, Antigravity Artifact Sync & Episodic Memory Recall
-  await registerMuseOverlay(ctx)
-  await registerArtifactContextHook(ctx, rootDir)
-  await registerMemoryContextHook(ctx, rootDir)
-
-  // 7. Register Slash Commands: /ship, /swarm, /gui, /research, /office, /artifacts, /map
-  await registerShipCommand(ctx)
-  await registerSwarmCommand(ctx, rootDir)
-  await registerOmniCommands(ctx, rootDir)
+  storeSetupReport(report)
+  await runSetupModules(ctx, buildSetupModules(rootDir, config), report)
+  return report
 }
 
 export interface SwarmOSPluginCallable {
   (ctx: any): Promise<void>
   readonly id: string
-  readonly setup: (ctx: any) => Promise<void>
+  readonly setup: (ctx: any) => Promise<SetupReport>
 }
 
 export const SwarmOSPlugin: SwarmOSPluginCallable = Object.assign(
   async function SwarmOSPlugin(ctx: any): Promise<void> {
-    return setup(ctx)
+    await setup(ctx)
   },
   {
     id: SWARMOS_PLUGIN_ID,

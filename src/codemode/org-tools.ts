@@ -132,7 +132,8 @@ export function registerOrgTools(editor: any, rootDir: string): void {
 
   editor.add({
     name: "submit_qa_receipt",
-    description: "Record an adversarial QA PASS or REJECT receipt for a task. Only tasks with a PASS receipt can be released.",
+    description:
+      "Record an adversarial QA PASS or REJECT receipt for a task. PASS must cite a passing `tools.verify.run` (verifyRunId) taken on the task's current code. Only tasks with a PASS receipt can be released.",
     options: { namespace: "org", codemode: true, pinned: true },
     input: {
       type: "object",
@@ -142,6 +143,10 @@ export function registerOrgTools(editor: any, rootDir: string): void {
         summary: { type: "string", description: "Executive summary of verification findings" },
         defects: { type: "array", items: { type: "string" }, description: "List of defects or regressions found (must be empty for PASS)" },
         testCommand: { type: "string", description: "Exact command executed to verify" },
+        verifyRunId: {
+          type: "string",
+          description: "ID of a passing `tools.verify.run` taken on the task's current tree (required for PASS when the board policy demands it)",
+        },
       },
       required: ["taskId", "verdict", "summary", "defects"],
     },

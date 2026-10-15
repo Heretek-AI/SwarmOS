@@ -34,6 +34,10 @@ export interface QAReceipt {
   summary: string
   defects: string[]
   testCommand?: string
+  /** `tools.verify.run` run backing a PASS verdict. */
+  verifyRunId?: string
+  /** Working-tree fingerprint the verify run was taken at. */
+  fingerprint?: string | null
   timestamp: string
 }
 
@@ -79,11 +83,18 @@ export interface ReleaseReadinessReport {
   supersededTasks: string[]
   activeTournaments: string[]
   blockers: string[]
+  latestFullVerifyRunId?: string
   checkedAt: string
+}
+
+export interface BoardPolicy {
+  /** PASS receipts must cite a passing `tools.verify.run` taken on the current working tree. */
+  requireVerifiedReceipts: boolean
 }
 
 export interface OrgBoard {
   version: string
+  policy?: BoardPolicy
   project: ProjectCharter | null
   contracts: Contract[]
   tasks: Task[]
@@ -94,6 +105,8 @@ export interface InitProjectInput {
   name: string
   vision: string
   aestheticArchetype: AestheticArchetype
+  /** Defaults to true for new projects. */
+  requireVerifiedReceipts?: boolean
 }
 
 export interface LockContractInput {
@@ -119,6 +132,7 @@ export interface SubmitQAReceiptInput {
   summary: string
   defects: string[]
   testCommand?: string
+  verifyRunId?: string
 }
 
 export interface PlanTournamentInput {

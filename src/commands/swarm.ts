@@ -1,4 +1,5 @@
 import { loadBoard, verifyReleaseReady } from "../board/board.js"
+import { SWARMOS_VERSION } from "../version.js"
 
 export async function registerSwarmCommand(ctx: any, rootDir: string): Promise<void> {
   if (!ctx.command?.transform) return
@@ -13,7 +14,7 @@ export async function registerSwarmCommand(ctx: any, rootDir: string): Promise<v
         const tournaments = Array.isArray(board.tournaments) ? board.tournaments : []
 
         const summary = [
-          "# SwarmOS Organizational Status (v0.3.0)",
+          `# SwarmOS Organizational Status (v${SWARMOS_VERSION})`,
           "",
           board.project
             ? `**Project**: ${board.project.name} (${board.project.aestheticArchetype})\n**Vision**: ${board.project.vision}`

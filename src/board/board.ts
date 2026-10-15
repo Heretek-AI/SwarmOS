@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
+import { computeTreeFingerprint, loadLatestVerifyRun, loadVerifyRun } from "../omni/verify.js"
 import type {
   Contract,
   CreateTaskInput,
@@ -42,6 +43,7 @@ export async function loadBoard(rootDir: string): Promise<OrgBoard> {
     const parsed = JSON.parse(raw) as Partial<OrgBoard>
     return {
       version: parsed.version ?? BOARD_VERSION,
+      ...(parsed.policy ? { policy: parsed.policy } : {}),
       project: parsed.project ?? null,
       contracts: Array.isArray(parsed.contracts) ? parsed.contracts : [],
       tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
@@ -104,6 +106,9 @@ export async function initProject(rootDir: string, input: InitProjectInput): Pro
       updatedAt: new Date().toISOString(),
     }
     board.project = charter
+    if (!board.policy || input.requireVerifiedReceipts !== undefined) {
+      board.policy = { requireVerifiedReceipts: input.requireVerifiedReceipts ?? true }
+    }
     return charter
   })
 }
@@ -167,7 +172,47 @@ export async function updateTaskStatus(rootDir: string, taskId: string, status: 
   })
 }
 
+/** Directory a task's code lives in: its worktree when it has one, else the workspace root. */
+export function taskWorkdir(rootDir: string, task: Pick<Task, "worktree">): string {
+  return task.worktree ? path.resolve(rootDir, task.worktree) : path.resolve(rootDir)
+}
+
+/**
+ * Checks that a PASS verdict is backed by a passing `tools.verify.run` taken on the task's
+ * current working tree. Returns the fingerprint to store on the receipt.
+ */
+async function assertVerifiedPass(rootDir: string, task: Task, verifyRunId: string | undefined): Promise<string | null> {
+  if (!verifyRunId) {
+    throw new Error(
+      `SwarmOS Verify Gate: PASS for task [${task.id}] must cite a passing \`tools.verify.run\` (pass \`verifyRunId\`). Run verification instead of asserting it.`,
+    )
+  }
+  const workdir = taskWorkdir(rootDir, task)
+  const run = (await loadVerifyRun(workdir, verifyRunId)) ?? (await loadVerifyRun(rootDir, verifyRunId))
+  if (!run) throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] not found for task [${task.id}].`)
+  if (!run.passed) {
+    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] FAILED; a failing run cannot back a PASS receipt.`)
+  }
+  if (path.resolve(run.rootDir) !== workdir) {
+    throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] ran in ${run.rootDir}, but task [${task.id}] lives in ${workdir}.`)
+  }
+  const current = await computeTreeFingerprint(workdir)
+  if (current !== null && run.fingerprint !== current) {
+    throw new Error(
+      `SwarmOS Verify Gate: code changed since verify run [${verifyRunId}]. Re-run \`tools.verify.run\` on the current tree.`,
+    )
+  }
+  return current
+}
+
 export async function submitQAReceipt(rootDir: string, input: SubmitQAReceiptInput): Promise<Task> {
+  const snapshot = await loadBoard(rootDir)
+  const target = snapshot.tasks.find((t) => t.id === input.taskId)
+  let fingerprint: string | null | undefined
+  if (target && input.verdict === "PASS" && snapshot.policy?.requireVerifiedReceipts) {
+    fingerprint = await assertVerifiedPass(rootDir, target, input.verifyRunId)
+  }
+
   return withBoardLock(rootDir, (board) => {
     const task = board.tasks.find((t) => t.id === input.taskId)
     if (!task) {
@@ -179,6 +224,8 @@ export async function submitQAReceipt(rootDir: string, input: SubmitQAReceiptInp
       summary: input.summary,
       defects: input.defects,
       testCommand: input.testCommand,
+      ...(input.verifyRunId ? { verifyRunId: input.verifyRunId } : {}),
+      ...(fingerprint !== undefined ? { fingerprint } : {}),
       timestamp: new Date().toISOString(),
     }
 
@@ -349,6 +396,32 @@ export async function verifyReleaseReady(rootDir: string): Promise<ReleaseReadin
     }
   }
 
+  let latestFullVerifyRunId: string | undefined
+  let verifyBlocked = false
+  if (board.policy?.requireVerifiedReceipts) {
+    for (const id of verifiedTasks) {
+      const task = board.tasks.find((t) => t.id === id)!
+      if (!task.qaReceipts[task.qaReceipts.length - 1]?.verifyRunId) {
+        verifyBlocked = true
+        blockers.push(`Task [${id}] PASS receipt does not cite a \`tools.verify.run\` result.`)
+      }
+    }
+    const full = await loadLatestVerifyRun(rootDir, "full")
+    const fingerprint = await computeTreeFingerprint(rootDir)
+    if (!full) {
+      verifyBlocked = true
+      blockers.push("No full verification run: call `tools.verify.run({ scope: \"full\" })` before release.")
+    } else if (!full.passed) {
+      verifyBlocked = true
+      blockers.push(`Latest full verification run [${full.id}] FAILED.`)
+    } else if (fingerprint !== null && full.fingerprint !== fingerprint) {
+      verifyBlocked = true
+      blockers.push(`Code changed since full verification run [${full.id}]: re-run \`tools.verify.run({ scope: "full" })\`.`)
+    } else {
+      latestFullVerifyRunId = full.id
+    }
+  }
+
   const tournaments = Array.isArray(board.tournaments) ? board.tournaments : []
   const activeTournaments = tournaments.filter((t) => t.status === "active").map((t) => t.id)
   for (const tid of activeTournaments) {
@@ -361,7 +434,8 @@ export async function verifyReleaseReady(rootDir: string): Promise<ReleaseReadin
     activeTasks.length > 0 &&
     unverifiedTasks.length === 0 &&
     rejectedTasks.length === 0 &&
-    activeTournaments.length === 0
+    activeTournaments.length === 0 &&
+    !verifyBlocked
 
   return {
     ready,
@@ -373,6 +447,7 @@ export async function verifyReleaseReady(rootDir: string): Promise<ReleaseReadin
     supersededTasks,
     activeTournaments,
     blockers,
+    ...(latestFullVerifyRunId ? { latestFullVerifyRunId } : {}),
     checkedAt: new Date().toISOString(),
   }
 }
