@@ -171,6 +171,16 @@ At any time during a build, run `/swarm` to view the active project charter, loc
 /swarm
 ```
 
+### Omni-Harness Product Modes (v0.4.0+): `/gui`, `/research`, `/office`, `/artifacts`
+
+SwarmOS v0.4.0 expands OpenCode V2 beyond software engineering into a **Universal Product, GUI, Research & Office Adapter**:
+
+- **`/gui <spec>` (`studio-gui`)**: Designs and verifies both Web/Electron/Tauri UIs (via live Chromium DOM geometry & contrast audits) and Native Desktop GUIs (macOS `screencapture`, Wayland `grim`, X11 `scrot`/`import`) with a 4-Pillar Visual Quality Checklist (`tools.gui.*`).
+- **`/research <topic>` (`researcher`)**: Unlocks OpenCode's native `websearch` and `webfetch` inside Code Mode (`execute`) for parallel multi-hop discovery, records verified sources in `.opencode/artifacts/research_sources.json`, and audits drafts via `tools.research.audit_citations` to block fabricated or bare-root URLs.
+- **`/office <request>` (`office-analyst`)**: Upgrades OpenCode's native `read` tool in-place to transparently extract `.docx`, `.xlsx`, `.pptx`, `.sqlite`, and `.csv` files, and adds `tools.office.render_preview` to convert generated PDFs, Word docs, Excel sheets, and PowerPoint decks into page PNGs for multimodal visual self-critique.
+- **Oh-My-Pi Precision Hashline Editing (`tools.fs.hash_read` & `tools.fs.hash_edit`)**: Tags every line with a 2-hex FNV-1a content hash (`42#a7: const x = 1;`) and applies multi-hunk line-range replacements with automatic $\pm 3$-line drift recovery.
+- **Antigravity Persistent Artifacts (`/artifacts` & `tools.artifacts.*`)**: Automatically syncs `.opencode/artifacts/task.md` and `plan.md` into the live session context window across turns.
+
 ---
 
 ## 8. Development & Testing

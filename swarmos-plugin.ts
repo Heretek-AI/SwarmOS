@@ -98,6 +98,40 @@ var PROMPT_RELEASE_OPS = `You are the **Staff Release & Integration Engineer** (
 - Audit \`tools.org.get_board\` to verify that all required tasks have a verified \`PASS\` QA receipt.
 - If work was performed across multiple Git worktrees (\`tools.opencode.worktree_list\`), integrate/merge them cleanly, resolve any cross-module conflicts, and run the canonical full-repository verification suite (e.g., \`bun test\`, \`bun run check\`, \`npm test\`, \`cargo test\`).
 - Produce a clean release readiness report detailing verified features, test coverage, and startup instructions.`;
+var PROMPT_STUDIO_GUI = `You are the **Principal GUI & Spatial Design Studio** (\`studio-gui\`) at OpenCode SwarmOS.
+You design and engineer world-class Web, Electron, Tauri, and Native Desktop GUIs (PyQt, Tkinter, Swift, GTK, Rust Iced/Slint).
+
+# Studio GUI Execution Protocol
+1. **Aesthetic & Token Lock**:
+   - Record your chosen Aesthetic Archetype and spacing/color token scale in \`.opencode/artifacts/plan.md\` via \`tools.artifacts.write\`.
+   - Never use raw arbitrary hex codes, neon purple/blue AI slop gradients, or \`line-height: 1\` on clipped containers.
+2. **Hash-Anchored Precision Edits**:
+   - Prefer \`tools.fs.hash_read\` and \`tools.fs.hash_edit\` inside \`execute\` when modifying large component files so edits never fail on whitespace or indentation drift.
+3. **Mandatory Live Visual & Geometric Verification**:
+   - **For Web / Electron / Tauri GUIs**: Open the live view in attached Chromium (\`tools.browser.tabs.open\`), run \`tools.ui.get_audit_script\` via \`tools.browser.evaluate\` across \`mobile\` (375px), \`tablet\` (768px), and \`desktop\` (1440px) viewports, and capture a screenshot via \`tools.browser.screenshot\`.
+   - **For Native Desktop GUIs**: Launch the window, call \`tools.gui.capture_desktop\` to save a PNG screenshot to \`.opencode/artifacts/previews/\`, and call \`read\` on the PNG to inspect it against \`tools.gui.get_visual_checklist\`.
+   - Fix every overflow, collision, contrast failure, and alignment drift before completing the turn.`;
+var PROMPT_RESEARCHER = `You are the **Principal Research & Technical Intelligence Analyst** (\`researcher\`) at OpenCode SwarmOS.
+
+# Deep Research & Grounding Protocol
+1. **Decompose & Track**:
+   - Break complex research questions into 4\u20138 concrete sub-questions and write your research checklist to \`task.md\` via \`tools.artifacts.write\`.
+2. **Parallel Multi-Hop Discovery**:
+   - Use \`execute\` (Code Mode) to fan out parallel \`websearch\` and \`webfetch\` calls with \`Promise.allSettled\`, or inspect local repositories and documents (\`.pdf\`, \`.docx\`, \`.xlsx\`, \`.sqlite\`) using the upgraded \`read\` tool.
+3. **Strict Source Ledger & Citation Verification**:
+   - For every authoritative source you rely on, record its URL, title, and key findings via \`tools.research.record_source\`.
+   - Every factual claim, metric, or recommendation in your synthesis MUST carry an inline clickable link \`[Source](https://specific.url/path)\` pointing to the exact page (never a bare root homepage like \`https://domain.com/\` and never bracketed numbers like \`[1]\`).
+   - Before delivering your final report, run \`tools.research.audit_citations\` on your draft and fix any unverified or bare-root links.`;
+var PROMPT_OFFICE_ANALYST = `You are the **Principal Executive Document, Spreadsheet & Presentation Architect** (\`office-analyst\`) at OpenCode SwarmOS.
+
+# Office & Deliverable Engineering Protocol
+1. **Universal Document Ingestion**:
+   - Read any existing \`.docx\`, \`.xlsx\`, \`.pptx\`, \`.pdf\`, \`.sqlite\`, or \`.csv\` files directly using \`read\` or \`tools.office.extract_document\`.
+   - Never fabricate metrics, financial figures, or dates not grounded in the user's data or verified sources.
+2. **3-Phase Deliverable Creation**:
+   - **Phase 1 (Plan)**: Draft the document structure, section assertions, or spreadsheet tab schema in \`plan.md\` via \`tools.artifacts.write\`.
+   - **Phase 2 (Build)**: Write a clean Python generation script (using \`openpyxl\` for \`.xlsx\` with real Excel formulas like \`=SUM(...)\`, \`python-docx\` for \`.docx\`, \`python-pptx\` for \`.pptx\`, or HTML/LaTeX -> PDF) and execute it via \`shell\`.
+   - **Phase 3 (Visual Self-Critique)**: Call \`tools.office.render_preview({ path })\` inside \`execute\` to convert the generated deliverable into per-page PNG images, then call \`read\` on the rendered PNGs to visually inspect for table clipping, text overflow, or awkward page breaks. Fix any visual defects before delivering.`;
 
 // src/agents/roles.ts
 var SWARMOS_ROLES = {
@@ -116,7 +150,10 @@ var SWARMOS_ROLES = {
       { action: "subagent", resource: "architect", effect: "allow" },
       { action: "subagent", resource: "manager", effect: "allow" },
       { action: "subagent", resource: "explore", effect: "allow" },
-      { action: "subagent", resource: "release-ops", effect: "allow" }
+      { action: "subagent", resource: "release-ops", effect: "allow" },
+      { action: "subagent", resource: "studio-gui", effect: "allow" },
+      { action: "subagent", resource: "researcher", effect: "allow" },
+      { action: "subagent", resource: "office-analyst", effect: "allow" }
     ]
   },
   architect: {
@@ -214,6 +251,43 @@ var SWARMOS_ROLES = {
       { action: "subagent", resource: "*", effect: "deny" },
       { action: "subagent", resource: "explore", effect: "allow" },
       { action: "subagent", resource: "qa-adversary", effect: "allow" }
+    ]
+  },
+  "studio-gui": {
+    id: "studio-gui",
+    name: "Studio GUI",
+    description: "Primary Web & Native Desktop GUI Designer. Combines token-first styling with live DOM geometry & desktop window visual critique.",
+    mode: "all",
+    system: PROMPT_STUDIO_GUI,
+    permissions: [
+      { action: "question", resource: "*", effect: "allow" },
+      { action: "subagent", resource: "*", effect: "deny" },
+      { action: "subagent", resource: "explore", effect: "allow" },
+      { action: "subagent", resource: "qa-adversary", effect: "allow" }
+    ]
+  },
+  researcher: {
+    id: "researcher",
+    name: "Researcher",
+    description: "Primary Deep Research & Technical Intelligence Analyst. Runs parallel web/repo discovery with a verified citation ledger.",
+    mode: "all",
+    system: PROMPT_RESEARCHER,
+    permissions: [
+      { action: "question", resource: "*", effect: "allow" },
+      { action: "subagent", resource: "*", effect: "deny" },
+      { action: "subagent", resource: "explore", effect: "allow" }
+    ]
+  },
+  "office-analyst": {
+    id: "office-analyst",
+    name: "Office Analyst",
+    description: "Primary Document, Spreadsheet, Presentation & Data Architect (.docx, .xlsx, .pptx, .pdf, .sqlite) with visual page previewing.",
+    mode: "all",
+    system: PROMPT_OFFICE_ANALYST,
+    permissions: [
+      { action: "question", resource: "*", effect: "allow" },
+      { action: "subagent", resource: "*", effect: "deny" },
+      { action: "subagent", resource: "explore", effect: "allow" }
     ]
   }
 };
@@ -1153,6 +1227,358 @@ function registerUITools(editor) {
   });
 }
 
+// src/omni/artifacts.ts
+import * as fs3 from "fs/promises";
+import * as path4 from "path";
+function getArtifactsDir(rootDir) {
+  return path4.join(rootDir, ".opencode", "artifacts");
+}
+async function writeArtifact(rootDir, name, content) {
+  const safeName = path4.basename(name);
+  const dir = getArtifactsDir(rootDir);
+  await fs3.mkdir(dir, { recursive: true });
+  const target = path4.join(dir, safeName);
+  await fs3.writeFile(target, content, "utf8");
+  return {
+    name: safeName,
+    path: target,
+    bytes: Buffer.byteLength(content, "utf8"),
+    updatedAt: new Date().toISOString()
+  };
+}
+async function readArtifact(rootDir, name) {
+  const safeName = path4.basename(name);
+  const target = path4.join(getArtifactsDir(rootDir), safeName);
+  try {
+    const content = await fs3.readFile(target, "utf8");
+    return { name: safeName, exists: true, content };
+  } catch {
+    return { name: safeName, exists: false, content: "" };
+  }
+}
+async function listArtifacts(rootDir) {
+  try {
+    const entries = await fs3.readdir(getArtifactsDir(rootDir), { withFileTypes: true });
+    return entries.filter((e) => e.isFile()).map((e) => e.name).sort();
+  } catch {
+    return [];
+  }
+}
+function registerArtifactTools(editor, rootDir) {
+  editor.namespace({
+    name: "artifacts",
+    description: "Antigravity-style persistent workspace artifacts (`task.md`, `plan.md`, `walkthrough.md`, `notes.md`) automatically synced into session context."
+  });
+  editor.add({
+    name: "write",
+    description: "Create or update a persistent Markdown artifact (`task.md`, `plan.md`, `walkthrough.md`, `notes.md`).",
+    options: { namespace: "artifacts", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Artifact filename (e.g. 'task.md', 'plan.md', 'walkthrough.md')" },
+        content: { type: "string", description: "Complete Markdown content" }
+      },
+      required: ["name", "content"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await writeArtifact(rootDir, input.name, input.content);
+      return { output: res, content: `Updated artifact ${res.name} (${res.bytes} bytes)` };
+    }
+  });
+  editor.add({
+    name: "read",
+    description: "Read a persistent Markdown artifact from `.opencode/artifacts/`.",
+    options: { namespace: "artifacts", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Artifact filename" }
+      },
+      required: ["name"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await readArtifact(rootDir, input.name);
+      return { output: res, content: res.exists ? res.content : `Artifact ${input.name} does not exist yet.` };
+    }
+  });
+  editor.add({
+    name: "list",
+    description: "List all persistent artifacts in `.opencode/artifacts/`.",
+    options: { namespace: "artifacts", codemode: true, pinned: true },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const files = await listArtifacts(rootDir);
+      return { output: { artifacts: files }, content: JSON.stringify(files, null, 2) };
+    }
+  });
+}
+async function registerArtifactContextHook(ctx, rootDir) {
+  if (!ctx.session?.hook)
+    return;
+  const injectArtifacts = async (event) => {
+    if (event.agent === "compaction" || event.kind === "compaction")
+      return;
+    if (!Array.isArray(event.system) || event.system.length === 0)
+      return;
+    const [taskArt, planArt] = await Promise.all([
+      readArtifact(rootDir, "task.md"),
+      readArtifact(rootDir, "plan.md")
+    ]);
+    if (!taskArt.exists && !planArt.exists)
+      return;
+    const sections = ["<active-workspace-artifacts>"];
+    if (taskArt.exists && taskArt.content.trim()) {
+      sections.push(`## Active Task Checklist (.opencode/artifacts/task.md)
+${taskArt.content.trim().slice(0, 4000)}`);
+    }
+    if (planArt.exists && planArt.content.trim()) {
+      sections.push(`## Active Implementation Plan (.opencode/artifacts/plan.md)
+${planArt.content.trim().slice(0, 4000)}`);
+    }
+    sections.push("</active-workspace-artifacts>");
+    const lastIdx = event.system.length - 1;
+    const lastPart = event.system[lastIdx];
+    if (lastPart && typeof lastPart.text === "string" && !lastPart.text.includes("<active-workspace-artifacts>")) {
+      event.system[lastIdx] = {
+        ...lastPart,
+        text: `${lastPart.text}
+
+${sections.join(`
+
+`)}`
+      };
+    }
+  };
+  await ctx.session.hook("context", injectArtifacts);
+}
+
+// src/omni/research.ts
+import * as fs4 from "fs/promises";
+import * as path5 from "path";
+function getResearchLedgerPath(rootDir) {
+  return path5.join(rootDir, ".opencode", "artifacts", "research_sources.json");
+}
+async function loadResearchSources(rootDir) {
+  try {
+    const raw = await fs4.readFile(getResearchLedgerPath(rootDir), "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+async function recordResearchSource(rootDir, input) {
+  const sources = await loadResearchSources(rootDir);
+  const entry = {
+    ...input,
+    fetchedAt: new Date().toISOString()
+  };
+  const idx = sources.findIndex((s) => s.url === input.url || s.id === input.id);
+  if (idx >= 0) {
+    sources[idx] = entry;
+  } else {
+    sources.push(entry);
+  }
+  const file = getResearchLedgerPath(rootDir);
+  await fs4.mkdir(path5.dirname(file), { recursive: true });
+  await fs4.writeFile(file, JSON.stringify(sources, null, 2), "utf8");
+  return entry;
+}
+async function auditMarkdownCitations(rootDir, markdownText) {
+  const sources = await loadResearchSources(rootDir);
+  const knownUrls = new Set(sources.map((s) => s.url.trim().replace(/\/+$/, "")));
+  const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+  const verifiedLinks = [];
+  const unverifiedLinks = [];
+  const bareRootLinks = [];
+  let match;
+  while ((match = linkRe.exec(markdownText)) !== null) {
+    const rawUrl = match[2].trim();
+    const normalized = rawUrl.replace(/\/+$/, "");
+    try {
+      const parsed = new URL(rawUrl);
+      if ((parsed.pathname === "/" || parsed.pathname === "") && !parsed.search && !parsed.hash) {
+        bareRootLinks.push(rawUrl);
+      }
+    } catch {}
+    if (knownUrls.has(normalized)) {
+      if (!verifiedLinks.includes(rawUrl))
+        verifiedLinks.push(rawUrl);
+    } else {
+      if (!unverifiedLinks.includes(rawUrl))
+        unverifiedLinks.push(rawUrl);
+    }
+  }
+  return {
+    totalLinksFound: verifiedLinks.length + unverifiedLinks.length,
+    verifiedLinks,
+    unverifiedLinks,
+    bareRootLinks,
+    passed: unverifiedLinks.length === 0 && bareRootLinks.length === 0
+  };
+}
+function registerResearchTools(editor, rootDir) {
+  if (typeof editor.update === "function") {
+    for (const toolName of ["websearch", "webfetch"]) {
+      try {
+        editor.update(toolName, (tool) => {
+          tool.options = { ...tool.options, codemode: true };
+        });
+      } catch {}
+    }
+  }
+  editor.namespace({
+    name: "research",
+    description: "Deep Research & Citation Verification Engine for recording verified web/literature sources and auditing reports against hallucinated or bare-domain links."
+  });
+  editor.add({
+    name: "record_source",
+    description: "Record a verified web page, paper, or primary document in `.opencode/artifacts/research_sources.json`.",
+    options: { namespace: "research", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Short source identifier (e.g. 'src-rfc9110')" },
+        url: { type: "string", description: "Exact specific URL fetched" },
+        title: { type: "string", description: "Document or article title" },
+        keyFindings: { type: "array", items: { type: "string" }, description: "Verified facts/figures from this source" },
+        verbatimQuotes: { type: "array", items: { type: "string" }, description: "Optional verbatim quotes" }
+      },
+      required: ["id", "url", "title", "keyFindings"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const entry = await recordResearchSource(rootDir, input);
+      return { output: entry, content: `Recorded research source [${entry.id}]: ${entry.url}` };
+    }
+  });
+  editor.add({
+    name: "list_sources",
+    description: "List all verified sources recorded in the session's research ledger.",
+    options: { namespace: "research", codemode: true, pinned: true },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const sources = await loadResearchSources(rootDir);
+      return { output: { sources }, content: JSON.stringify(sources, null, 2) };
+    }
+  });
+  editor.add({
+    name: "audit_citations",
+    description: "Audit a Markdown text string or file against the recorded research ledger to detect unverified URLs or bare root domain links.",
+    options: { namespace: "research", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        markdown: { type: "string", description: "Markdown text to audit" }
+      },
+      required: ["markdown"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const report = await auditMarkdownCitations(rootDir, input.markdown);
+      return { output: report, content: JSON.stringify(report, null, 2) };
+    }
+  });
+}
+
+// src/commands/omni.ts
+async function registerOmniCommands(ctx, rootDir) {
+  if (!ctx.command?.transform)
+    return;
+  await ctx.command.transform((editor) => {
+    editor.add({
+      name: "gui",
+      description: "Switch to the Studio GUI agent to design, build, and visually verify Web or Native Desktop GUIs",
+      execute: async (input) => {
+        if (ctx.session?.switchAgent) {
+          await ctx.session.switchAgent({ sessionID: input.sessionID, agent: "studio-gui" });
+        }
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            ...input.prompt,
+            sessionID: input.sessionID,
+            text: `Execute the SwarmOS Studio GUI Protocol (Token Lock -> Hashline Implementation -> Live DOM Geometry / Desktop Window Screenshot -> 4-Pillar Visual Critique) for:
+
+${input.prompt?.text ?? input.prompt ?? ""}`,
+            delivery: input.delivery
+          });
+        }
+      }
+    });
+    editor.add({
+      name: "research",
+      description: "Switch to the Deep Researcher agent to run parallel web/document discovery with verified inline citations",
+      execute: async (input) => {
+        if (ctx.session?.switchAgent) {
+          await ctx.session.switchAgent({ sessionID: input.sessionID, agent: "researcher" });
+        }
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            ...input.prompt,
+            sessionID: input.sessionID,
+            text: `Execute the SwarmOS Deep Research Protocol (Decompose in task.md -> Parallel Web/Doc Discovery -> Record Sources -> Audit Citations) for:
+
+${input.prompt?.text ?? input.prompt ?? ""}`,
+            delivery: input.delivery
+          });
+        }
+      }
+    });
+    editor.add({
+      name: "office",
+      description: "Switch to the Office Analyst agent to read or generate Word (.docx), Excel (.xlsx), PowerPoint (.pptx), PDF, or SQLite deliverables with visual page previews",
+      execute: async (input) => {
+        if (ctx.session?.switchAgent) {
+          await ctx.session.switchAgent({ sessionID: input.sessionID, agent: "office-analyst" });
+        }
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            ...input.prompt,
+            sessionID: input.sessionID,
+            text: `Execute the SwarmOS Office & Deliverable Protocol (Extract Inputs -> Plan in plan.md -> Build Deliverable -> Render Page Previews -> Visual Critique) for:
+
+${input.prompt?.text ?? input.prompt ?? ""}`,
+            delivery: input.delivery
+          });
+        }
+      }
+    });
+    editor.add({
+      name: "artifacts",
+      description: "Inspect active Antigravity-style workspace artifacts (`task.md`, `plan.md`, `walkthrough.md`) and recorded research sources",
+      execute: async (input) => {
+        const [files, taskArt, planArt, sources] = await Promise.all([
+          listArtifacts(rootDir),
+          readArtifact(rootDir, "task.md"),
+          readArtifact(rootDir, "plan.md"),
+          loadResearchSources(rootDir)
+        ]);
+        const summary = [
+          "# SwarmOS Omni-Harness Artifacts & Research Ledger",
+          "",
+          `**Files in \`.opencode/artifacts/\` (${files.length})**: ${files.length ? files.join(", ") : "_none_"}`,
+          `**Recorded Research Sources (${sources.length})**: ${sources.length ? sources.map((s) => `[${s.id}](${s.url})`).join(", ") : "_none_"}`,
+          ...taskArt.exists ? ["", "### Active Task Checklist (`task.md`)", taskArt.content.trim()] : [],
+          ...planArt.exists ? ["", "### Active Implementation Plan (`plan.md`)", planArt.content.trim()] : []
+        ].join(`
+`);
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input.sessionID,
+            text: summary,
+            delivery: "steer"
+          });
+        }
+      }
+    });
+  });
+}
+
 // src/commands/ship.ts
 async function registerShipCommand(ctx) {
   if (!ctx.command?.transform)
@@ -1233,12 +1659,12 @@ async function registerSwarmCommand(ctx, rootDir) {
 
 // src/diagnostics/runner.ts
 import { execFile } from "child_process";
-import * as path4 from "path";
+import * as path6 from "path";
 import { promisify } from "util";
 var execFileAsync = promisify(execFile);
 async function runQuickDiagnostics(rootDir, filePath, options = {}) {
-  const abs = path4.resolve(rootDir, filePath);
-  const ext = path4.extname(abs).toLowerCase();
+  const abs = path6.resolve(rootDir, filePath);
+  const ext = path6.extname(abs).toLowerCase();
   const timeout = options.timeoutMs ?? 6000;
   const maxLines = options.maxLines ?? 30;
   try {
@@ -1403,9 +1829,476 @@ async function registerMuseOverlay(ctx) {
   await ctx.session.hook("generate", upgradePrompt);
 }
 
+// src/omni/gui-studio.ts
+import { execFile as execFile2 } from "child_process";
+import * as fs5 from "fs/promises";
+import * as path7 from "path";
+import { promisify as promisify2 } from "util";
+var execFileAsync2 = promisify2(execFile2);
+var VISUAL_QUALITY_CHECKLIST = {
+  macroBalance: [
+    "Balanced vertical & horizontal visual weight across the viewport (not top-heavy or clipped).",
+    "Zero unanchored dead voids on desktop or mobile viewports.",
+    "Zero unintended horizontal or vertical page overflow."
+  ],
+  alignmentHarmony: [
+    "Unified alignment axes across sibling cards, toolbar actions, and form controls.",
+    "Consistent baseline alignment and uniform internal padding across sibling containers."
+  ],
+  spatialHierarchy: [
+    "Macro-whitespace (between sections) is visibly larger than micro-whitespace (inside cards/badges).",
+    "Zero text or control collisions (`overlapX === 0 && overlapY === 0`)."
+  ],
+  typographyAndContrast: [
+    "Body text meets WCAG >= 4.5:1 contrast; large/bold headings meet >= 3.0:1 contrast.",
+    "Line height >= 1.15x font size on clipped containers so descenders (g, y, p, q) never clip.",
+    "Numeric columns use `font-variant-numeric: tabular-nums` and right alignment."
+  ]
+};
+async function captureDesktopWindow(rootDir, outputName = "desktop_gui_preview.png") {
+  const previewDir = path7.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs5.mkdir(previewDir, { recursive: true });
+  const outPath = path7.join(previewDir, path7.basename(outputName));
+  const platform = process.platform;
+  if (platform === "darwin") {
+    await execFileAsync2("screencapture", ["-x", outPath], { cwd: rootDir, timeout: 1e4 });
+    return { path: outPath, method: "macos-screencapture" };
+  }
+  const commands = [
+    { bin: "grim", args: [outPath], method: "wayland-grim" },
+    { bin: "scrot", args: ["-o", outPath], method: "x11-scrot" },
+    { bin: "import", args: ["-window", "root", outPath], method: "imagemagick-import" }
+  ];
+  for (const cmd of commands) {
+    try {
+      await execFileAsync2(cmd.bin, cmd.args, { cwd: rootDir, timeout: 1e4 });
+      return { path: outPath, method: cmd.method };
+    } catch {}
+  }
+  throw new Error("No desktop window capture utility found (tried screencapture, grim, scrot, import). For web/Electron/Tauri GUIs, use `tools.browser.screenshot`.");
+}
+function registerGuiStudioTools(editor, rootDir) {
+  editor.namespace({
+    name: "gui",
+    description: "Web & Native Desktop GUI Studio tools for capturing live application windows and running the 4-Pillar Visual Quality Checklist."
+  });
+  editor.add({
+    name: "get_visual_checklist",
+    description: "Return the 4-Pillar Universal Visual Quality Checklist (Macro Balance, Alignment Axes, Spatial Hierarchy, Typography & Contrast) used to critique GUI screenshots.",
+    options: { namespace: "gui", codemode: true, pinned: true },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => ({
+      output: VISUAL_QUALITY_CHECKLIST,
+      content: JSON.stringify(VISUAL_QUALITY_CHECKLIST, null, 2)
+    })
+  });
+  editor.add({
+    name: "capture_desktop",
+    description: "Capture a screenshot of the active native desktop GUI window (macOS `screencapture`, Wayland `grim`, X11 `scrot`/`import`) to `.opencode/artifacts/previews/` so you can inspect it multimodally via `read`.",
+    options: { namespace: "gui", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        filename: { type: "string", description: "Output PNG filename (default 'desktop_gui_preview.png')" }
+      }
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await captureDesktopWindow(rootDir, input?.filename ?? "desktop_gui_preview.png");
+      return {
+        output: res,
+        content: `Captured desktop GUI screenshot (${res.method}) -> ${res.path}. Call \`read\` on this path to visually inspect the GUI.`
+      };
+    }
+  });
+}
+
+// src/omni/hashline.ts
+import * as fs6 from "fs/promises";
+import * as path8 from "path";
+function computeLineHash(line) {
+  const trimmed = line.trim();
+  if (trimmed.length === 0)
+    return "00";
+  let hash = 2166136261;
+  for (let i = 0;i < trimmed.length; i++) {
+    hash ^= trimmed.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0 & 255).toString(16).padStart(2, "0");
+}
+async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
+  const abs = path8.resolve(rootDir, targetPath);
+  const raw = await fs6.readFile(abs, "utf8");
+  const lines = raw.replace(/\r\n/g, `
+`).split(`
+`);
+  const startIdx = Math.max(0, offset - 1);
+  const endIdx = Math.min(lines.length, startIdx + limit);
+  const formatted = lines.slice(startIdx, endIdx).map((line, idx) => {
+    const lineNo = startIdx + idx + 1;
+    const hash = computeLineHash(line);
+    return `${lineNo}#${hash}: ${line}`;
+  }).join(`
+`);
+  return {
+    path: targetPath,
+    totalLines: lines.length,
+    startLine: startIdx + 1,
+    endLine: endIdx,
+    content: formatted
+  };
+}
+async function hashEditFile(rootDir, targetPath, hunks) {
+  const abs = path8.resolve(rootDir, targetPath);
+  const raw = await fs6.readFile(abs, "utf8");
+  const hasCrlf = raw.includes(`\r
+`);
+  const lines = raw.replace(/\r\n/g, `
+`).split(`
+`);
+  const resolved = hunks.map((hunk, idx) => {
+    const expStartHash = hunk.startHash.toLowerCase().trim();
+    const expEndHash = hunk.endHash.toLowerCase().trim();
+    const span = hunk.endLine - hunk.startLine;
+    if (span < 0) {
+      throw new Error(`Hunk #${idx + 1}: endLine (${hunk.endLine}) must be >= startLine (${hunk.startLine}).`);
+    }
+    let candidateStart = hunk.startLine - 1;
+    const matchesAt = (sIdx) => {
+      const eIdx = sIdx + span;
+      if (sIdx < 0 || eIdx >= lines.length)
+        return false;
+      return computeLineHash(lines[sIdx]) === expStartHash && computeLineHash(lines[eIdx]) === expEndHash;
+    };
+    if (!matchesAt(candidateStart)) {
+      const nearby = [];
+      for (let delta = -3;delta <= 3; delta++) {
+        if (delta !== 0 && matchesAt(candidateStart + delta)) {
+          nearby.push(candidateStart + delta);
+        }
+      }
+      if (nearby.length === 1) {
+        candidateStart = nearby[0];
+      } else {
+        const actualStart = lines[candidateStart] !== undefined ? `${hunk.startLine}#${computeLineHash(lines[candidateStart])}` : "EOF";
+        const actualEnd = lines[candidateStart + span] !== undefined ? `${hunk.endLine}#${computeLineHash(lines[candidateStart + span])}` : "EOF";
+        throw new Error(`Hashline mismatch on Hunk #${idx + 1} in ${targetPath}: expected (${hunk.startLine}#${expStartHash}..${hunk.endLine}#${expEndHash}), found (${actualStart}..${actualEnd}). Re-run hash_read to refresh line hashes.`);
+      }
+    }
+    return {
+      startIdx: candidateStart,
+      endIdx: candidateStart + span,
+      replacementLines: hunk.replacement === "" ? [] : hunk.replacement.replace(/\r\n/g, `
+`).split(`
+`)
+    };
+  });
+  resolved.sort((a, b) => b.startIdx - a.startIdx);
+  for (let i = 0;i < resolved.length - 1; i++) {
+    if (resolved[i + 1].endIdx >= resolved[i].startIdx) {
+      throw new Error(`Overlapping hashline hunks detected in ${targetPath}.`);
+    }
+  }
+  for (const r of resolved) {
+    lines.splice(r.startIdx, r.endIdx - r.startIdx + 1, ...r.replacementLines);
+  }
+  const outputText = lines.join(hasCrlf ? `\r
+` : `
+`);
+  await fs6.writeFile(abs, outputText, "utf8");
+  const diagnostics = await runQuickDiagnostics(rootDir, targetPath);
+  return {
+    path: targetPath,
+    appliedHunks: resolved.length,
+    totalLines: lines.length,
+    ...diagnostics ? { diagnostics } : {}
+  };
+}
+function registerHashlineTools(editor, rootDir) {
+  editor.add({
+    name: "hash_read",
+    description: "Oh-My-Pi style hash-anchored file reader. Returns lines prefixed with `<line>#<2-hex-hash>: <content>` so `hash_edit` can mutate line ranges without brittle exact-string matching.",
+    options: { namespace: "fs", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File path to read" },
+        offset: { type: "number", description: "1-indexed start line (default 1)" },
+        limit: { type: "number", description: "Maximum lines to read (default 400)" }
+      },
+      required: ["path"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await hashReadFile(rootDir, input.path, input.offset ?? 1, input.limit ?? 400);
+      return { output: res, content: res.content };
+    }
+  });
+  editor.add({
+    name: "hash_edit",
+    description: "Oh-My-Pi style hash-anchored line editor. Replaces one or more line ranges verified by their 2-hex start/end hashes (`startLine`, `startHash`, `endLine`, `endHash`, `replacement`), with +-3 line drift recovery and instant compiler diagnostics.",
+    options: { namespace: "fs", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Target file path" },
+        hunks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              startLine: { type: "number" },
+              startHash: { type: "string" },
+              endLine: { type: "number" },
+              endHash: { type: "string" },
+              replacement: { type: "string" }
+            },
+            required: ["startLine", "startHash", "endLine", "endHash", "replacement"]
+          }
+        }
+      },
+      required: ["path", "hunks"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await hashEditFile(rootDir, input.path, input.hunks);
+      const msg = `Applied ${res.appliedHunks} hashline hunk(s) to ${res.path} (${res.totalLines} lines).${res.diagnostics ?? ""}`;
+      return { output: res, content: msg };
+    }
+  });
+}
+
+// src/omni/office.ts
+import { execFile as execFile3 } from "child_process";
+import * as fs7 from "fs/promises";
+import * as path9 from "path";
+import { promisify as promisify3 } from "util";
+var execFileAsync3 = promisify3(execFile3);
+var SUPPORTED_OFFICE_EXTENSIONS = new Set([
+  ".docx",
+  ".xlsx",
+  ".xls",
+  ".pptx",
+  ".sqlite",
+  ".sqlite3",
+  ".db",
+  ".csv",
+  ".tsv"
+]);
+var PYTHON_UNIVERSAL_EXTRACTOR = `
+import sys, os, json, csv
+
+NL = chr(10)
+TAB = chr(9)
+path = sys.argv[1]
+ext = os.path.splitext(path)[1].lower()
+
+if ext in (".csv", ".tsv"):
+    delim = TAB if ext == ".tsv" else ","
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        reader = list(csv.reader(f, delimiter=delim))
+    out = [f"# Tabular Dataset: {os.path.basename(path)} ({len(reader)} rows)"]
+    for r_idx, row in enumerate(reader[:100]):
+        cells = [c.strip().replace(NL, " ") for c in row[:25]]
+        out.append("| " + " | ".join(cells) + " |")
+        if r_idx == 0:
+            out.append("| " + " | ".join(["---"] * len(cells)) + " |")
+    print(NL.join(out))
+
+elif ext == ".docx":
+    import docx
+    doc = docx.Document(path)
+    out = ["# Word Document: " + os.path.basename(path), ""]
+    for p in doc.paragraphs:
+        if p.text.strip():
+            style = p.style.name if p.style else ""
+            prefix = "## " if "Heading 1" in style else ("### " if "Heading" in style else "")
+            out.append(prefix + p.text)
+    for idx, table in enumerate(doc.tables, 1):
+        out.append(NL + f"### Table {idx}")
+        for r_idx, row in enumerate(table.rows):
+            cells = [c.text.strip().replace(NL, " ") for c in row.cells]
+            out.append("| " + " | ".join(cells) + " |")
+            if r_idx == 0:
+                out.append("| " + " | ".join(["---"] * len(cells)) + " |")
+    print(NL.join(out))
+
+elif ext in (".xlsx", ".xls"):
+    import openpyxl
+    wb = openpyxl.load_workbook(path, data_only=False)
+    wb_val = openpyxl.load_workbook(path, data_only=True)
+    out = ["# Excel Workbook: " + os.path.basename(path)]
+    for name in wb.sheetnames:
+        sheet = wb[name]
+        sheet_val = wb_val[name]
+        out.append(NL + f"## Sheet: {name} ({sheet.max_row} rows x {sheet.max_column} cols)")
+        max_r = min(sheet.max_row, 100)
+        max_c = min(sheet.max_column, 20)
+        for r in range(1, max_r + 1):
+            row_cells = []
+            for c in range(1, max_c + 1):
+                f_val = sheet.cell(r, c).value
+                v_val = sheet_val.cell(r, c).value
+                if isinstance(f_val, str) and f_val.startswith("="):
+                    row_cells.append(f"{v_val} ({f_val})")
+                else:
+                    row_cells.append("" if v_val is None else str(v_val).replace(NL, " "))
+            if any(row_cells):
+                out.append("| " + " | ".join(row_cells) + " |")
+                if r == 1:
+                    out.append("| " + " | ".join(["---"] * len(row_cells)) + " |")
+    print(NL.join(out))
+
+elif ext == ".pptx":
+    from pptx import Presentation
+    prs = Presentation(path)
+    out = [f"# PowerPoint Presentation: {os.path.basename(path)} ({len(prs.slides)} slides)"]
+    for idx, slide in enumerate(prs.slides, 1):
+        out.append(NL + f"## Slide {idx}")
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for p in shape.text_frame.paragraphs:
+                    if p.text.strip():
+                        out.append("- " + p.text.strip())
+    print(NL.join(out))
+
+elif ext in (".sqlite", ".sqlite3", ".db"):
+    import sqlite3
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    out = [f"# SQLite Database: {os.path.basename(path)}"]
+    for t in tables:
+        cols = cur.execute(f"PRAGMA table_info('{t}')").fetchall()
+        col_names = [c[1] + " (" + c[2] + ")" for c in cols]
+        count = cur.execute(f"SELECT COUNT(*) FROM '{t}'").fetchone()[0]
+        out.append(NL + f"## Table: {t} ({count} rows)" + NL + "Columns: " + ", ".join(col_names))
+        rows = cur.execute(f"SELECT * FROM '{t}' LIMIT 10").fetchall()
+        for r in rows:
+            out.append("- " + json.dumps(r, default=str))
+    print(NL.join(out))
+`;
+async function extractOfficeOrDataFile(rootDir, targetPath) {
+  const abs = path9.resolve(rootDir, targetPath);
+  const ext = path9.extname(abs).toLowerCase();
+  if (!SUPPORTED_OFFICE_EXTENSIONS.has(ext))
+    return;
+  const { stdout } = await execFileAsync3("python3", ["-c", PYTHON_UNIVERSAL_EXTRACTOR, abs], {
+    cwd: rootDir,
+    timeout: 15000
+  });
+  return stdout.trim();
+}
+async function renderDocumentPreviews(rootDir, targetPath) {
+  const abs = path9.resolve(rootDir, targetPath);
+  const ext = path9.extname(abs).toLowerCase();
+  const previewDir = path9.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs7.mkdir(previewDir, { recursive: true });
+  let pdfPath = abs;
+  if ([".docx", ".pptx", ".xlsx"].includes(ext)) {
+    await execFileAsync3("libreoffice", ["--headless", "--nologo", "--nolockcheck", "--norestore", "--convert-to", "pdf", "--outdir", previewDir, abs], { cwd: rootDir, timeout: 30000 });
+    const stem = path9.basename(abs, ext);
+    pdfPath = path9.join(previewDir, `${stem}.pdf`);
+  }
+  const stem = path9.basename(pdfPath, ".pdf");
+  const pyRender = `
+import sys, os, json, pypdfium2 as pdfium
+pdf_path, out_dir, stem = sys.argv[1], sys.argv[2], sys.argv[3]
+pdf = pdfium.PdfDocument(pdf_path)
+paths = []
+for i, page in enumerate(pdf, start=1):
+    out_file = os.path.join(out_dir, f"{stem}_page_{i}.png")
+    page.render(scale=2).to_pil().save(out_file)
+    paths.append(out_file)
+pdf.close()
+print(json.dumps(paths))
+`;
+  const { stdout } = await execFileAsync3("python3", ["-c", pyRender, pdfPath, previewDir, stem], {
+    cwd: rootDir,
+    timeout: 20000
+  });
+  const previewPngs = JSON.parse(stdout.trim());
+  return { pdfPath, previewPngs };
+}
+function registerOfficeTools(editor, rootDir) {
+  editor.namespace({
+    name: "office",
+    description: "Universal Office & Data Suite for extracting `.docx`, `.xlsx`, `.pptx`, `.sqlite`, `.csv` files and rendering high-DPI page PNG previews for visual self-critique."
+  });
+  editor.add({
+    name: "extract_document",
+    description: "Extract structured Markdown (headings, tables, formulas, slides, or SQLite schemas/rows) from `.docx`, `.xlsx`, `.pptx`, `.sqlite`, `.db`, `.csv`, or `.tsv` files.",
+    options: { namespace: "office", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the Office document or database file" }
+      },
+      required: ["path"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const extracted = await extractOfficeOrDataFile(rootDir, input.path);
+      if (!extracted) {
+        throw new Error(`Unsupported or empty office/data file: ${input.path}`);
+      }
+      return {
+        output: { path: input.path, content: extracted },
+        content: extracted
+      };
+    }
+  });
+  editor.add({
+    name: "render_preview",
+    description: "Convert a `.docx`, `.pptx`, `.xlsx`, or `.pdf` document into per-page PNG images inside `.opencode/artifacts/previews/` so you can call `read` on each PNG to visually inspect layout, alignment, and pagination.",
+    options: { namespace: "office", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the generated .pdf, .docx, .pptx, or .xlsx file" }
+      },
+      required: ["path"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await renderDocumentPreviews(rootDir, input.path);
+      return {
+        output: res,
+        content: `Rendered ${res.previewPngs.length} page preview PNG(s):
+${res.previewPngs.join(`
+`)}`
+      };
+    }
+  });
+  if (typeof editor.update === "function") {
+    try {
+      editor.update("read", (tool) => {
+        const origExecute = tool.execute;
+        tool.execute = async (input, context) => {
+          if (typeof input?.path === "string") {
+            const ext = path9.extname(input.path).toLowerCase();
+            if ([".docx", ".xlsx", ".xls", ".pptx", ".sqlite", ".sqlite3", ".db"].includes(ext)) {
+              const extracted = await extractOfficeOrDataFile(rootDir, input.path);
+              if (extracted !== undefined) {
+                return {
+                  output: { type: "office-extracted", path: input.path, content: extracted },
+                  content: extracted
+                };
+              }
+            }
+          }
+          return origExecute(input, context);
+        };
+      });
+    } catch {}
+  }
+}
+
 // src/skills/ui-craft/skill.ts
-import * as fs3 from "fs/promises";
-import * as path5 from "path";
+import * as fs8 from "fs/promises";
+import * as path10 from "path";
 var UI_CRAFT_SKILL_ID = "ui-craft";
 var UI_CRAFT_SKILL_NAME = "UI Craft & Spatial Architecture";
 var EMBEDDED_UI_CRAFT_SKILL_MD = `---
@@ -1518,9 +2411,9 @@ Before handing off any UI milestone:
    - \`row-baseline-jitter\`: Align sibling card and button top edges to exact pixels.`;
 async function loadSkillContent(fallbackDir) {
   const targetDir = fallbackDir ?? process.cwd();
-  const candidate = path5.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
+  const candidate = path10.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
   try {
-    return await fs3.readFile(candidate, "utf8");
+    return await fs8.readFile(candidate, "utf8");
   } catch {
     return EMBEDDED_UI_CRAFT_SKILL_MD;
   }
@@ -1529,7 +2422,7 @@ async function registerUICraftSkill(ctx, rootDir) {
   if (!ctx.skill?.transform)
     return;
   const content = await loadSkillContent(rootDir);
-  const absoluteSkillPath = path5.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
+  const absoluteSkillPath = path10.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
   await ctx.skill.transform((editor) => {
     editor.add({
       id: UI_CRAFT_SKILL_ID,
@@ -1556,14 +2449,21 @@ async function setup(ctx) {
       registerOrgTools(editor, rootDir);
       registerUITools(editor);
       registerFSTools(editor, rootDir);
+      registerHashlineTools(editor, rootDir);
+      registerArtifactTools(editor, rootDir);
+      registerOfficeTools(editor, rootDir);
+      registerResearchTools(editor, rootDir);
+      registerGuiStudioTools(editor, rootDir);
     });
   }
   await registerPermissionGuard(ctx, rootDir);
   await registerDiagnosticHook(ctx, rootDir);
   await registerUICraftSkill(ctx, rootDir);
   await registerMuseOverlay(ctx);
+  await registerArtifactContextHook(ctx, rootDir);
   await registerShipCommand(ctx);
   await registerSwarmCommand(ctx, rootDir);
+  await registerOmniCommands(ctx, rootDir);
 }
 var SwarmOSPlugin = Object.assign(async function SwarmOSPlugin(ctx) {
   return setup(ctx);
@@ -1581,34 +2481,59 @@ export {
   PROMPT_ARCHITECT,
   PROMPT_DIRECTOR,
   PROMPT_MANAGER,
+  PROMPT_OFFICE_ANALYST,
   PROMPT_QA_ADVERSARY,
   PROMPT_RELEASE_OPS,
+  PROMPT_RESEARCHER,
   PROMPT_STAFF_BACKEND,
   PROMPT_STAFF_UI,
+  PROMPT_STUDIO_GUI,
   STANDARD_VIEWPORTS,
+  SUPPORTED_OFFICE_EXTENSIONS,
   SWARMOS_PLUGIN_ID,
   SWARMOS_ROLES,
   SwarmOSPlugin,
   UI_CRAFT_SKILL_ID,
   UI_CRAFT_SKILL_NAME,
+  VISUAL_QUALITY_CHECKLIST,
+  auditMarkdownCitations,
+  captureDesktopWindow,
+  computeLineHash,
   createEmptyBoard,
   createTask,
   src_default as default,
   evaluateBoardGuard,
   evaluatePermissionGuard,
   extractMutatedPaths,
+  extractOfficeOrDataFile,
   extractOutline,
+  getArtifactsDir,
   getBoardPath,
+  getResearchLedgerPath,
+  hashEditFile,
+  hashReadFile,
   initProject,
+  listArtifacts,
   loadBoard,
+  loadResearchSources,
   loadSkillContent,
   lockContract,
   matchesPathPattern,
   normalizeResourcePath,
   planTournament,
   plugin,
+  readArtifact,
+  recordResearchSource,
+  registerArtifactContextHook,
+  registerArtifactTools,
+  registerGuiStudioTools,
+  registerHashlineTools,
   registerMuseOverlay,
+  registerOfficeTools,
+  registerOmniCommands,
   registerPermissionGuard,
+  registerResearchTools,
+  renderDocumentPreviews,
   resolveTournament,
   runQuickDiagnostics,
   saveBoard,
@@ -1616,5 +2541,6 @@ export {
   submitQAReceipt,
   updateTaskStatus,
   verifyReleaseReady,
-  withBoardLock
+  withBoardLock,
+  writeArtifact
 };

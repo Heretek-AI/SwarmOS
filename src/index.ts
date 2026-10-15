@@ -12,10 +12,13 @@ import {
   PROMPT_ARCHITECT,
   PROMPT_DIRECTOR,
   PROMPT_MANAGER,
+  PROMPT_OFFICE_ANALYST,
   PROMPT_QA_ADVERSARY,
   PROMPT_RELEASE_OPS,
+  PROMPT_RESEARCHER,
   PROMPT_STAFF_BACKEND,
   PROMPT_STAFF_UI,
+  PROMPT_STUDIO_GUI,
 } from "./agents/prompts.js"
 import {
   BOARD_VERSION,
@@ -54,12 +57,51 @@ import type {
 import { extractOutline, registerFSTools } from "./codemode/fs-outline.js"
 import { registerOrgTools } from "./codemode/org-tools.js"
 import { registerUITools } from "./codemode/ui-tools.js"
+import { registerOmniCommands } from "./commands/omni.js"
 import { registerShipCommand } from "./commands/ship.js"
 import { registerSwarmCommand } from "./commands/swarm.js"
 import { extractMutatedPaths, registerDiagnosticHook, runQuickDiagnostics } from "./diagnostics/runner.js"
 import { DOM_GEOMETRY_AUDIT_SCRIPT, type DOMAuditResult, type DOMDefect } from "./geometry/audit-script.js"
 import { STANDARD_VIEWPORTS, type ViewportDefinition } from "./geometry/viewports.js"
 import { MUSE_SOTA_BASE_PROMPT, registerMuseOverlay } from "./muse/overlay.js"
+import {
+  getArtifactsDir,
+  listArtifacts,
+  readArtifact,
+  registerArtifactContextHook,
+  registerArtifactTools,
+  writeArtifact,
+  type ArtifactName,
+} from "./omni/artifacts.js"
+import {
+  captureDesktopWindow,
+  registerGuiStudioTools,
+  VISUAL_QUALITY_CHECKLIST,
+} from "./omni/gui-studio.js"
+import {
+  computeLineHash,
+  hashEditFile,
+  hashReadFile,
+  registerHashlineTools,
+  type HashEditResult,
+  type HashLineHunk,
+  type HashReadResult,
+} from "./omni/hashline.js"
+import {
+  extractOfficeOrDataFile,
+  registerOfficeTools,
+  renderDocumentPreviews,
+  SUPPORTED_OFFICE_EXTENSIONS,
+} from "./omni/office.js"
+import {
+  auditMarkdownCitations,
+  getResearchLedgerPath,
+  loadResearchSources,
+  recordResearchSource,
+  registerResearchTools,
+  type CitationAuditReport,
+  type ResearchSource,
+} from "./omni/research.js"
 import {
   EMBEDDED_UI_CRAFT_SKILL_MD,
   loadSkillContent,
@@ -78,6 +120,9 @@ export {
   PROMPT_STAFF_UI,
   PROMPT_QA_ADVERSARY,
   PROMPT_RELEASE_OPS,
+  PROMPT_STUDIO_GUI,
+  PROMPT_RESEARCHER,
+  PROMPT_OFFICE_ANALYST,
   normalizeResourcePath,
   matchesPathPattern,
   evaluateBoardGuard,
@@ -100,7 +145,37 @@ export {
   verifyReleaseReady,
   getBoardPath,
 
-  // Geometry auditor & Code Mode helpers
+  // Omni-Harness: Hashline (Oh-My-Pi precision editing)
+  computeLineHash,
+  hashReadFile,
+  hashEditFile,
+  registerHashlineTools,
+
+  // Omni-Harness: Persistent Artifacts (Antigravity state sync)
+  getArtifactsDir,
+  writeArtifact,
+  readArtifact,
+  listArtifacts,
+  registerArtifactTools,
+  registerArtifactContextHook,
+
+  // Omni-Harness: Universal Office & Document Suite (Claude Cowork equivalence)
+  SUPPORTED_OFFICE_EXTENSIONS,
+  extractOfficeOrDataFile,
+  renderDocumentPreviews,
+  registerOfficeTools,
+
+  // Omni-Harness: Deep Research & Citation Verification
+  getResearchLedgerPath,
+  loadResearchSources,
+  recordResearchSource,
+  auditMarkdownCitations,
+  registerResearchTools,
+
+  // Omni-Harness: Web & Desktop GUI Studio
+  VISUAL_QUALITY_CHECKLIST,
+  captureDesktopWindow,
+  registerGuiStudioTools,
   DOM_GEOMETRY_AUDIT_SCRIPT,
   STANDARD_VIEWPORTS,
   extractOutline,
@@ -116,6 +191,7 @@ export {
   UI_CRAFT_SKILL_NAME,
   EMBEDDED_UI_CRAFT_SKILL_MD,
   loadSkillContent,
+  registerOmniCommands,
 }
 
 export type {
@@ -140,32 +216,43 @@ export type {
   DOMDefect,
   DOMAuditResult,
   ViewportDefinition,
+  HashLineHunk,
+  HashReadResult,
+  HashEditResult,
+  ArtifactName,
+  ResearchSource,
+  CitationAuditReport,
 }
 
 export const SWARMOS_PLUGIN_ID = "heretek.swarmos"
 
 /**
- * OpenCode SwarmOS Plugin Setup Function (v0.3.0).
+ * OpenCode SwarmOS Omni-Harness Plugin Setup Function (v0.4.0).
  *
- * Turns OpenCode V2 into an autonomous multi-agent software engineering company
- * and visual UI engine with hardware-enforced separation of powers.
+ * Turns OpenCode V2 into an autonomous multi-agent software company,
+ * Web/Desktop GUI Studio, Deep Research Analyst, and Office Document Suite.
  */
 export async function setup(ctx: any): Promise<void> {
   const rootDir = ctx.location?.directory ?? process.cwd()
 
-  // 1. Register 7 Specialized Engineering Roles with strict permission matrices
+  // 1. Register 10 Specialized Roles (7 Swarm Engineering + 3 Domain Product Adapters)
   if (ctx.agent?.transform) {
     await ctx.agent.transform((editor: any) => {
       registerSwarmOSAgents(editor)
     })
   }
 
-  // 2. Register Code Mode namespaces: tools.org.*, tools.ui.*, tools.fs.*
+  // 2. Register Code Mode namespaces & in-place tool upgrades (`read`, `websearch`, `webfetch`)
   if (ctx.tool?.transform) {
     await ctx.tool.transform((editor: any) => {
       registerOrgTools(editor, rootDir)
       registerUITools(editor)
       registerFSTools(editor, rootDir)
+      registerHashlineTools(editor, rootDir)
+      registerArtifactTools(editor, rootDir)
+      registerOfficeTools(editor, rootDir)
+      registerResearchTools(editor, rootDir)
+      registerGuiStudioTools(editor, rootDir)
     })
   }
 
@@ -178,12 +265,14 @@ export async function setup(ctx: any): Promise<void> {
   // 5. Register Anti-Slop UI Craft & Spatial Architecture Skill
   await registerUICraftSkill(ctx, rootDir)
 
-  // 6. Register Muse 1.3 / High-Context Model Overlay & Compaction Isolation
+  // 6. Register Muse 1.3 Overlay & Antigravity Persistent Artifact Context Sync
   await registerMuseOverlay(ctx)
+  await registerArtifactContextHook(ctx, rootDir)
 
-  // 7. Register Slash Commands: /ship and /swarm
+  // 7. Register Slash Commands: /ship, /swarm, /gui, /research, /office, /artifacts
   await registerShipCommand(ctx)
   await registerSwarmCommand(ctx, rootDir)
+  await registerOmniCommands(ctx, rootDir)
 }
 
 export interface SwarmOSPluginCallable {
@@ -192,11 +281,6 @@ export interface SwarmOSPluginCallable {
   readonly setup: (ctx: any) => Promise<void>
 }
 
-/**
- * Dual-compatible plugin export:
- * 1. Satisfies OpenCode V2's `PluginModule.load` Effect Schema (`{ id: string, setup: (ctx) => Promise<void> }`)
- * 2. Remains directly callable (`await SwarmOSPlugin(ctx)`) for existing unit tests and scripts.
- */
 export const SwarmOSPlugin: SwarmOSPluginCallable = Object.assign(
   async function SwarmOSPlugin(ctx: any): Promise<void> {
     return setup(ctx)

@@ -117,8 +117,11 @@ describe("SwarmOS Plugin & Roles Setup", () => {
 
     await SwarmOSPlugin.setup(mockCtx)
 
-    // Agents registered
-    expect(Object.keys(agentsRegistered).length).toBe(7)
+    // Agents registered (7 Swarm Engineering + 3 Omni-Harness Adapters)
+    expect(Object.keys(agentsRegistered).length).toBe(10)
+    expect(agentsRegistered["studio-gui"].name).toBe("Studio GUI")
+    expect(agentsRegistered.researcher.name).toBe("Researcher")
+    expect(agentsRegistered["office-analyst"].name).toBe("Office Analyst")
     expect(agentsRegistered.director.name).toBe("Director")
 
     // Namespaces registered
@@ -148,6 +151,10 @@ describe("SwarmOS Plugin & Roles Setup", () => {
     // Commands registered
     expect(commandsRegistered.ship).toBeDefined()
     expect(commandsRegistered.swarm).toBeDefined()
+    expect(commandsRegistered.gui).toBeDefined()
+    expect(commandsRegistered.research).toBeDefined()
+    expect(commandsRegistered.office).toBeDefined()
+    expect(commandsRegistered.artifacts).toBeDefined()
   })
 
   it("embeds full SKILL.md content even when disk path is missing", async () => {

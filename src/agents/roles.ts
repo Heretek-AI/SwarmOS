@@ -4,8 +4,11 @@ import {
   PROMPT_MANAGER,
   PROMPT_QA_ADVERSARY,
   PROMPT_RELEASE_OPS,
+  PROMPT_OFFICE_ANALYST,
+  PROMPT_RESEARCHER,
   PROMPT_STAFF_BACKEND,
   PROMPT_STAFF_UI,
+  PROMPT_STUDIO_GUI,
 } from "./prompts.js"
 
 export interface AgentPermissionRule {
@@ -40,6 +43,9 @@ export const SWARMOS_ROLES: Record<string, AgentDefinition> = {
       { action: "subagent", resource: "manager", effect: "allow" },
       { action: "subagent", resource: "explore", effect: "allow" },
       { action: "subagent", resource: "release-ops", effect: "allow" },
+      { action: "subagent", resource: "studio-gui", effect: "allow" },
+      { action: "subagent", resource: "researcher", effect: "allow" },
+      { action: "subagent", resource: "office-analyst", effect: "allow" },
     ],
   },
   architect: {
@@ -137,6 +143,43 @@ export const SWARMOS_ROLES: Record<string, AgentDefinition> = {
       { action: "subagent", resource: "*", effect: "deny" },
       { action: "subagent", resource: "explore", effect: "allow" },
       { action: "subagent", resource: "qa-adversary", effect: "allow" },
+    ],
+  },
+  "studio-gui": {
+    id: "studio-gui",
+    name: "Studio GUI",
+    description: "Primary Web & Native Desktop GUI Designer. Combines token-first styling with live DOM geometry & desktop window visual critique.",
+    mode: "all",
+    system: PROMPT_STUDIO_GUI,
+    permissions: [
+      { action: "question", resource: "*", effect: "allow" },
+      { action: "subagent", resource: "*", effect: "deny" },
+      { action: "subagent", resource: "explore", effect: "allow" },
+      { action: "subagent", resource: "qa-adversary", effect: "allow" },
+    ],
+  },
+  researcher: {
+    id: "researcher",
+    name: "Researcher",
+    description: "Primary Deep Research & Technical Intelligence Analyst. Runs parallel web/repo discovery with a verified citation ledger.",
+    mode: "all",
+    system: PROMPT_RESEARCHER,
+    permissions: [
+      { action: "question", resource: "*", effect: "allow" },
+      { action: "subagent", resource: "*", effect: "deny" },
+      { action: "subagent", resource: "explore", effect: "allow" },
+    ],
+  },
+  "office-analyst": {
+    id: "office-analyst",
+    name: "Office Analyst",
+    description: "Primary Document, Spreadsheet, Presentation & Data Architect (.docx, .xlsx, .pptx, .pdf, .sqlite) with visual page previewing.",
+    mode: "all",
+    system: PROMPT_OFFICE_ANALYST,
+    permissions: [
+      { action: "question", resource: "*", effect: "allow" },
+      { action: "subagent", resource: "*", effect: "deny" },
+      { action: "subagent", resource: "explore", effect: "allow" },
     ],
   },
 }
