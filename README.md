@@ -181,6 +181,16 @@ SwarmOS v0.4.0 expands OpenCode V2 beyond software engineering into a **Universa
 - **Oh-My-Pi Precision Hashline Editing (`tools.fs.hash_read` & `tools.fs.hash_edit`)**: Tags every line with a 2-hex FNV-1a content hash (`42#a7: const x = 1;`) and applies multi-hunk line-range replacements with automatic $\pm 3$-line drift recovery.
 - **Antigravity Persistent Artifacts (`/artifacts` & `tools.artifacts.*`)**: Automatically syncs `.opencode/artifacts/task.md` and `plan.md` into the live session context window across turns.
 
+### Agent Reliability Engines (v0.5.0+): `/map`, Circuit Breaker, Checkpoints, Memory & PTY Tap
+
+SwarmOS v0.5.0 adds five engines that keep long-running agents oriented, recoverable, and out of retry loops:
+
+- **PageRank RepoMap & Blast-Radius Analyzer (`/map`, `tools.repo.map`, `tools.repo.blast_radius`)**: Parses `import`/`export` edges and top-level symbols across the repository, ranks files by PageRank centrality (`tools.repo.map({ topN })`), and lists the direct and transitive reverse-import dependents of a file (`tools.repo.blast_radius({ path })`) before you change its interface.
+- **Doom-Loop Circuit Breaker (automatic)**: Tracks tool attempts per session. After **2 consecutive `edit`/`patch` failures** on the same file it injects a `<circuit-breaker-intervention>` steering the agent to `tools.fs.hash_read` / `tools.fs.hash_edit`; after **3 consecutive identical `shell` failures** it halts blind retries and requires root-cause notes in `notes.md`.
+- **Zero-Git-Noise Checkpoints (`tools.checkpoints.create` / `rollback` / `list`)**: Snapshots the given `paths` into `.opencode/checkpoints/<id>.json` before a risky refactor, then restores them (and removes files that did not exist yet) in one call, without commits or touching `HEAD`.
+- **Cross-Session Episodic Memory (`tools.memory.record_lesson` / `recall`)**: Stores repository lessons (`id`, `trigger`, `lesson`, optional `scopePaths`) in `.opencode/memory/lessons.json` and injects them as `<episodic-repository-memory>` into every non-compaction turn.
+- **Live PTY & Dev-Server Log Tap (`tools.pty.read_logs`)**: Reads a persistent terminal (`ptyID`, via `ctx.experimental.terminal.read`) or a log file (`logFile`, default `.opencode/artifacts/devserver.log`), with `lines` (10–500, default 80) and `filterErrorsOnly` so agents can check HMR/SSR/runtime errors right after an edit.
+
 ---
 
 ## 8. Development & Testing
