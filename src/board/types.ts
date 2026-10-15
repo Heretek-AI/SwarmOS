@@ -58,6 +58,11 @@ export interface TournamentCandidate {
   label: string
   taskId: string
   worktree: string
+  /** Git branch backing the worktree (`swarmos/<taskId>`). */
+  branch?: string
+  /** Whether a real git worktree exists at `worktree` (false outside git repositories). */
+  provisioned?: boolean
+  provisionNote?: string
 }
 
 export interface Tournament {
@@ -69,6 +74,10 @@ export interface Tournament {
   status: "active" | "resolved"
   winningTaskId?: string
   resolutionSummary?: string
+  /** Commit the candidates branched from. */
+  baseRef?: string
+  /** Merge commit created when the winner was merged into the main tree. */
+  mergeCommit?: string
   createdAt: string
   updatedAt: string
 }
@@ -147,4 +156,6 @@ export interface ResolveTournamentInput {
   tournamentId: string
   winningTaskId: string
   summary: string
+  /** Merge the winner's branch and remove all candidate worktrees (default true when worktrees exist). */
+  merge?: boolean
 }

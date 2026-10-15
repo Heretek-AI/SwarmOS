@@ -201,12 +201,23 @@ SwarmOS v0.6.0 makes it possible to check that SwarmOS is actually running and a
 - **Telemetry & observe mode**: Each session's tool calls, failures, circuit-breaker fires, turns and (when the host reports it) token usage are written to `.opencode/telemetry/<sessionID>.jsonl`. `{"mode": "observe"}` in `.opencode/swarmos.json` (or `SWARMOS_MODE=observe`) loads only telemetry and `/doctor`.
 - **Benchmark harness (`bench/`)**: 12 tasks (bugs, multi-file refactors, constraint-heavy features, UI fixes, one Python task), each with hidden tests and a reference solution. `bun run bench:check` proves every task fails untouched and passes when solved; `bun bench/run.ts --driver agent` runs a real agent on each task with SwarmOS on and in observe mode, and reports success rate, turns, tool failure rate, breaker fires, tokens and cache hits. See `bench/README.md`.
 
+### Safety (v0.7.0+): shell parsing, real worktree tournaments, edit transactions & taint tracking
+
+- **Shell commands are parsed, not pattern-matched**: `src/agents/shell-parse.ts` splits commands on `;`, `&&`, `||`, pipes and newlines, follows `$(...)`, backticks, process substitution, heredocs, `bash -c`/`sh -c`, `eval`, and wrappers like `sudo`, `env`, `timeout` and `xargs`, records redirections, and classifies every command as read, verify, write, network, destructive or exec. `bash -c "echo x > src/a.ts"`, `tee`, `cp` and `$(rm …)` no longer get past the guard. Every file a shell command writes goes through the same contract, ownership and tournament checks as `edit`.
+- **Per-role policy**: destructive commands (`git reset --hard`, `git push -f`, `git checkout -- …`, `rm -rf /`) are denied for everyone, but `--force-with-lease` is fine. `director` and `manager` cannot write, and need approval to run code or reach the network. `qa-adversary` may write only test files, and inline code (`python -c`, `node -e`) needs approval. Read-only commands from `director`, `manager`, `explore`, `plan` and `qa-adversary` run without a prompt. `explore` and `plan` need approval for anything else. Commands SwarmOS cannot parse always need approval.
+- **Real worktree tournaments**: `tools.org.plan_tournament` creates a git worktree per candidate at `.worktrees/<taskId>` on branch `swarmos/<taskId>`. While a tournament is active, its files are locked in the main tree and each candidate may edit only its own worktree. `tools.verify.run({ dir })` verifies a candidate, `tools.org.score_tournament` ranks all candidates (passing first, then fewest failures, then smallest diff), and `tools.org.resolve_tournament` merges the winner with `--no-ff`, removes every candidate worktree and branch, and aborts cleanly on conflicts.
+- **All-or-nothing edits**: before every `edit`, `write` or `patch`, SwarmOS snapshots the files the call will touch (patch envelopes and unified diffs are parsed for targets). If the call fails, every file is restored, files the call created are removed, and the model is told what was rolled back. Multi-file calls also leave an `auto-*` checkpoint, and only the last 20 are kept.
+- **Untrusted-content tracking**: after a session reads `webfetch`, `websearch`, browser, or third-party MCP output (including Code Mode scripts that call them), saved approvals no longer cover risky actions. Network commands, writes outside the project, edits to `.opencode/`, `.git/`, CI workflows, `package.json`, `.env` or shell profiles, and inline or downloaded code need approval again until the user runs `/untaint`.
+- `/doctor` now also shows how many times the host invoked each hook, so a hook stuck at 0 after real use (for example `tool.execute.before`) shows the host doesn't fire it.
+
 #### Configuration (`.opencode/swarmos.json`)
 
 ```jsonc
 {
   "mode": "full",                 // or "observe"; env: SWARMOS_MODE
   "telemetry": true,              // env: SWARMOS_TELEMETRY
+  "autoTransactions": true,       // env: SWARMOS_AUTO_TRANSACTIONS
+  "taintTracking": true,          // env: SWARMOS_TAINT_TRACKING
   "verifier": { "typecheck": "bun run typecheck", "test": "bun test" }
 }
 ```

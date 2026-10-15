@@ -1,5 +1,6 @@
 import { listSessionStates } from "../host/session-state.js"
 import { formatDoctorReport, getSetupReport } from "../host/setup-report.js"
+import { transactionStats } from "../omni/transactions.js"
 
 function sessionLines(): string[] {
   const states = listSessionStates()
@@ -17,8 +18,17 @@ function sessionLines(): string[] {
   ]
 }
 
+function transactionLines(): string[] {
+  const t = transactionStats
+  if (t.started === 0) return []
+  return [
+    "## Edit transactions",
+    `${t.started} snapshotted, ${t.committed} committed, ${t.rolledBack} rolled back (${t.filesRestored} file(s) restored).`,
+  ]
+}
+
 export function buildDoctorText(rootDir: string): string {
-  return formatDoctorReport(getSetupReport(rootDir), sessionLines())
+  return formatDoctorReport(getSetupReport(rootDir), [...sessionLines(), ...transactionLines()])
 }
 
 export function registerDoctorTools(editor: any, rootDir: string): void {

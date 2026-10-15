@@ -14,6 +14,8 @@ export interface ModuleReport {
   skills: string[]
   /** Exceptions thrown by this module's hook handlers at runtime (caught so the host tool call survives). */
   runtimeErrors: Array<{ hook: string; message: string; at: string }>
+  /** How many times the host has invoked each hook this module registered. */
+  hookCalls: Record<string, number>
 }
 
 export interface SetupReport {
@@ -42,7 +44,7 @@ export function storeSetupReport(report: SetupReport): void {
 }
 
 function newModuleReport(id: string): ModuleReport {
-  return { id, status: "registered", agents: [], namespaces: [], tools: [], hooks: [], commands: [], skills: [], runtimeErrors: [] }
+  return { id, status: "registered", agents: [], namespaces: [], tools: [], hooks: [], commands: [], skills: [], runtimeErrors: [], hookCalls: {} }
 }
 
 const MAX_RUNTIME_ERRORS = 20
@@ -50,6 +52,7 @@ const MAX_RUNTIME_ERRORS = 20
 function guardHandler(rec: ModuleReport, hookId: string, handler: any): any {
   if (typeof handler !== "function") return handler
   return async (...args: any[]) => {
+    rec.hookCalls[hookId] = (rec.hookCalls[hookId] ?? 0) + 1
     try {
       return await handler(...args)
     } catch (err: any) {
@@ -191,6 +194,22 @@ export function formatDoctorReport(report: SetupReport | undefined, extras: stri
       return `| ${m.id} | ${status} | ${parts.join("; ") || "-"} | ${m.runtimeErrors.length} |`
     }),
   ]
+
+  const hookTotals: Record<string, number> = {}
+  for (const m of report.modules) {
+    for (const h of m.hooks) hookTotals[h] ??= 0
+    for (const [h, n] of Object.entries(m.hookCalls)) hookTotals[h] = (hookTotals[h] ?? 0) + n
+  }
+  const hookIds = Object.keys(hookTotals).sort()
+  if (hookIds.length > 0) {
+    lines.push(
+      "",
+      "## Hook activity",
+      "Calls received from the host since setup. A hook stuck at 0 after real tool use means the host never fires it.",
+      "",
+      ...hookIds.map((h) => `- \`${h}\`: ${hookTotals[h]}`),
+    )
+  }
 
   const errored = report.modules.filter((m) => m.runtimeErrors.length > 0)
   if (errored.length > 0) {

@@ -52,6 +52,8 @@ export interface VerifyRun {
 }
 
 export interface VerifyRunInput {
+  /** Directory to verify, relative to the workspace root (e.g. a tournament worktree). */
+  dir?: string
   scope?: "changed" | "full"
   kinds?: VerifyKind[]
   paths?: string[]
@@ -482,6 +484,14 @@ export function formatVerifyRun(run: VerifyRun): string {
   return lines.join("\n")
 }
 
+export function resolveVerifyDir(rootDir: string, dir?: string): string {
+  if (!dir) return rootDir
+  const abs = path.resolve(rootDir, dir)
+  const rel = path.relative(path.resolve(rootDir), abs)
+  if (rel.startsWith("..") || path.isAbsolute(rel)) throw new Error(`SwarmOS Verify: "${dir}" is outside the workspace.`)
+  return abs
+}
+
 export function registerVerifyTools(editor: any, rootDir: string, pinned = true): void {
   editor.namespace({
     name: "verify",
@@ -497,6 +507,7 @@ export function registerVerifyTools(editor: any, rootDir: string, pinned = true)
     input: {
       type: "object",
       properties: {
+        dir: { type: "string", description: "Directory to verify relative to the workspace root, e.g. a tournament worktree '.worktrees/<taskId>'" },
         scope: { type: "string", enum: ["changed", "full"], description: "Scope of the run (default 'changed')" },
         kinds: { type: "array", items: { type: "string", enum: ["typecheck", "lint", "test"] }, description: "Subset of checks to run" },
         paths: { type: "array", items: { type: "string" }, description: "Override the changed-file set" },
@@ -505,7 +516,7 @@ export function registerVerifyTools(editor: any, rootDir: string, pinned = true)
     },
     output: { type: "object" },
     execute: async (input: VerifyRunInput) => {
-      const run = await runVerify(rootDir, input ?? {})
+      const run = await runVerify(resolveVerifyDir(rootDir, input?.dir), input ?? {})
       return { output: run, content: formatVerifyRun(run) }
     },
   })

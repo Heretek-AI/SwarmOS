@@ -50,7 +50,7 @@ var PROMPT_MANAGER = `You are the **Engineering Manager & Tech Lead** (\`manager
    - Break milestones into granular tasks in \`tools.org.create_task\` with explicit file ownership boundaries (\`ownedPaths\`) so parallel engineers never collide or overwrite each other's work.
 2. **Parallel Dispatch & Best-of-N Tournaments**:
    - Launch independent \`staff-backend\` and \`staff-ui\` tasks in parallel (\`subagent\` calls in the same step, or in isolated Git worktrees via \`tools.opencode.worktree_create\`).
-   - On high-complexity algorithmic or UI tasks, spawn 2 competing subagents in separate worktrees (Best-of-2 Tournament) and select the implementation that passes \`qa-adversary\` with zero defects.
+   - On high-complexity algorithmic or UI tasks, run a Best-of-N tournament: \`tools.org.plan_tournament\` creates a real git worktree per candidate (\`.worktrees/<taskId>\`). Tell each candidate subagent its worktree path; the guard blocks edits to contested files in the main tree. Have \`qa-adversary\` verify each candidate with \`tools.verify.run({ dir: "<worktree>" })\`, rank them with \`tools.org.score_tournament\`, then \`tools.org.resolve_tournament\` merges the winner and removes the other worktrees.
 3. **Zero Unverified Merges**:
    - NEVER accept an engineer's self-reported success at face value.
    - After \`staff-backend\` or \`staff-ui\` completes a task, you MUST spawn \`qa-adversary\` to audit the diff, run the test suite, and (for UI work) run the live browser DOM geometry audit.
@@ -85,7 +85,7 @@ var PROMPT_QA_ADVERSARY = `You are the **Adversarial QA, E2E & Security Lead** (
 
 # Verification Checklist
 1. **Contract & Diff Audit**: Run \`git status --short\` and \`git diff\` (or read modified files). Verify zero stubbed functions, zero hardcoded fake data, zero swallowed errors, and 100% adherence to locked contracts.
-2. **Automated Test Execution**: Call \`execute\` -> \`tools.verify.run({})\` (typecheck, lint, and the tests that import the changed files; use \`scope: "full"\` for cross-cutting changes). For tournament candidates, run it inside the candidate's worktree. Write additional edge-case tests (empty inputs, malformed payloads, concurrent calls, boundary values) to test resilience.
+2. **Automated Test Execution**: Call \`execute\` -> \`tools.verify.run({})\` (typecheck, lint, and the tests that import the changed files; use \`scope: "full"\` for cross-cutting changes). For tournament candidates, pass the candidate's worktree: \`tools.verify.run({ dir: ".worktrees/<taskId>" })\`. Write additional edge-case tests (empty inputs, malformed payloads, concurrent calls, boundary values) to test resilience.
 3. **Live Browser & UI Audit (for Frontend/Full-Stack Tasks)**:
    - Inspect \`tools.browser.console\` (must have 0 uncaught errors) and \`tools.browser.network.list\` (must have 0 unexpected 4xx/5xx failures).
    - Run the DOM Geometry Auditor script via \`tools.browser.evaluate\` and inspect \`tools.browser.screenshot\`.
@@ -309,11 +309,11 @@ function registerSwarmOSAgents(editor) {
 }
 
 // src/agents/guard.ts
-import * as path4 from "path";
+import * as path5 from "path";
 
 // src/board/board.ts
-import * as fs3 from "fs/promises";
-import * as path3 from "path";
+import * as fs4 from "fs/promises";
+import * as path4 from "path";
 
 // src/omni/verify.ts
 import { exec, execFile } from "child_process";
@@ -881,6 +881,15 @@ function formatVerifyRun(run) {
   return lines.join(`
 `);
 }
+function resolveVerifyDir(rootDir, dir) {
+  if (!dir)
+    return rootDir;
+  const abs = path2.resolve(rootDir, dir);
+  const rel = path2.relative(path2.resolve(rootDir), abs);
+  if (rel.startsWith("..") || path2.isAbsolute(rel))
+    throw new Error(`SwarmOS Verify: "${dir}" is outside the workspace.`);
+  return abs;
+}
 function registerVerifyTools(editor, rootDir, pinned = true) {
   editor.namespace({
     name: "verify",
@@ -893,6 +902,7 @@ function registerVerifyTools(editor, rootDir, pinned = true) {
     input: {
       type: "object",
       properties: {
+        dir: { type: "string", description: "Directory to verify relative to the workspace root, e.g. a tournament worktree '.worktrees/<taskId>'" },
         scope: { type: "string", enum: ["changed", "full"], description: "Scope of the run (default 'changed')" },
         kinds: { type: "array", items: { type: "string", enum: ["typecheck", "lint", "test"] }, description: "Subset of checks to run" },
         paths: { type: "array", items: { type: "string" }, description: "Override the changed-file set" },
@@ -901,7 +911,7 @@ function registerVerifyTools(editor, rootDir, pinned = true) {
     },
     output: { type: "object" },
     execute: async (input) => {
-      const run = await runVerify(rootDir, input ?? {});
+      const run = await runVerify(resolveVerifyDir(rootDir, input?.dir), input ?? {});
       return { output: run, content: formatVerifyRun(run) };
     }
   });
@@ -918,11 +928,123 @@ function registerVerifyTools(editor, rootDir, pinned = true) {
   });
 }
 
+// src/board/worktrees.ts
+import { execFile as execFile2 } from "child_process";
+import * as fs3 from "fs/promises";
+import * as path3 from "path";
+import { promisify as promisify2 } from "util";
+var execFileAsync2 = promisify2(execFile2);
+async function git2(cwd, args, timeout = 60000) {
+  try {
+    const { stdout, stderr } = await execFileAsync2("git", args, { cwd, timeout, maxBuffer: 32 * 1024 * 1024 });
+    return { ok: true, stdout, stderr };
+  } catch (err) {
+    return { ok: false, stdout: err?.stdout ?? "", stderr: err?.stderr ?? String(err?.message ?? err) };
+  }
+}
+async function isGitRepo(rootDir) {
+  const res = await git2(rootDir, ["rev-parse", "--is-inside-work-tree"]);
+  return res.ok && res.stdout.trim() === "true";
+}
+function candidateBranch(taskId) {
+  return `swarmos/${taskId}`;
+}
+async function provisionWorktree(rootDir, taskId, worktree, baseRef) {
+  const branch = candidateBranch(taskId);
+  const abs = path3.resolve(rootDir, worktree);
+  const list = await git2(rootDir, ["worktree", "list", "--porcelain"]);
+  if (list.ok && list.stdout.split(`
+`).some((l) => l === `worktree ${abs}`)) {
+    return { worktree, branch, provisioned: true, reason: "reused existing worktree" };
+  }
+  await fs3.mkdir(path3.dirname(abs), { recursive: true });
+  const branchExists = (await git2(rootDir, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`])).ok;
+  const res = branchExists ? await git2(rootDir, ["worktree", "add", abs, branch]) : await git2(rootDir, ["worktree", "add", "-b", branch, abs, baseRef]);
+  if (!res.ok)
+    return { worktree, branch, provisioned: false, reason: res.stderr.trim().slice(0, 300) };
+  return { worktree, branch, provisioned: true };
+}
+async function commitWorktree(worktreeDir, message) {
+  await git2(worktreeDir, ["add", "-A", "--", ".", ":(exclude).opencode"]);
+  const staged = await git2(worktreeDir, ["diff", "--cached", "--quiet"]);
+  if (staged.ok)
+    return false;
+  let res = await git2(worktreeDir, ["commit", "-q", "-m", message]);
+  if (!res.ok && /identity|user\.(name|email)/i.test(res.stderr)) {
+    res = await git2(worktreeDir, ["-c", "user.name=SwarmOS", "-c", "user.email=swarmos@localhost", "commit", "-q", "-m", message]);
+  }
+  if (!res.ok)
+    throw new Error(`SwarmOS Worktree: commit failed in ${worktreeDir}: ${res.stderr.trim()}`);
+  return true;
+}
+function parseShortstat(text) {
+  const n = (re) => Number(re.exec(text)?.[1] ?? 0);
+  return { files: n(/(\d+) files? changed/), insertions: n(/(\d+) insertions?/), deletions: n(/(\d+) deletions?/) };
+}
+async function scoreTournament(rootDir, tournament) {
+  const scores = [];
+  for (const c of tournament.candidates) {
+    const dir = path3.resolve(rootDir, c.worktree);
+    const provisioned = c.provisioned !== false && await isGitRepo(dir);
+    if (!provisioned) {
+      scores.push({ taskId: c.taskId, worktree: c.worktree, provisioned: false, passed: false, failedChecks: 0, failedTests: 0, diff: { files: 0, insertions: 0, deletions: 0 } });
+      continue;
+    }
+    const run = await runVerify(dir, { scope: "full" });
+    const base = tournament.baseRef ?? "HEAD";
+    const stat = await git2(dir, ["diff", "--shortstat", base, "--", ".", ":(exclude).opencode"]);
+    scores.push({
+      taskId: c.taskId,
+      worktree: c.worktree,
+      provisioned: true,
+      verifyRunId: run.id,
+      passed: run.passed,
+      failedChecks: run.checks.filter((k) => !k.passed).length,
+      failedTests: run.checks.reduce((a, k) => a + (k.counts?.failed ?? 0), 0),
+      diff: parseShortstat(stat.stdout)
+    });
+  }
+  const size = (s) => s.diff.insertions + s.diff.deletions;
+  return scores.sort((a, b) => Number(b.passed) - Number(a.passed) || a.failedChecks - b.failedChecks || a.failedTests - b.failedTests || size(a) - size(b));
+}
+async function mergeTournamentWinner(rootDir, tournament, winnerTaskId) {
+  const winner = tournament.candidates.find((c) => c.taskId === winnerTaskId);
+  if (!winner)
+    throw new Error(`SwarmOS Tournament: ${winnerTaskId} is not a candidate of ${tournament.id}`);
+  const winnerDir = path3.resolve(rootDir, winner.worktree);
+  await commitWorktree(winnerDir, `swarmos: ${tournament.id} candidate ${winner.label}`);
+  const branch = winner.branch ?? candidateBranch(winnerTaskId);
+  const merge = await git2(rootDir, ["merge", "--no-ff", "-m", `swarmos: merge tournament ${tournament.id} winner ${winnerTaskId}`, branch]);
+  if (!merge.ok) {
+    const conflicts = (await git2(rootDir, ["diff", "--name-only", "--diff-filter=U"])).stdout.trim().split(`
+`).filter(Boolean);
+    await git2(rootDir, ["merge", "--abort"]);
+    throw new Error(`SwarmOS Tournament: merging ${branch} failed${conflicts.length ? ` with conflicts in ${conflicts.join(", ")}` : ""}: ${merge.stderr.trim().slice(0, 300)}. The merge was aborted; resolve it manually or re-run the candidate on the current base.`);
+  }
+  const commit = (await git2(rootDir, ["rev-parse", "HEAD"])).stdout.trim();
+  const cleanup = await cleanupTournamentWorktrees(rootDir, tournament);
+  return { merged: true, commit, ...cleanup };
+}
+async function cleanupTournamentWorktrees(rootDir, tournament) {
+  const removedWorktrees = [];
+  const deletedBranches = [];
+  for (const c of tournament.candidates) {
+    const abs = path3.resolve(rootDir, c.worktree);
+    if ((await git2(rootDir, ["worktree", "remove", "--force", abs])).ok)
+      removedWorktrees.push(c.worktree);
+    const branch = c.branch ?? candidateBranch(c.taskId);
+    if ((await git2(rootDir, ["branch", "-D", branch])).ok)
+      deletedBranches.push(branch);
+  }
+  await git2(rootDir, ["worktree", "prune"]);
+  return { removedWorktrees, deletedBranches };
+}
+
 // src/board/board.ts
 var BOARD_VERSION = "4.1.0";
 var boardLocks = new Map;
 function getBoardPath(rootDir) {
-  return path3.join(rootDir, ".opencode", "org", "board.json");
+  return path4.join(rootDir, ".opencode", "org", "board.json");
 }
 function createEmptyBoard() {
   return {
@@ -936,7 +1058,7 @@ function createEmptyBoard() {
 async function loadBoard(rootDir) {
   const file = getBoardPath(rootDir);
   try {
-    const raw = await fs3.readFile(file, "utf8");
+    const raw = await fs4.readFile(file, "utf8");
     const parsed = JSON.parse(raw);
     return {
       version: parsed.version ?? BOARD_VERSION,
@@ -951,16 +1073,16 @@ async function loadBoard(rootDir) {
   }
 }
 async function saveBoard(rootDir, board) {
-  const dir = path3.join(rootDir, ".opencode", "org");
-  await fs3.mkdir(dir, { recursive: true });
-  const targetFile = path3.join(dir, "board.json");
-  const tempFile = path3.join(dir, `board.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`);
+  const dir = path4.join(rootDir, ".opencode", "org");
+  await fs4.mkdir(dir, { recursive: true });
+  const targetFile = path4.join(dir, "board.json");
+  const tempFile = path4.join(dir, `board.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`);
   const payload = JSON.stringify(board, null, 2);
-  await fs3.writeFile(tempFile, payload, "utf8");
-  await fs3.rename(tempFile, targetFile);
+  await fs4.writeFile(tempFile, payload, "utf8");
+  await fs4.rename(tempFile, targetFile);
 }
 async function withBoardLock(rootDir, mutator) {
-  const key = path3.resolve(rootDir);
+  const key = path4.resolve(rootDir);
   const previous = boardLocks.get(key) ?? Promise.resolve();
   let release;
   const gate = new Promise((resolve) => {
@@ -1051,7 +1173,7 @@ async function updateTaskStatus(rootDir, taskId, status) {
   });
 }
 function taskWorkdir(rootDir, task) {
-  return task.worktree ? path3.resolve(rootDir, task.worktree) : path3.resolve(rootDir);
+  return task.worktree ? path4.resolve(rootDir, task.worktree) : path4.resolve(rootDir);
 }
 async function assertVerifiedPass(rootDir, task, verifyRunId) {
   if (!verifyRunId) {
@@ -1064,7 +1186,7 @@ async function assertVerifiedPass(rootDir, task, verifyRunId) {
   if (!run.passed) {
     throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] FAILED; a failing run cannot back a PASS receipt.`);
   }
-  if (path3.resolve(run.rootDir) !== workdir) {
+  if (path4.resolve(run.rootDir) !== workdir) {
     throw new Error(`SwarmOS Verify Gate: verify run [${verifyRunId}] ran in ${run.rootDir}, but task [${task.id}] lives in ${workdir}.`);
   }
   const current = await computeTreeFingerprint(workdir);
@@ -1101,6 +1223,35 @@ async function submitQAReceipt(rootDir, input) {
   });
 }
 async function planTournament(rootDir, input) {
+  const planned = await recordTournamentPlan(rootDir, input);
+  if (!await isGitRepo(rootDir)) {
+    return markProvisioning(rootDir, planned.id, undefined, planned.candidates.map(() => ({ provisioned: false, reason: "not a git repository" })));
+  }
+  const baseRef = (await git2(rootDir, ["rev-parse", "HEAD"])).stdout.trim() || "HEAD";
+  const results = [];
+  for (const c of planned.candidates) {
+    results.push(await provisionWorktree(rootDir, c.taskId, c.worktree, baseRef));
+  }
+  return markProvisioning(rootDir, planned.id, baseRef, results);
+}
+async function markProvisioning(rootDir, tournamentId, baseRef, results) {
+  return withBoardLock(rootDir, (board) => {
+    const tournament = board.tournaments.find((t) => t.id === tournamentId);
+    if (baseRef)
+      tournament.baseRef = baseRef;
+    tournament.candidates.forEach((c, i) => {
+      c.provisioned = results[i].provisioned;
+      if (results[i].branch)
+        c.branch = results[i].branch;
+      if (results[i].reason)
+        c.provisionNote = results[i].reason;
+      else
+        delete c.provisionNote;
+    });
+    return tournament;
+  });
+}
+async function recordTournamentPlan(rootDir, input) {
   return withBoardLock(rootDir, (board) => {
     if (!Array.isArray(board.tournaments)) {
       board.tournaments = [];
@@ -1153,23 +1304,14 @@ async function planTournament(rootDir, input) {
   });
 }
 async function resolveTournament(rootDir, input) {
+  const snapshot = await loadBoard(rootDir);
+  const planned = assertResolvable(snapshot, input);
+  let merge;
+  if (input.merge !== false && planned.candidates.some((c) => c.provisioned)) {
+    merge = await mergeTournamentWinner(rootDir, planned, input.winningTaskId);
+  }
   return withBoardLock(rootDir, (board) => {
-    if (!Array.isArray(board.tournaments)) {
-      board.tournaments = [];
-    }
-    const tournament = board.tournaments.find((t) => t.id === input.tournamentId);
-    if (!tournament) {
-      throw new Error(`SwarmOS Tournament not found: ${input.tournamentId}`);
-    }
-    const isCandidate = tournament.candidates.some((c) => c.taskId === input.winningTaskId);
-    if (!isCandidate) {
-      throw new Error(`SwarmOS Tournament Guard: Task "${input.winningTaskId}" is not a registered candidate of tournament "${input.tournamentId}".`);
-    }
-    const winningTask = board.tasks.find((t) => t.id === input.winningTaskId);
-    const latestReceipt = winningTask?.qaReceipts[winningTask.qaReceipts.length - 1];
-    if (!winningTask || winningTask.status !== "verified" || latestReceipt?.verdict !== "PASS") {
-      throw new Error(`SwarmOS Tournament Guard: Winning candidate task [${input.winningTaskId}] must have a verified PASS QA receipt before resolving the tournament.`);
-    }
+    const tournament = assertResolvable(board, input);
     const now = new Date().toISOString();
     for (const candidate of tournament.candidates) {
       if (candidate.taskId === input.winningTaskId)
@@ -1184,8 +1326,35 @@ async function resolveTournament(rootDir, input) {
     tournament.winningTaskId = input.winningTaskId;
     tournament.resolutionSummary = input.summary;
     tournament.updatedAt = now;
+    if (merge?.commit) {
+      tournament.mergeCommit = merge.commit;
+      const winnerTask = board.tasks.find((t) => t.id === input.winningTaskId);
+      if (winnerTask)
+        delete winnerTask.worktree;
+      for (const c of tournament.candidates)
+        c.provisioned = false;
+    }
     return tournament;
   });
+}
+function assertResolvable(board, input) {
+  const tournament = (board.tournaments ?? []).find((t) => t.id === input.tournamentId);
+  if (!tournament) {
+    throw new Error(`SwarmOS Tournament not found: ${input.tournamentId}`);
+  }
+  const isCandidate = tournament.candidates.some((c) => c.taskId === input.winningTaskId);
+  if (!isCandidate) {
+    throw new Error(`SwarmOS Tournament Guard: Task "${input.winningTaskId}" is not a registered candidate of tournament "${input.tournamentId}".`);
+  }
+  const winningTask = board.tasks.find((t) => t.id === input.winningTaskId);
+  const latestReceipt = winningTask?.qaReceipts[winningTask.qaReceipts.length - 1];
+  if (!winningTask || winningTask.status !== "verified" || latestReceipt?.verdict !== "PASS") {
+    throw new Error(`SwarmOS Tournament Guard: Winning candidate task [${input.winningTaskId}] must have a verified PASS QA receipt before resolving the tournament.`);
+  }
+  if (tournament.status === "resolved") {
+    throw new Error(`SwarmOS Tournament Guard: Tournament "${input.tournamentId}" is already resolved.`);
+  }
+  return tournament;
 }
 async function verifyReleaseReady(rootDir) {
   const board = await loadBoard(rootDir);
@@ -1268,12 +1437,811 @@ async function verifyReleaseReady(rootDir) {
   };
 }
 
+// src/agents/shell-parse.ts
+var OPERATOR_CHARS = new Set([";", "&", "|", `
+`, "(", ")"]);
+function findClosingParen(src, start) {
+  let depth = 1;
+  for (let i = start;i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "\\") {
+      i++;
+    } else if (ch === "'") {
+      const end = src.indexOf("'", i + 1);
+      if (end < 0)
+        return -1;
+      i = end;
+    } else if (ch === '"') {
+      i++;
+      while (i < src.length && src[i] !== '"') {
+        if (src[i] === "\\")
+          i++;
+        i++;
+      }
+      if (i >= src.length)
+        return -1;
+    } else if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      depth--;
+      if (depth === 0)
+        return i;
+    }
+  }
+  return -1;
+}
+function parseShell(src) {
+  const commands = [];
+  const nested = [];
+  let argv = [];
+  let redirects = [];
+  let word = "";
+  let inWord = false;
+  let pendingRedirect = null;
+  const pendingHeredocs = [];
+  let ok = true;
+  const endWord = () => {
+    if (!inWord)
+      return;
+    if (pendingRedirect) {
+      if (pendingRedirect.startsWith("<<") && !pendingRedirect.startsWith("<<<")) {
+        pendingHeredocs.push(word);
+      } else {
+        redirects.push({ op: pendingRedirect, target: word });
+      }
+      pendingRedirect = null;
+    } else {
+      argv.push(word);
+    }
+    word = "";
+    inWord = false;
+  };
+  const endCommand = () => {
+    endWord();
+    if (argv.length || redirects.length)
+      commands.push({ argv, redirects });
+    argv = [];
+    redirects = [];
+  };
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "\\") {
+      if (src[i + 1] === `
+`) {
+        i += 2;
+        continue;
+      }
+      word += src[i + 1] ?? "";
+      inWord = true;
+      i += 2;
+      continue;
+    }
+    if (ch === "'") {
+      const end = src.indexOf("'", i + 1);
+      if (end < 0) {
+        ok = false;
+        word += src.slice(i + 1);
+        inWord = true;
+        break;
+      }
+      word += src.slice(i + 1, end);
+      inWord = true;
+      i = end + 1;
+      continue;
+    }
+    if (ch === '"') {
+      i++;
+      inWord = true;
+      let closed = false;
+      while (i < src.length) {
+        const c = src[i];
+        if (c === "\\" && i + 1 < src.length && '"\\$`\n'.includes(src[i + 1])) {
+          word += src[i + 1];
+          i += 2;
+        } else if (c === '"') {
+          closed = true;
+          i++;
+          break;
+        } else if (c === "$" && src[i + 1] === "(" && src[i + 2] !== "(") {
+          const end = findClosingParen(src, i + 2);
+          if (end < 0) {
+            ok = false;
+            i = src.length;
+            break;
+          }
+          nested.push(src.slice(i + 2, end));
+          word += "$(...)";
+          i = end + 1;
+        } else if (c === "`") {
+          const end = src.indexOf("`", i + 1);
+          if (end < 0) {
+            ok = false;
+            i = src.length;
+            break;
+          }
+          nested.push(src.slice(i + 1, end));
+          word += "`...`";
+          i = end + 1;
+        } else {
+          word += c;
+          i++;
+        }
+      }
+      if (!closed)
+        ok = false;
+      continue;
+    }
+    if (ch === "$" && src[i + 1] === "(" && src[i + 2] === "(") {
+      const end = src.indexOf("))", i + 3);
+      if (end < 0) {
+        ok = false;
+        break;
+      }
+      word += src.slice(i, end + 2);
+      inWord = true;
+      i = end + 2;
+      continue;
+    }
+    if ((ch === "$" || ch === "<" || ch === ">") && src[i + 1] === "(") {
+      if (ch !== "$" && inWord) {} else {
+        const end = findClosingParen(src, i + 2);
+        if (end < 0) {
+          ok = false;
+          break;
+        }
+        nested.push(src.slice(i + 2, end));
+        word += ch === "$" ? "$(...)" : `${ch}(...)`;
+        inWord = true;
+        i = end + 1;
+        continue;
+      }
+    }
+    if (ch === "`") {
+      const end = src.indexOf("`", i + 1);
+      if (end < 0) {
+        ok = false;
+        break;
+      }
+      nested.push(src.slice(i + 1, end));
+      word += "`...`";
+      inWord = true;
+      i = end + 1;
+      continue;
+    }
+    if (ch === "#" && !inWord) {
+      const nl = src.indexOf(`
+`, i);
+      i = nl < 0 ? src.length : nl;
+      continue;
+    }
+    if (ch === ">" || ch === "<" || ch === "&" && src[i + 1] === ">") {
+      let fdPrefix = "";
+      if (inWord && /^\d+$/.test(word)) {
+        fdPrefix = word;
+        word = "";
+        inWord = false;
+      } else {
+        endWord();
+      }
+      let op = ch;
+      let j = i + 1;
+      if (ch === "&") {
+        op = "&>";
+        j = i + 2;
+        if (src[j] === ">") {
+          op = "&>>";
+          j++;
+        }
+      } else if (ch === ">" && (src[j] === ">" || src[j] === "|")) {
+        op += src[j];
+        j++;
+      } else if (ch === "<" && src[j] === "<") {
+        op = "<<";
+        j++;
+        if (src[j] === "<") {
+          op = "<<<";
+          j++;
+        } else if (src[j] === "-") {
+          op = "<<-";
+          j++;
+        }
+      } else if (ch === "<" && src[j] === ">") {
+        op = "<>";
+        j++;
+      }
+      if ((op === ">" || op === "<") && src[j] === "&") {
+        let k = j + 1;
+        while (k < src.length && /[0-9-]/.test(src[k]))
+          k++;
+        redirects.push({ op: `${fdPrefix}${op}&`, target: src.slice(j + 1, k) });
+        i = k;
+        continue;
+      }
+      pendingRedirect = `${fdPrefix}${op}`;
+      i = j;
+      continue;
+    }
+    if (OPERATOR_CHARS.has(ch)) {
+      endCommand();
+      if (ch === `
+` && pendingHeredocs.length > 0) {
+        let pos = i + 1;
+        while (pendingHeredocs.length > 0) {
+          const delim = pendingHeredocs.shift();
+          let found = false;
+          while (pos < src.length) {
+            const nl = src.indexOf(`
+`, pos);
+            const line = src.slice(pos, nl < 0 ? src.length : nl);
+            pos = nl < 0 ? src.length : nl + 1;
+            if (line.replace(/^\t+/, "") === delim) {
+              found = true;
+              break;
+            }
+          }
+          if (!found)
+            ok = false;
+        }
+        i = pos;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (ch === " " || ch === "\t" || ch === "\r") {
+      endWord();
+      i++;
+      continue;
+    }
+    word += ch;
+    inWord = true;
+    i++;
+  }
+  endCommand();
+  if (pendingRedirect)
+    ok = false;
+  return { commands, nested, ok };
+}
+var READ_ONLY = new Set([
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "grep",
+  "egrep",
+  "fgrep",
+  "rg",
+  "ag",
+  "pwd",
+  "which",
+  "whereis",
+  "type",
+  "echo",
+  "printf",
+  "stat",
+  "file",
+  "tree",
+  "du",
+  "df",
+  "printenv",
+  "cut",
+  "tr",
+  "diff",
+  "cmp",
+  "comm",
+  "sha1sum",
+  "sha256sum",
+  "sha512sum",
+  "md5sum",
+  "shasum",
+  "date",
+  "uname",
+  "whoami",
+  "id",
+  "true",
+  "false",
+  "test",
+  "[",
+  "basename",
+  "dirname",
+  "realpath",
+  "readlink",
+  "nl",
+  "column",
+  "jq",
+  "less",
+  "more",
+  "hostname",
+  "ps",
+  "lsof",
+  "xxd",
+  "od",
+  "hexdump",
+  "strings",
+  "fd",
+  "fdfind",
+  "sleep",
+  "seq",
+  "yes",
+  "cd",
+  "pushd",
+  "popd",
+  "uniq",
+  "sort",
+  "find",
+  "sed",
+  "awk",
+  "gawk",
+  "mawk",
+  "ast-grep",
+  "sg",
+  "env",
+  "tac",
+  "rev",
+  "fold",
+  "expr",
+  "locale",
+  "getconf",
+  "nproc",
+  "free",
+  "uptime",
+  "ldd",
+  "man",
+  "help"
+]);
+var WRITE_PROGRAMS = new Set([
+  "rm",
+  "rmdir",
+  "mv",
+  "cp",
+  "touch",
+  "mkdir",
+  "ln",
+  "chmod",
+  "chown",
+  "chgrp",
+  "truncate",
+  "dd",
+  "tee",
+  "install",
+  "unzip",
+  "tar",
+  "patch",
+  "shred",
+  "unlink",
+  "mkfifo",
+  "split",
+  "csplit",
+  "gzip",
+  "gunzip",
+  "zip"
+]);
+var NETWORK_PROGRAMS = new Set(["curl", "wget", "ssh", "scp", "sftp", "nc", "ncat", "netcat", "telnet", "ftp", "gh", "rsync"]);
+var SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "fish"]);
+var INTERPRETERS = new Set(["python", "python3", "python2", "node", "bun", "deno", "ruby", "perl", "php", "osascript", "pwsh", "powershell"]);
+var INLINE_FLAGS = new Set(["-c", "-e", "--eval", "-p", "--print", "-E", "-r"]);
+var VERIFY_SCRIPT_RE = /^(?:test|tests|lint|typecheck|type-check|check|check-types|build|format:check|fmt:check|ci)(?::.*)?$/;
+function unwrap(argv) {
+  let a = [...argv];
+  let viaXargs = false;
+  for (let guard = 0;guard < 10 && a.length > 0; guard++) {
+    while (a.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(a[0]))
+      a.shift();
+    const p = a[0];
+    if (!p)
+      break;
+    if (p === "sudo" || p === "doas") {
+      a.shift();
+      while (a.length && a[0].startsWith("-")) {
+        const flag = a.shift();
+        if (/^-[ugCh]$/.test(flag))
+          a.shift();
+      }
+    } else if (p === "env") {
+      a.shift();
+      while (a.length && (a[0].startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(a[0]))) {
+        const flag = a.shift();
+        if (flag === "-u" || flag === "-C" || flag === "-S")
+          a.shift();
+      }
+      if (a.length === 0)
+        return { argv: ["env"], viaXargs };
+    } else if (p === "timeout") {
+      a.shift();
+      while (a.length && a[0].startsWith("-")) {
+        const flag = a.shift();
+        if (flag === "-s" || flag === "-k" || flag === "--signal" || flag === "--kill-after")
+          a.shift();
+      }
+      a.shift();
+    } else if (p === "nice" || p === "ionice") {
+      a.shift();
+      while (a.length && a[0].startsWith("-")) {
+        const flag = a.shift();
+        if (/^-[ncp]$/.test(flag))
+          a.shift();
+      }
+    } else if (p === "nohup" || p === "command" || p === "exec" || p === "time" || p === "builtin" || p === "stdbuf" || p === "unbuffer") {
+      a.shift();
+      while (a.length && a[0].startsWith("-"))
+        a.shift();
+    } else if (p === "xargs") {
+      viaXargs = true;
+      a.shift();
+      while (a.length && a[0].startsWith("-")) {
+        const flag = a.shift();
+        if (/^-[IdEsLnPa]$/.test(flag))
+          a.shift();
+      }
+      if (a.length === 0)
+        return { argv: ["echo"], viaXargs };
+    } else {
+      break;
+    }
+  }
+  return { argv: a, viaXargs };
+}
+function nonFlagArgs(args) {
+  const out = [];
+  let endOfFlags = false;
+  for (const a of args) {
+    if (!endOfFlags && a === "--") {
+      endOfFlags = true;
+      continue;
+    }
+    if (!endOfFlags && a.startsWith("-") && a !== "-")
+      continue;
+    out.push(a);
+  }
+  return out;
+}
+function hasFlag(args, ...flags) {
+  return args.some((a) => flags.includes(a) || flags.some((f) => /^-[a-zA-Z]$/.test(f) && /^-[a-zA-Z]+$/.test(a) && a.includes(f[1])));
+}
+function classifyGit(args) {
+  let i = 0;
+  while (i < args.length && args[i].startsWith("-")) {
+    if (args[i] === "-C" || args[i] === "-c")
+      i++;
+    i++;
+  }
+  const sub = args[i] ?? "";
+  const rest = args.slice(i + 1);
+  const read = { effects: ["read"], writes: [] };
+  const write = { effects: ["write"], writes: [] };
+  switch (sub) {
+    case "":
+    case "status":
+    case "diff":
+    case "log":
+    case "show":
+    case "blame":
+    case "rev-parse":
+    case "ls-files":
+    case "ls-tree":
+    case "grep":
+    case "describe":
+    case "shortlog":
+    case "cat-file":
+    case "rev-list":
+    case "merge-base":
+    case "name-rev":
+    case "whatchanged":
+    case "help":
+    case "version":
+    case "--version":
+      return read;
+    case "reflog":
+      return rest[0] === "expire" || rest[0] === "delete" ? { effects: ["destructive"], writes: [], note: "rewrites reflog" } : read;
+    case "config":
+      return hasFlag(rest, "--get", "--get-all", "--list", "-l", "--get-regexp") || nonFlagArgs(rest).length <= 1 ? read : write;
+    case "remote":
+      return rest.length === 0 || hasFlag(rest, "-v", "--verbose") || rest[0] === "show" || rest[0] === "get-url" ? read : write;
+    case "branch":
+      if (hasFlag(rest, "-D") || hasFlag(rest, "-d", "--delete") && hasFlag(rest, "-f", "--force")) {
+        return { effects: ["destructive"], writes: [], note: "force-deletes a branch" };
+      }
+      return nonFlagArgs(rest).length === 0 || hasFlag(rest, "--list", "-l", "--show-current", "-a", "-r", "-v", "-vv", "--contains", "--merged") ? read : write;
+    case "tag":
+      return nonFlagArgs(rest).length === 0 || hasFlag(rest, "-l", "--list", "-n") ? read : write;
+    case "stash":
+      if (rest[0] === "list" || rest[0] === "show")
+        return read;
+      if (rest[0] === "drop" || rest[0] === "clear")
+        return { effects: ["destructive"], writes: [], note: "discards stashed work" };
+      return write;
+    case "worktree":
+      if (rest[0] === "list")
+        return read;
+      if (rest[0] === "remove" && hasFlag(rest, "-f", "--force"))
+        return { effects: ["destructive"], writes: [], note: "force-removes a worktree" };
+      return write;
+    case "reset":
+      return hasFlag(rest, "--hard", "--merge", "--keep") ? { effects: ["destructive"], writes: [], note: "discards working-tree changes" } : write;
+    case "clean":
+      return hasFlag(rest, "-f", "--force") ? { effects: ["destructive"], writes: [], note: "deletes untracked files" } : read;
+    case "checkout": {
+      const dashdash = rest.indexOf("--");
+      if (dashdash >= 0 || rest.includes(".") || hasFlag(rest, "-f", "--force")) {
+        return { effects: ["destructive"], writes: [], note: "overwrites working-tree files" };
+      }
+      return write;
+    }
+    case "restore":
+      return hasFlag(rest, "--staged", "-S") && !hasFlag(rest, "--worktree", "-W") ? write : { effects: ["destructive"], writes: [], note: "overwrites working-tree files" };
+    case "push":
+      if (rest.some((a) => a === "--force" || a === "-f" || /^-[a-zA-Z]*f/.test(a) || a === "--mirror" || a === "--delete" || a.startsWith("+"))) {
+        return { effects: ["destructive", "network"], writes: [], note: "force-push or remote deletion" };
+      }
+      return { effects: ["write", "network"], writes: [] };
+    case "pull":
+    case "fetch":
+    case "clone":
+    case "submodule":
+    case "ls-remote":
+      return { effects: sub === "ls-remote" ? ["network"] : ["write", "network"], writes: [] };
+    case "gc":
+    case "prune":
+      return hasFlag(rest, "--prune=now", "--aggressive") || sub === "prune" ? { effects: ["destructive"], writes: [], note: "prunes objects" } : write;
+    case "rm":
+    case "mv":
+      return { effects: ["write"], writes: nonFlagArgs(rest) };
+    default:
+      return write;
+  }
+}
+function classifyPackageManager(program, args) {
+  const sub = args[0] ?? "";
+  if (program === "npx" || program === "bunx" || program === "pnpm" && sub === "dlx" || program === "yarn" && sub === "dlx") {
+    return { effects: ["exec", "network"], writes: [] };
+  }
+  if (sub === "test" || sub === "t")
+    return { effects: ["verify"], writes: [] };
+  if (sub === "run" || sub === "run-script") {
+    return VERIFY_SCRIPT_RE.test(args[1] ?? "") ? { effects: ["verify"], writes: [] } : { effects: ["exec"], writes: [] };
+  }
+  if (program === "bun" && sub === "test")
+    return { effects: ["verify"], writes: [] };
+  if (["install", "i", "add", "remove", "rm", "uninstall", "update", "upgrade", "ci", "link"].includes(sub)) {
+    return { effects: ["write", "network"], writes: [] };
+  }
+  if (sub === "publish" || sub === "deploy")
+    return { effects: ["network", "write"], writes: [] };
+  if (["ls", "list", "outdated", "why", "view", "info", "--version", "-v", "help"].includes(sub)) {
+    return { effects: sub === "view" || sub === "info" || sub === "outdated" ? ["network"] : ["read"], writes: [] };
+  }
+  if (program === "bun" || program === "node" || program === "deno")
+    return { effects: ["exec"], writes: [] };
+  return { effects: ["exec"], writes: [] };
+}
+function classify(argv, depth) {
+  const program = (argv[0] ?? "").split("/").pop() ?? "";
+  const args = argv.slice(1);
+  if (SHELLS.has(program)) {
+    const cIdx = args.findIndex((a) => a === "-c" || /^-[a-zA-Z]*c$/.test(a) && a.startsWith("-"));
+    if (cIdx >= 0 && args[cIdx + 1] !== undefined)
+      return { effects: [], writes: [], nested: args[cIdx + 1] };
+    return { effects: ["exec"], writes: [], note: `runs a ${program} script` };
+  }
+  if (program === "eval")
+    return { effects: [], writes: [], nested: args.join(" ") };
+  if (program === "source" || program === ".")
+    return { effects: ["exec"], writes: [], note: "sources a script" };
+  if (program === "git")
+    return classifyGit(args);
+  if (["npm", "pnpm", "yarn", "npx", "bunx", "bun", "deno"].includes(program)) {
+    if (program === "bun" && INLINE_FLAGS.has(args[0] ?? ""))
+      return { effects: ["exec"], writes: [], note: "inline bun script" };
+    return classifyPackageManager(program, args);
+  }
+  if (INTERPRETERS.has(program)) {
+    if (args.some((a) => INLINE_FLAGS.has(a) || /^-[a-zA-Z]*[ce]$/.test(a))) {
+      if (program === "perl" && args.some((a) => /^-[a-zA-Z]*i/.test(a))) {
+        return { effects: ["write", "exec"], writes: nonFlagArgs(args).slice(1), note: "perl in-place edit" };
+      }
+      return { effects: ["exec"], writes: [], note: `inline ${program} code` };
+    }
+    if ((program === "python" || program === "python3") && args[0] === "-m") {
+      const mod = args[1] ?? "";
+      if (["pytest", "unittest", "mypy", "py_compile", "compileall", "doctest", "pyflakes", "pylint"].includes(mod)) {
+        return { effects: ["verify"], writes: [] };
+      }
+      if (mod === "pip")
+        return { effects: ["write", "network"], writes: [] };
+      if (mod === "http.server" || mod === "json.tool")
+        return { effects: ["read"], writes: [] };
+      return { effects: ["exec"], writes: [] };
+    }
+    if (program === "node" && (args[0] === "--check" || args[0] === "-c"))
+      return { effects: ["verify"], writes: [] };
+    if (program === "node" && args[0] === "--test")
+      return { effects: ["verify"], writes: [] };
+    if (args.length === 0 || args[0] === "--version" || args[0] === "-V")
+      return { effects: ["read"], writes: [] };
+    return { effects: ["exec"], writes: [], note: `runs a ${program} script` };
+  }
+  if (["tsc", "vitest", "jest", "pytest", "mypy", "oxlint", "biome", "eslint", "ruff", "prettier", "tsgo", "pyright", "go", "cargo", "make", "gradle", "mvn"].includes(program)) {
+    if (program === "eslint" && hasFlag(args, "--fix"))
+      return { effects: ["write"], writes: [] };
+    if (program === "ruff" && (args[0] === "format" || hasFlag(args, "--fix")))
+      return { effects: ["write"], writes: [] };
+    if (program === "prettier")
+      return hasFlag(args, "--write", "-w") ? { effects: ["write"], writes: [] } : { effects: ["verify"], writes: [] };
+    if (program === "biome" && hasFlag(args, "--write", "--apply"))
+      return { effects: ["write"], writes: [] };
+    if (program === "go") {
+      const sub = args[0] ?? "";
+      if (["test", "vet", "build", "list", "version", "env", "doc"].includes(sub))
+        return { effects: ["verify"], writes: [] };
+      if (sub === "fmt")
+        return { effects: ["write"], writes: [] };
+      return { effects: ["write", "network"], writes: [] };
+    }
+    if (program === "cargo") {
+      const sub = args[0] ?? "";
+      if (["test", "check", "clippy", "build", "doc", "tree", "metadata", "--version"].includes(sub))
+        return { effects: ["verify"], writes: [] };
+      if (sub === "fmt")
+        return hasFlag(args, "--check") ? { effects: ["verify"], writes: [] } : { effects: ["write"], writes: [] };
+      return { effects: ["write", "network"], writes: [] };
+    }
+    if (program === "make" || program === "gradle" || program === "mvn") {
+      return /^(test|check|lint|build|verify)$/.test(args[0] ?? "") ? { effects: ["verify"], writes: [] } : { effects: ["exec"], writes: [] };
+    }
+    return { effects: ["verify"], writes: [] };
+  }
+  if (NETWORK_PROGRAMS.has(program)) {
+    const writes = [];
+    if (program === "curl") {
+      const o = args.findIndex((a) => a === "-o" || a === "--output");
+      if (o >= 0 && args[o + 1])
+        writes.push(args[o + 1]);
+      if (hasFlag(args, "-O", "--remote-name"))
+        writes.push("<remote-name>");
+    }
+    if (program === "wget") {
+      const o = args.findIndex((a) => a === "-O" || a === "--output-document");
+      writes.push(o >= 0 && args[o + 1] ? args[o + 1] : "<remote-name>");
+    }
+    if (program === "rsync" || program === "scp") {
+      const files = nonFlagArgs(args);
+      const dest = files[files.length - 1];
+      if (dest && !dest.includes(":"))
+        writes.push(dest);
+    }
+    return { effects: writes.length ? ["network", "write"] : ["network"], writes };
+  }
+  if (WRITE_PROGRAMS.has(program)) {
+    const files = nonFlagArgs(args);
+    let writes = files;
+    if (program === "cp" || program === "install" || program === "ln")
+      writes = files.slice(-1);
+    if (program === "dd")
+      writes = args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3));
+    if (program === "tar") {
+      const f = args.findIndex((a) => a === "-f" || /^-?[a-zA-Z]*f$/.test(a));
+      const extracting = args.some((a) => /^-?[a-zA-Z]*x/.test(a) || a === "--extract");
+      writes = extracting ? ["<archive contents>"] : f >= 0 && args[f + 1] ? [args[f + 1]] : [];
+      if (!extracting && !args.some((a) => /^-?[a-zA-Z]*c/.test(a) || a === "--create"))
+        return { effects: ["read"], writes: [] };
+    }
+    if (program === "unzip")
+      writes = ["<archive contents>"];
+    if (program === "patch")
+      writes = ["<patched files>"];
+    if (program === "rm" && hasFlag(args, "-r", "-R", "--recursive") && files.some((f) => f === "/" || f === "~" || f === "*" || f === "." || f === "..")) {
+      return { effects: ["destructive"], writes: files, note: "recursive delete of a broad path" };
+    }
+    return { effects: ["write"], writes };
+  }
+  if (READ_ONLY.has(program)) {
+    if (program === "sed" && args.some((a) => a === "--in-place" || a.startsWith("--in-place=") || /^-[a-zA-Z]*i/.test(a))) {
+      const operands = [];
+      let scriptViaFlag = false;
+      for (let k = 0;k < args.length; k++) {
+        const x = args[k];
+        if (x === "-e" || x === "-f" || x === "--expression" || x === "--file") {
+          scriptViaFlag = true;
+          k++;
+        } else if (x.startsWith("--expression=") || x.startsWith("--file=")) {
+          scriptViaFlag = true;
+        } else if (!x.startsWith("-") && x !== "") {
+          operands.push(x);
+        }
+      }
+      return { effects: ["write"], writes: scriptViaFlag ? operands : operands.slice(1), note: "sed in-place edit" };
+    }
+    if (program === "sed" && args.some((a) => /(^|;|\s)w\s+\S|(^|;)e(\s|$)/.test(a))) {
+      return { effects: ["write", "exec"], writes: [], note: "sed script writes files or runs commands" };
+    }
+    if ((program === "awk" || program === "gawk" || program === "mawk") && (args.some((a) => /\bsystem\s*\(|print[^;]*>|\|\s*"/.test(a)) || hasFlag(args, "-i"))) {
+      return { effects: ["write", "exec"], writes: [], note: "awk program writes files or runs commands" };
+    }
+    if (program === "find" && args.some((a) => ["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls", "-fprint0"].includes(a))) {
+      return args.includes("-delete") ? { effects: ["write"], writes: ["<find matches>"] } : { effects: ["exec"], writes: [], note: "find -exec" };
+    }
+    if (program === "sort" && args.some((a) => a === "-o" || a.startsWith("--output"))) {
+      const o = args.indexOf("-o");
+      return { effects: ["write"], writes: o >= 0 && args[o + 1] ? [args[o + 1]] : [] };
+    }
+    if ((program === "ast-grep" || program === "sg") && hasFlag(args, "-U", "--update-all", "--interactive", "-i")) {
+      return { effects: ["write"], writes: [] };
+    }
+    return { effects: ["read"], writes: [] };
+  }
+  if (depth > 0 && program === "")
+    return { effects: ["read"], writes: [] };
+  return { effects: ["exec"], writes: [], note: program ? `unknown program "${program}"` : undefined };
+}
+var SAFE_REDIRECT_TARGETS = new Set(["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"]);
+function analyzeShell(src, depth = 0) {
+  const parsed = parseShell(src);
+  const commands = [];
+  let unparseable = !parsed.ok;
+  for (const cmd of parsed.commands) {
+    const { argv, viaXargs } = unwrap(cmd.argv);
+    const result = argv.length ? classify(argv, depth) : { effects: ["read"], writes: [] };
+    const effects = new Set(result.effects);
+    const writes = [...result.writes];
+    if ("nested" in result && result.nested !== undefined) {
+      if (depth >= 4) {
+        effects.add("exec");
+      } else {
+        const inner = analyzeShell(result.nested, depth + 1);
+        commands.push(...inner.commands);
+        if (inner.unparseable)
+          unparseable = true;
+      }
+    }
+    if (viaXargs && effects.has("write") && writes.length === 0)
+      writes.push("<xargs input>");
+    for (const r of cmd.redirects) {
+      if (r.op.endsWith("&"))
+        continue;
+      if (r.op.includes(">") && !SAFE_REDIRECT_TARGETS.has(r.target)) {
+        effects.add("write");
+        writes.push(r.target);
+      }
+    }
+    if (effects.size === 0 && !(("nested" in result) && result.nested !== undefined))
+      effects.add("read");
+    if (effects.size > 0) {
+      commands.push({
+        program: (argv[0] ?? "").split("/").pop() ?? "",
+        argv,
+        effects: [...effects],
+        writes,
+        ..."note" in result && result.note ? { note: result.note } : {}
+      });
+    }
+  }
+  for (const n of parsed.nested) {
+    if (depth >= 4) {
+      unparseable = true;
+      continue;
+    }
+    const inner = analyzeShell(n, depth + 1);
+    commands.push(...inner.commands);
+    if (inner.unparseable)
+      unparseable = true;
+  }
+  const effects = [...new Set(commands.flatMap((c) => c.effects))];
+  return { commands, effects, writes: [...new Set(commands.flatMap((c) => c.writes))], unparseable };
+}
+function isReadOnly(analysis, allowVerify = false) {
+  if (analysis.unparseable || analysis.commands.length === 0)
+    return false;
+  return analysis.effects.every((e) => e === "read" || allowVerify && e === "verify");
+}
+
 // src/agents/guard.ts
 function normalizeResourcePath(rootDir, resource) {
   const trimmed = resource.trim();
-  const absRoot = path4.resolve(rootDir);
-  const resolved = path4.isAbsolute(trimmed) ? path4.resolve(trimmed) : path4.resolve(absRoot, trimmed);
-  const rel = path4.relative(absRoot, resolved).split(path4.sep).join("/");
+  const absRoot = path5.resolve(rootDir);
+  const resolved = path5.isAbsolute(trimmed) ? path5.resolve(trimmed) : path5.resolve(absRoot, trimmed);
+  const rel = path5.relative(absRoot, resolved).split(path5.sep).join("/");
   return rel.startsWith("./") ? rel.slice(2) : rel;
 }
 function matchesPathPattern(relPath, pattern) {
@@ -1315,9 +2283,134 @@ function matchesPathPattern(relPath, pattern) {
   const regex = new RegExp(`^${res}$`);
   return regex.test(normPath);
 }
-var DESTRUCTIVE_GIT_RE = /\bgit\s+(?:reset\s+--hard|clean\s+-[a-zA-Z]*f|push\s+[^;|\n]*--force(?!-with-lease)|checkout\s+--\s+)/i;
-var LEADERSHIP_MUTATING_SHELL_RE = /(?:^|[;&|]\s*)(?:rm|mv|cp|chmod|chown|truncate|dd)\s+|\b(?:sed|perl)\s+-[a-zA-Z]*i\b|\bgit\s+(?:commit|merge|rebase|cherry-pick|am|apply|stash\s+pop)\b|(?:^|[^2>])>>?\s*(?!\/dev\/null\b)\S+/i;
-var QA_SOURCE_MUTATING_SHELL_RE = /\b(?:sed|perl)\s+-[a-zA-Z]*i\b|\bgit\s+(?:commit|merge|rebase|reset|checkout\s+--)\b|(?:^|[;&|]\s*)(?:rm|mv)\s+(?![^;&|\n]*(?:\.test\.|\.spec\.|\btest\/|\btests\/|\be2e\/|\/tmp\/))|(?:^|[^2>])>>?\s*(?!\/dev\/null\b)(?![^;&|\n]*(?:\.test\.|\.spec\.|\btest\/|\btests\/|\be2e\/|\/tmp\/))\S+/i;
+var LEADERSHIP_AGENTS = new Set(["director", "manager"]);
+var AUTO_APPROVE_READ_AGENTS = new Set(["director", "manager", "explore", "plan", "qa-adversary"]);
+var TEST_PATH_PATTERNS = ["**/*.test.*", "**/*.spec.*", "test/**", "tests/**", "e2e/**", "**/__tests__/**", "**/test/**", "**/tests/**"];
+var IMPLEMENTATION_AGENTS = new Set(["staff-backend", "staff-ui"]);
+var TOURNAMENT_EXEMPT_AGENTS = new Set(["architect", "release-ops"]);
+function isScratchPath(raw) {
+  return /^\/(?:tmp|var\/tmp|dev)\//.test(raw) || raw === "/dev/null";
+}
+function isPlaceholder(target) {
+  return target.startsWith("<") && target.endsWith(">");
+}
+function isTestPath(relPath) {
+  return TEST_PATH_PATTERNS.some((p) => matchesPathPattern(relPath, p));
+}
+var ACTIVE_TASK_STATUSES = new Set(["pending", "in_progress", "ready_for_qa", "qa_rejected"]);
+function evaluateFileMutation(rootDir, board, agent, rawPath) {
+  let relPath = normalizeResourcePath(rootDir, rawPath);
+  if (relPath.startsWith("..") || path5.isAbsolute(relPath))
+    return { allowed: true };
+  const wt = /^(\.worktrees\/[^/]+)\/(.+)$/.exec(relPath);
+  let worktreeTask;
+  if (wt) {
+    worktreeTask = board.tasks.find((t) => t.worktree === wt[1]);
+    relPath = wt[2];
+  }
+  if (agent && agent !== "architect") {
+    for (const contract of board.contracts) {
+      if (contract.files.some((cf) => matchesPathPattern(relPath, cf))) {
+        return {
+          allowed: false,
+          reason: `SwarmOS Contract Guard: File "${relPath}" is locked under architectural contract [${contract.id}] ("${contract.title}"). Only the "architect" role may modify locked contract files.`
+        };
+      }
+    }
+  }
+  if (worktreeTask) {
+    if (IMPLEMENTATION_AGENTS.has(agent) && worktreeTask.owner !== agent) {
+      return {
+        allowed: false,
+        reason: `SwarmOS Worktree Guard: "${wt[1]}" belongs to task [${worktreeTask.id}] owned by "${worktreeTask.owner}", not "${agent}".`
+      };
+    }
+    return { allowed: true };
+  }
+  if (IMPLEMENTATION_AGENTS.has(agent)) {
+    const activeTasks = board.tasks.filter((t) => ACTIVE_TASK_STATUSES.has(t.status) && !t.worktree);
+    const ownedBySelf = activeTasks.some((t) => t.owner === agent && t.ownedPaths.some((pattern) => matchesPathPattern(relPath, pattern)));
+    if (!ownedBySelf) {
+      const conflictingTask = activeTasks.find((t) => t.owner !== agent && t.ownedPaths.some((pattern) => matchesPathPattern(relPath, pattern)));
+      if (conflictingTask) {
+        return {
+          allowed: false,
+          reason: `SwarmOS Ownership Guard: File "${relPath}" is claimed by active task [${conflictingTask.id}] assigned to "${conflictingTask.owner}". Role "${agent}" cannot modify files outside its disjoint ownedPaths boundary.`
+        };
+      }
+    }
+  }
+  if (agent && !TOURNAMENT_EXEMPT_AGENTS.has(agent)) {
+    for (const tour of board.tournaments ?? []) {
+      if (tour.status !== "active")
+        continue;
+      if (tour.ownedPaths.some((pattern) => matchesPathPattern(relPath, pattern))) {
+        const where = tour.candidates.map((c) => c.worktree).join(" or ");
+        return {
+          allowed: false,
+          reason: `SwarmOS Tournament Guard: "${relPath}" is contested by active tournament [${tour.id}]. Edit it inside your candidate worktree (${where}), not in the main tree.`
+        };
+      }
+    }
+  }
+  return { allowed: true };
+}
+function evaluateShellCommand(rootDir, board, agent, cmd) {
+  const analysis = analyzeShell(cmd);
+  const short = cmd.slice(0, 80);
+  const destructive = analysis.commands.find((c) => c.effects.includes("destructive"));
+  if (destructive) {
+    const label = destructive.program === "git" ? "SwarmOS Git Safety Guard" : "SwarmOS Destructive Command Guard";
+    return {
+      allowed: false,
+      reason: `${label}: Destructive command "${short}" (${destructive.note ?? destructive.program}) is blocked across all SwarmOS roles.`
+    };
+  }
+  if (analysis.unparseable) {
+    return { allowed: true, ask: true, reason: `SwarmOS Shell Guard: could not parse "${short}"; approve it manually.` };
+  }
+  const writeCommands = analysis.commands.filter((c) => c.effects.includes("write"));
+  const projectWrites = analysis.writes.filter((w) => !isScratchPath(w));
+  const unknownTargets = writeCommands.some((c) => c.writes.length === 0) || projectWrites.some(isPlaceholder);
+  if (LEADERSHIP_AGENTS.has(agent) && writeCommands.length > 0 && (projectWrites.length > 0 || unknownTargets)) {
+    return {
+      allowed: false,
+      reason: `SwarmOS Separation-of-Powers Guard: Leadership role "${agent}" is read-only and cannot execute file-mutating or git-committing shell commands ("${short}"). Delegate implementation to subagents.`
+    };
+  }
+  if (agent === "qa-adversary" && writeCommands.length > 0) {
+    const nonTest = projectWrites.filter((w) => isPlaceholder(w) || !isTestPath(normalizeResourcePath(rootDir, w)));
+    if (unknownTargets || nonTest.length > 0) {
+      return {
+        allowed: false,
+        reason: `SwarmOS Red-Team Guard: "qa-adversary" is forbidden from mutating production source files or git history via shell ("${short}").`
+      };
+    }
+  }
+  for (const target of projectWrites) {
+    if (isPlaceholder(target))
+      continue;
+    const decision = evaluateFileMutation(rootDir, board, agent, target);
+    if (!decision.allowed)
+      return decision;
+  }
+  if (analysis.effects.includes("exec") || analysis.effects.includes("network")) {
+    if (LEADERSHIP_AGENTS.has(agent) || agent === "explore" || agent === "plan") {
+      return { allowed: true, ask: true, reason: `SwarmOS Shell Guard: "${short}" runs code or reaches the network; read-only role "${agent}" needs approval.` };
+    }
+    if (agent === "qa-adversary" && analysis.commands.some((c) => c.effects.includes("exec") && /inline/.test(c.note ?? ""))) {
+      return { allowed: true, ask: true, reason: `SwarmOS Red-Team Guard: "${short}" runs inline code SwarmOS cannot inspect; approve it manually.` };
+    }
+    return { allowed: true };
+  }
+  const readOnly = isReadOnly(analysis, agent !== "explore" && agent !== "plan");
+  if (readOnly && AUTO_APPROVE_READ_AGENTS.has(agent))
+    return { allowed: true, autoAllow: true };
+  if (!readOnly && (agent === "explore" || agent === "plan")) {
+    return { allowed: true, ask: true, reason: `SwarmOS Shell Guard: "${short}" is not read-only; "${agent}" needs approval.` };
+  }
+  return { allowed: true };
+}
 function evaluateBoardGuard(rootDir, board, event) {
   const agent = (event.agent ?? "").toLowerCase();
   const action = (event.action ?? "").toLowerCase();
@@ -1326,83 +2419,76 @@ function evaluateBoardGuard(rootDir, board, event) {
     for (const rawResource of resources) {
       if (typeof rawResource !== "string" || rawResource === "*")
         continue;
-      const relPath = normalizeResourcePath(rootDir, rawResource);
-      if (agent && agent !== "architect") {
-        for (const contract of board.contracts) {
-          const hitsContract = contract.files.some((cf) => matchesPathPattern(relPath, cf));
-          if (hitsContract) {
-            return {
-              allowed: false,
-              reason: `SwarmOS Contract Guard: File "${relPath}" is locked under architectural contract [${contract.id}] ("${contract.title}"). Only the "architect" role may modify locked contract files.`
-            };
-          }
-        }
-      }
-      if (agent === "staff-backend" || agent === "staff-ui") {
-        const activeTasks = board.tasks.filter((t) => t.status === "pending" || t.status === "in_progress" || t.status === "ready_for_qa" || t.status === "qa_rejected");
-        const ownedBySelf = activeTasks.some((t) => t.owner === agent && t.ownedPaths.some((pattern) => matchesPathPattern(relPath, pattern)));
-        if (!ownedBySelf) {
-          const conflictingTask = activeTasks.find((t) => t.owner !== agent && t.ownedPaths.some((pattern) => matchesPathPattern(relPath, pattern)));
-          if (conflictingTask) {
-            return {
-              allowed: false,
-              reason: `SwarmOS Ownership Guard: File "${relPath}" is claimed by active task [${conflictingTask.id}] assigned to "${conflictingTask.owner}". Role "${agent}" cannot modify files outside its disjoint ownedPaths boundary.`
-            };
-          }
-        }
-      }
+      const decision = evaluateFileMutation(rootDir, board, agent, rawResource);
+      if (!decision.allowed)
+        return decision;
     }
   }
   if (action === "shell" || action === "bash") {
+    let ask;
+    let autoAllow = resources.length > 0;
     for (const cmd of resources) {
       if (typeof cmd !== "string")
         continue;
-      if (DESTRUCTIVE_GIT_RE.test(cmd)) {
-        return {
-          allowed: false,
-          reason: `SwarmOS Git Safety Guard: Destructive git command "${cmd.slice(0, 80)}" is blocked across all SwarmOS roles.`
-        };
-      }
-      if ((agent === "director" || agent === "manager") && LEADERSHIP_MUTATING_SHELL_RE.test(cmd)) {
-        return {
-          allowed: false,
-          reason: `SwarmOS Separation-of-Powers Guard: Leadership role "${agent}" is read-only and cannot execute file-mutating or git-committing shell commands ("${cmd.slice(0, 80)}"). Delegate implementation to subagents.`
-        };
-      }
-      if (agent === "qa-adversary" && QA_SOURCE_MUTATING_SHELL_RE.test(cmd)) {
-        return {
-          allowed: false,
-          reason: `SwarmOS Red-Team Guard: "qa-adversary" is forbidden from mutating production source files or git history via shell ("${cmd.slice(0, 80)}").`
-        };
-      }
+      const decision = evaluateShellCommand(rootDir, board, agent, cmd);
+      if (!decision.allowed)
+        return decision;
+      if (decision.ask && !ask)
+        ask = decision;
+      if (!decision.autoAllow)
+        autoAllow = false;
     }
+    if (ask)
+      return ask;
+    if (autoAllow)
+      return { allowed: true, autoAllow: true };
   }
   return { allowed: true };
 }
-async function evaluatePermissionGuard(rootDir, event) {
+async function evaluatePermissionGuard(rootDir, event, evaluators = []) {
   const board = await loadBoard(rootDir);
-  return evaluateBoardGuard(rootDir, board, event);
+  const base = evaluateBoardGuard(rootDir, board, event);
+  if (!base.allowed)
+    return base;
+  let result = base;
+  for (const evaluate of evaluators) {
+    const extra = await evaluate(event, board);
+    if (!extra)
+      continue;
+    if (!extra.allowed)
+      return extra;
+    if (extra.ask)
+      result = { allowed: true, ask: true, reason: extra.reason };
+  }
+  return result;
 }
-async function registerPermissionGuard(ctx, rootDir) {
+async function registerPermissionGuard(ctx, rootDir, evaluators = []) {
   if (ctx.permission?.hook) {
     await ctx.permission.hook("evaluate", async (event) => {
       if (event.effect === "deny")
         return;
-      const decision = await evaluatePermissionGuard(rootDir, event);
+      const decision = await evaluatePermissionGuard(rootDir, event, evaluators);
       if (!decision.allowed) {
         event.effect = "deny";
         event.message = decision.reason;
+      } else if (decision.ask) {
+        if (event.effect === "allow") {
+          event.effect = "ask";
+          event.message = decision.reason;
+        }
+      } else if (decision.autoAllow && event.effect === "ask") {
+        event.effect = "allow";
       }
     });
   }
 }
 
 // src/codemode/fs-outline.ts
-import * as fs4 from "fs/promises";
-import * as path5 from "path";
+import * as fs5 from "fs/promises";
+import * as path6 from "path";
 async function extractOutline(rootDir, targetPath) {
-  const abs = path5.resolve(rootDir, targetPath);
-  const text = await fs4.readFile(abs, "utf8");
+  const abs = path6.resolve(rootDir, targetPath);
+  const text = await fs5.readFile(abs, "utf8");
   const lines = text.split(`
 `);
   const declRe = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|const|let|var|enum|struct|fn|def|impl)\s+([A-Za-z0-9_$]+)/;
@@ -1581,7 +2667,7 @@ function registerOrgTools(editor, rootDir) {
   });
   editor.add({
     name: "plan_tournament",
-    description: "Provision a Best-of-N Worktree Tournament that creates competing candidate tasks (e.g. candidate-a, candidate-b) with isolated Git worktree paths.",
+    description: "Provision a Best-of-N Worktree Tournament: competing candidate tasks (candidate-a, candidate-b, ...) each get a real git worktree at .worktrees/<taskId> on branch swarmos/<taskId>. Candidates must edit only inside their worktree.",
     options: { namespace: "org", codemode: true, pinned: true },
     input: {
       type: "object",
@@ -1599,20 +2685,49 @@ function registerOrgTools(editor, rootDir) {
       const tournament = await planTournament(rootDir, input);
       return {
         output: tournament,
-        content: `Planned Best-of-${tournament.candidates.length} tournament [${tournament.id}] (${tournament.candidates.map((c) => c.taskId).join(", ")})`
+        content: `Planned Best-of-${tournament.candidates.length} tournament [${tournament.id}]:
+${tournament.candidates.map((c) => `- ${c.taskId}: ${c.provisioned ? `worktree ${c.worktree} on ${c.branch}` : `NOT provisioned (${c.provisionNote ?? "unknown"})`}`).join(`
+`)}`
+      };
+    }
+  });
+  editor.add({
+    name: "score_tournament",
+    description: "Run a full tools.verify.run inside every candidate worktree and rank candidates (passing first, then fewest failures, then smallest diff).",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: { tournamentId: { type: "string", description: "Tournament ID to score" } },
+      required: ["tournamentId"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const board = await loadBoard(rootDir);
+      const tournament = (board.tournaments ?? []).find((t) => t.id === input.tournamentId);
+      if (!tournament)
+        throw new Error(`SwarmOS Tournament not found: ${input.tournamentId}`);
+      const scores = await scoreTournament(rootDir, tournament);
+      return {
+        output: { scores },
+        content: scores.map((sc, i) => `${i + 1}. ${sc.taskId}: ${sc.provisioned ? sc.passed ? "PASS" : "FAIL" : "no worktree"}${sc.verifyRunId ? ` [${sc.verifyRunId}]` : ""} \u2014 ${sc.failedChecks} failed check(s), ${sc.failedTests} failed test(s), +${sc.diff.insertions}/-${sc.diff.deletions} in ${sc.diff.files} file(s)`).join(`
+`)
       };
     }
   });
   editor.add({
     name: "resolve_tournament",
-    description: "Resolve a Best-of-N Worktree Tournament by selecting a QA-verified winning candidate task and marking competing candidate tasks as superseded.",
+    description: "Resolve a Best-of-N Worktree Tournament: the QA-verified winner's branch is merged into the main tree (--no-ff), all candidate worktrees and branches are removed, and competing tasks are marked superseded.",
     options: { namespace: "org", codemode: true, pinned: true },
     input: {
       type: "object",
       properties: {
         tournamentId: { type: "string", description: "Tournament ID to resolve" },
         winningTaskId: { type: "string", description: "Winning candidate task ID (must have a PASS QA receipt)" },
-        summary: { type: "string", description: "Rationale for selecting the winning implementation" }
+        summary: { type: "string", description: "Rationale for selecting the winning implementation" },
+        merge: {
+          type: "boolean",
+          description: "Merge the winner's branch into the main tree and remove all candidate worktrees (default true when worktrees exist)"
+        }
       },
       required: ["tournamentId", "winningTaskId", "summary"]
     },
@@ -1621,7 +2736,7 @@ function registerOrgTools(editor, rootDir) {
       const tournament = await resolveTournament(rootDir, input);
       return {
         output: tournament,
-        content: `Resolved tournament [${tournament.id}] -> winner: ${tournament.winningTaskId}`
+        content: `Resolved tournament [${tournament.id}] -> winner: ${tournament.winningTaskId}${tournament.mergeCommit ? ` (merged as ${tournament.mergeCommit.slice(0, 10)})` : ""}`
       };
     }
   });
@@ -1898,20 +3013,20 @@ function registerUITools(editor) {
 }
 
 // src/version.ts
-var SWARMOS_VERSION = "0.6.0";
+var SWARMOS_VERSION = "0.7.0";
 
 // src/omni/artifacts.ts
-import * as fs5 from "fs/promises";
-import * as path6 from "path";
+import * as fs6 from "fs/promises";
+import * as path7 from "path";
 function getArtifactsDir(rootDir) {
-  return path6.join(rootDir, ".opencode", "artifacts");
+  return path7.join(rootDir, ".opencode", "artifacts");
 }
 async function writeArtifact(rootDir, name, content) {
-  const safeName = path6.basename(name);
+  const safeName = path7.basename(name);
   const dir = getArtifactsDir(rootDir);
-  await fs5.mkdir(dir, { recursive: true });
-  const target = path6.join(dir, safeName);
-  await fs5.writeFile(target, content, "utf8");
+  await fs6.mkdir(dir, { recursive: true });
+  const target = path7.join(dir, safeName);
+  await fs6.writeFile(target, content, "utf8");
   return {
     name: safeName,
     path: target,
@@ -1920,10 +3035,10 @@ async function writeArtifact(rootDir, name, content) {
   };
 }
 async function readArtifact(rootDir, name) {
-  const safeName = path6.basename(name);
-  const target = path6.join(getArtifactsDir(rootDir), safeName);
+  const safeName = path7.basename(name);
+  const target = path7.join(getArtifactsDir(rootDir), safeName);
   try {
-    const content = await fs5.readFile(target, "utf8");
+    const content = await fs6.readFile(target, "utf8");
     return { name: safeName, exists: true, content };
   } catch {
     return { name: safeName, exists: false, content: "" };
@@ -1931,7 +3046,7 @@ async function readArtifact(rootDir, name) {
 }
 async function listArtifacts(rootDir) {
   try {
-    const entries = await fs5.readdir(getArtifactsDir(rootDir), { withFileTypes: true });
+    const entries = await fs6.readdir(getArtifactsDir(rootDir), { withFileTypes: true });
     return entries.filter((e) => e.isFile()).map((e) => e.name).sort();
   } catch {
     return [];
@@ -2030,21 +3145,21 @@ ${sections.join(`
 }
 
 // src/omni/checkpoints.ts
-import * as fs6 from "fs/promises";
-import * as path7 from "path";
+import * as fs7 from "fs/promises";
+import * as path8 from "path";
 function getCheckpointsDir(rootDir) {
-  return path7.join(rootDir, ".opencode", "checkpoints");
+  return path8.join(rootDir, ".opencode", "checkpoints");
 }
 async function createCheckpoint(rootDir, input) {
   const id = input.id ?? `chk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const dir = getCheckpointsDir(rootDir);
-  await fs6.mkdir(dir, { recursive: true });
+  await fs7.mkdir(dir, { recursive: true });
   const files = [];
   for (const rawPath of input.paths) {
-    const abs = path7.resolve(rootDir, rawPath);
-    const rel = path7.relative(rootDir, abs).split(path7.sep).join("/");
+    const abs = path8.resolve(rootDir, rawPath);
+    const rel = path8.relative(rootDir, abs).split(path8.sep).join("/");
     try {
-      const buf = await fs6.readFile(abs);
+      const buf = await fs7.readFile(abs);
       files.push({
         path: rel,
         exists: true,
@@ -2063,7 +3178,7 @@ async function createCheckpoint(rootDir, input) {
     createdAt: new Date().toISOString(),
     files
   };
-  await fs6.writeFile(path7.join(dir, `${id}.json`), JSON.stringify(manifest, null, 2), "utf8");
+  await fs7.writeFile(path8.join(dir, `${id}.json`), JSON.stringify(manifest, null, 2), "utf8");
   return {
     id: manifest.id,
     label: manifest.label,
@@ -2072,19 +3187,19 @@ async function createCheckpoint(rootDir, input) {
   };
 }
 async function rollbackCheckpoint(rootDir, checkpointId) {
-  const file = path7.join(getCheckpointsDir(rootDir), `${path7.basename(checkpointId)}.json`);
-  const raw = await fs6.readFile(file, "utf8");
+  const file = path8.join(getCheckpointsDir(rootDir), `${path8.basename(checkpointId)}.json`);
+  const raw = await fs7.readFile(file, "utf8");
   const manifest = JSON.parse(raw);
   const restoredFiles = [];
   const removedFiles = [];
   for (const entry of manifest.files) {
-    const abs = path7.resolve(rootDir, entry.path);
+    const abs = path8.resolve(rootDir, entry.path);
     if (entry.exists && typeof entry.contentBase64 === "string") {
-      await fs6.mkdir(path7.dirname(abs), { recursive: true });
-      await fs6.writeFile(abs, Buffer.from(entry.contentBase64, "base64"));
+      await fs7.mkdir(path8.dirname(abs), { recursive: true });
+      await fs7.writeFile(abs, Buffer.from(entry.contentBase64, "base64"));
       restoredFiles.push(entry.path);
     } else if (!entry.exists) {
-      await fs6.rm(abs, { force: true });
+      await fs7.rm(abs, { force: true });
       removedFiles.push(entry.path);
     }
   }
@@ -2093,13 +3208,13 @@ async function rollbackCheckpoint(rootDir, checkpointId) {
 async function listCheckpoints(rootDir) {
   try {
     const dir = getCheckpointsDir(rootDir);
-    const entries = await fs6.readdir(dir);
+    const entries = await fs7.readdir(dir);
     const results = [];
     for (const name of entries) {
       if (!name.endsWith(".json"))
         continue;
       try {
-        const raw = await fs6.readFile(path7.join(dir, name), "utf8");
+        const raw = await fs7.readFile(path8.join(dir, name), "utf8");
         const parsed = JSON.parse(raw);
         results.push({
           id: parsed.id,
@@ -2172,14 +3287,14 @@ function registerCheckpointTools(editor, rootDir) {
 }
 
 // src/omni/memory.ts
-import * as fs7 from "fs/promises";
-import * as path8 from "path";
+import * as fs8 from "fs/promises";
+import * as path9 from "path";
 function getMemoryFilePath(rootDir) {
-  return path8.join(rootDir, ".opencode", "memory", "lessons.json");
+  return path9.join(rootDir, ".opencode", "memory", "lessons.json");
 }
 async function loadLessons(rootDir) {
   try {
-    const raw = await fs7.readFile(getMemoryFilePath(rootDir), "utf8");
+    const raw = await fs8.readFile(getMemoryFilePath(rootDir), "utf8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -2198,8 +3313,8 @@ async function recordLesson(rootDir, input) {
   else
     lessons.push(entry);
   const file = getMemoryFilePath(rootDir);
-  await fs7.mkdir(path8.dirname(file), { recursive: true });
-  await fs7.writeFile(file, JSON.stringify(lessons, null, 2), "utf8");
+  await fs8.mkdir(path9.dirname(file), { recursive: true });
+  await fs8.writeFile(file, JSON.stringify(lessons, null, 2), "utf8");
   return entry;
 }
 function registerMemoryTools(editor, rootDir) {
@@ -2271,14 +3386,14 @@ ${block}`
 }
 
 // src/omni/research.ts
-import * as fs8 from "fs/promises";
-import * as path9 from "path";
+import * as fs9 from "fs/promises";
+import * as path10 from "path";
 function getResearchLedgerPath(rootDir) {
-  return path9.join(rootDir, ".opencode", "artifacts", "research_sources.json");
+  return path10.join(rootDir, ".opencode", "artifacts", "research_sources.json");
 }
 async function loadResearchSources(rootDir) {
   try {
-    const raw = await fs8.readFile(getResearchLedgerPath(rootDir), "utf8");
+    const raw = await fs9.readFile(getResearchLedgerPath(rootDir), "utf8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -2298,8 +3413,8 @@ async function recordResearchSource(rootDir, input) {
     sources.push(entry);
   }
   const file = getResearchLedgerPath(rootDir);
-  await fs8.mkdir(path9.dirname(file), { recursive: true });
-  await fs8.writeFile(file, JSON.stringify(sources, null, 2), "utf8");
+  await fs9.mkdir(path10.dirname(file), { recursive: true });
+  await fs9.writeFile(file, JSON.stringify(sources, null, 2), "utf8");
   return entry;
 }
 async function auditMarkdownCitations(rootDir, markdownText) {
@@ -2648,7 +3763,7 @@ function isFailedEvent(event) {
 }
 
 // src/host/setup-report.ts
-import * as path10 from "path";
+import * as path11 from "path";
 
 // src/host/contract.ts
 var HOST_CONTRACT = [
@@ -2783,19 +3898,20 @@ function missingRequired(probe) {
 // src/host/setup-report.ts
 var reports = new Map;
 function getSetupReport(rootDir) {
-  return reports.get(path10.resolve(rootDir));
+  return reports.get(path11.resolve(rootDir));
 }
 function storeSetupReport(report) {
-  reports.set(path10.resolve(report.rootDir), report);
+  reports.set(path11.resolve(report.rootDir), report);
 }
 function newModuleReport(id) {
-  return { id, status: "registered", agents: [], namespaces: [], tools: [], hooks: [], commands: [], skills: [], runtimeErrors: [] };
+  return { id, status: "registered", agents: [], namespaces: [], tools: [], hooks: [], commands: [], skills: [], runtimeErrors: [], hookCalls: {} };
 }
 var MAX_RUNTIME_ERRORS = 20;
 function guardHandler(rec, hookId, handler) {
   if (typeof handler !== "function")
     return handler;
   return async (...args) => {
+    rec.hookCalls[hookId] = (rec.hookCalls[hookId] ?? 0) + 1;
     try {
       return await handler(...args);
     } catch (err) {
@@ -2921,6 +4037,17 @@ _SwarmOS setup has not run in this workspace._`;
       return `| ${m.id} | ${status} | ${parts.join("; ") || "-"} | ${m.runtimeErrors.length} |`;
     })
   ];
+  const hookTotals = {};
+  for (const m of report.modules) {
+    for (const h of m.hooks)
+      hookTotals[h] ??= 0;
+    for (const [h, n] of Object.entries(m.hookCalls))
+      hookTotals[h] = (hookTotals[h] ?? 0) + n;
+  }
+  const hookIds = Object.keys(hookTotals).sort();
+  if (hookIds.length > 0) {
+    lines.push("", "## Hook activity", "Calls received from the host since setup. A hook stuck at 0 after real tool use means the host never fires it.", "", ...hookIds.map((h) => `- \`${h}\`: ${hookTotals[h]}`));
+  }
   const errored = report.modules.filter((m) => m.runtimeErrors.length > 0);
   if (errored.length > 0) {
     lines.push("", "## Recent hook errors");
@@ -2936,6 +4063,184 @@ _SwarmOS setup has not run in this workspace._`;
 `);
 }
 
+// src/omni/transactions.ts
+import * as fs10 from "fs/promises";
+import * as path12 from "path";
+var MUTATING_TOOLS = new Set(["edit", "write", "patch", "multiedit", "apply_patch"]);
+var MAX_AUTO_CHECKPOINTS = 20;
+var byCallId = new Map;
+var bySessionTool = new Map;
+var transactionStats = { started: 0, committed: 0, rolledBack: 0, filesRestored: 0 };
+function resetTransactions() {
+  byCallId.clear();
+  bySessionTool.clear();
+  Object.assign(transactionStats, { started: 0, committed: 0, rolledBack: 0, filesRestored: 0 });
+}
+function callId(event) {
+  const id = event?.callID ?? event?.toolCallID ?? event?.callId ?? event?.id;
+  return typeof id === "string" && id ? id : undefined;
+}
+function sessionToolKey(event) {
+  return `${event?.sessionID ?? "default"}:${event?.tool ?? ""}`;
+}
+function patchText(input) {
+  for (const key of ["patchText", "patch", "input", "diff", "content"]) {
+    if (typeof input?.[key] === "string" && /\*\*\* (Begin Patch|Update File|Add File)|^(\+\+\+|---) /m.test(input[key])) {
+      return input[key];
+    }
+  }
+  return;
+}
+function mutationTargets(tool, input) {
+  const targets = new Set;
+  for (const key of ["path", "filePath", "file", "target"]) {
+    if (typeof input?.[key] === "string" && input[key])
+      targets.add(input[key]);
+  }
+  if (Array.isArray(input?.edits)) {
+    for (const e of input.edits)
+      if (typeof e?.path === "string")
+        targets.add(e.path);
+  }
+  const text = patchText(input);
+  if (text) {
+    for (const m of text.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm))
+      targets.add(m[1].trim());
+    for (const m of text.matchAll(/^\*\*\* Move to: (.+)$/gm))
+      targets.add(m[1].trim());
+    for (const m of text.matchAll(/^(?:\+\+\+|---) (?:[ab]\/)?(.+?)(?:\t.*)?$/gm)) {
+      if (m[1] !== "/dev/null")
+        targets.add(m[1].trim());
+    }
+  }
+  return [...targets];
+}
+async function snapshot(rootDir, rawPath) {
+  const abs = path12.resolve(rootDir, rawPath);
+  const rel = path12.relative(rootDir, abs).split(path12.sep).join("/");
+  if (rel.startsWith(".."))
+    return;
+  try {
+    return { rel, existed: true, content: await fs10.readFile(abs) };
+  } catch (err) {
+    if (err?.code === "ENOENT")
+      return { rel, existed: false };
+    return;
+  }
+}
+async function pruneAutoCheckpoints(rootDir) {
+  try {
+    const dir = getCheckpointsDir(rootDir);
+    const autos = (await fs10.readdir(dir)).filter((f) => f.startsWith("auto-") && f.endsWith(".json")).sort();
+    for (const f of autos.slice(0, Math.max(0, autos.length - MAX_AUTO_CHECKPOINTS))) {
+      await fs10.rm(path12.join(dir, f), { force: true });
+    }
+  } catch {}
+}
+async function beginTransaction(rootDir, event) {
+  if (!MUTATING_TOOLS.has(event?.tool))
+    return;
+  const targets = mutationTargets(event.tool, event.input);
+  if (targets.length === 0)
+    return;
+  const snapshots = (await Promise.all(targets.map((t) => snapshot(rootDir, t)))).filter((s) => Boolean(s));
+  if (snapshots.length === 0)
+    return;
+  const tx = { tool: event.tool, snapshots };
+  if (snapshots.length > 1) {
+    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "");
+    const cp = await createCheckpoint(rootDir, {
+      id: `auto-${stamp}-${Math.random().toString(36).slice(2, 6)}`,
+      label: `before ${event.tool} of ${snapshots.length} files`,
+      paths: snapshots.map((s) => s.rel)
+    });
+    tx.checkpointId = cp.id;
+    await pruneAutoCheckpoints(rootDir);
+  }
+  const id = callId(event);
+  if (id)
+    byCallId.set(id, tx);
+  else {
+    const key = sessionToolKey(event);
+    const stack = bySessionTool.get(key) ?? [];
+    stack.push(tx);
+    bySessionTool.set(key, stack);
+  }
+  transactionStats.started++;
+  return tx;
+}
+function takeTransaction(event) {
+  const id = callId(event);
+  if (id && byCallId.has(id)) {
+    const tx = byCallId.get(id);
+    byCallId.delete(id);
+    return tx;
+  }
+  const stack = bySessionTool.get(sessionToolKey(event));
+  return stack?.pop();
+}
+async function restore(rootDir, tx) {
+  const restored = [];
+  for (const s of tx.snapshots) {
+    const abs = path12.resolve(rootDir, s.rel);
+    let current;
+    try {
+      current = await fs10.readFile(abs);
+    } catch {
+      current = undefined;
+    }
+    if (s.existed) {
+      if (current && s.content && current.equals(s.content))
+        continue;
+      await fs10.mkdir(path12.dirname(abs), { recursive: true });
+      await fs10.writeFile(abs, s.content);
+      restored.push(s.rel);
+    } else if (current !== undefined) {
+      await fs10.rm(abs, { force: true });
+      restored.push(s.rel);
+    }
+  }
+  return restored;
+}
+async function finishTransaction(rootDir, event) {
+  if (!MUTATING_TOOLS.has(event?.tool))
+    return;
+  const tx = takeTransaction(event);
+  if (!tx)
+    return;
+  if (event.status !== "error") {
+    transactionStats.committed++;
+    return;
+  }
+  const restored = await restore(rootDir, tx);
+  transactionStats.rolledBack++;
+  transactionStats.filesRestored += restored.length;
+  if (restored.length === 0)
+    return;
+  return `
+
+<swarmos-transaction status="rolled-back">
+` + `The ${tx.tool} call failed part-way, so SwarmOS restored ${restored.length} file(s) to their state before the call: ${restored.join(", ")}. ` + `Nothing from this call was applied; re-read the files before retrying.
+</swarmos-transaction>`;
+}
+async function registerTransactionHooks(ctx, rootDir) {
+  if (!ctx.tool?.hook)
+    return;
+  await ctx.tool.hook("execute.before", async (event) => {
+    await beginTransaction(rootDir, event);
+  });
+  await ctx.tool.hook("execute.after", async (event) => {
+    const note = await finishTransaction(rootDir, event);
+    if (!note)
+      return;
+    if (event.error && typeof event.error === "object" && typeof event.error.message === "string") {
+      event.error.message += note;
+    } else if (typeof event.error === "string") {
+      event.error += note;
+    }
+  });
+}
+
 // src/commands/doctor.ts
 function sessionLines() {
   const states = listSessionStates();
@@ -2948,8 +4253,17 @@ function sessionLines() {
     ...states.map((s) => `| \`${s.sessionID}\` | ${s.agent ?? "-"} | ${s.turns} | ${s.toolCalls} | ${s.toolFailures} | ${s.breakerFires} | ${s.taint.length ? s.taint.map((t) => `${t.tool}`).join(", ") : "none"} | ${s.taskId ?? "-"} |`)
   ];
 }
+function transactionLines() {
+  const t = transactionStats;
+  if (t.started === 0)
+    return [];
+  return [
+    "## Edit transactions",
+    `${t.started} snapshotted, ${t.committed} committed, ${t.rolledBack} rolled back (${t.filesRestored} file(s) restored).`
+  ];
+}
 function buildDoctorText(rootDir) {
-  return formatDoctorReport(getSetupReport(rootDir), sessionLines());
+  return formatDoctorReport(getSetupReport(rootDir), [...sessionLines(), ...transactionLines()]);
 }
 function registerDoctorTools(editor, rootDir) {
   editor.namespace({
@@ -2985,8 +4299,8 @@ async function registerDoctorCommand(ctx, rootDir) {
 }
 
 // src/host/config.ts
-import * as fs9 from "fs/promises";
-import * as path11 from "path";
+import * as fs11 from "fs/promises";
+import * as path13 from "path";
 var DEFAULT_PINNED_NAMESPACES = ["org", "fs", "repo", "verify", "artifacts"];
 var DEFAULT_CONFIG = {
   mode: "full",
@@ -2997,7 +4311,7 @@ var DEFAULT_CONFIG = {
   taintTracking: true
 };
 function getConfigPath(rootDir) {
-  return path11.join(rootDir, ".opencode", "swarmos.json");
+  return path13.join(rootDir, ".opencode", "swarmos.json");
 }
 function parseBool(value) {
   if (value === undefined)
@@ -3011,7 +4325,7 @@ function parseBool(value) {
 async function loadConfig(rootDir, env = process.env) {
   let fileConfig = {};
   try {
-    const raw = await fs9.readFile(getConfigPath(rootDir), "utf8");
+    const raw = await fs11.readFile(getConfigPath(rootDir), "utf8");
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object")
       fileConfig = parsed;
@@ -3042,24 +4356,24 @@ async function loadConfig(rootDir, env = process.env) {
 }
 
 // src/host/telemetry.ts
-import { execFile as execFile2 } from "child_process";
-import * as fs10 from "fs/promises";
-import * as path12 from "path";
-import { promisify as promisify2 } from "util";
-var execFileAsync2 = promisify2(execFile2);
+import { execFile as execFile3 } from "child_process";
+import * as fs12 from "fs/promises";
+import * as path14 from "path";
+import { promisify as promisify3 } from "util";
+var execFileAsync3 = promisify3(execFile3);
 function getTelemetryDir(rootDir) {
-  return path12.join(rootDir, ".opencode", "telemetry");
+  return path14.join(rootDir, ".opencode", "telemetry");
 }
 function safeSessionFile(sessionID) {
   return `${sessionID.replace(/[^A-Za-z0-9_.-]/g, "_") || "default"}.jsonl`;
 }
 var writeQueues = new Map;
 async function appendTelemetry(rootDir, record) {
-  const file = path12.join(getTelemetryDir(rootDir), safeSessionFile(record.sessionID));
+  const file = path14.join(getTelemetryDir(rootDir), safeSessionFile(record.sessionID));
   const previous = writeQueues.get(file) ?? Promise.resolve();
   const next = previous.then(async () => {
-    await fs10.mkdir(path12.dirname(file), { recursive: true });
-    await fs10.appendFile(file, `${JSON.stringify(record)}
+    await fs12.mkdir(path14.dirname(file), { recursive: true });
+    await fs12.appendFile(file, `${JSON.stringify(record)}
 `, "utf8");
   });
   writeQueues.set(file, next.catch(() => {}));
@@ -3067,7 +4381,7 @@ async function appendTelemetry(rootDir, record) {
 }
 async function gitHead(rootDir) {
   try {
-    const { stdout } = await execFileAsync2("git", ["rev-parse", "HEAD"], { cwd: rootDir, timeout: 3000 });
+    const { stdout } = await execFileAsync3("git", ["rev-parse", "HEAD"], { cwd: rootDir, timeout: 3000 });
     return stdout.trim() || undefined;
   } catch {
     return;
@@ -3223,7 +4537,7 @@ function summarizeTelemetry(records) {
   return summary;
 }
 async function readTelemetryFile(file) {
-  const raw = await fs10.readFile(file, "utf8");
+  const raw = await fs12.readFile(file, "utf8");
   return raw.split(`
 `).filter((l) => l.trim()).flatMap((l) => {
     try {
@@ -3236,43 +4550,177 @@ async function readTelemetryFile(file) {
 async function listTelemetryFiles(rootDir) {
   try {
     const dir = getTelemetryDir(rootDir);
-    const entries = await fs10.readdir(dir);
-    return entries.filter((e) => e.endsWith(".jsonl")).map((e) => path12.join(dir, e));
+    const entries = await fs12.readdir(dir);
+    return entries.filter((e) => e.endsWith(".jsonl")).map((e) => path14.join(dir, e));
   } catch {
     return [];
   }
 }
 
+// src/omni/taint.ts
+import * as path15 from "path";
+var UNTRUSTED_TOOLS = /^(?:webfetch|websearch|fetch|web_search|web_fetch|browser[._-].*|mcp[._-].*|.*__.*)$/i;
+var CODEMODE_UNTRUSTED = /\btools\.(?:browser|opencode\.(?:webfetch|websearch)|research)\b|\b(?:webfetch|websearch)\s*\(/;
+var SENSITIVE_PATHS = [
+  ".opencode/**",
+  "opencode.json",
+  ".git/**",
+  ".github/workflows/**",
+  ".gitlab-ci.yml",
+  ".husky/**",
+  ".npmrc",
+  ".env",
+  ".env.*",
+  "package.json",
+  "**/*.sh"
+];
+var HOME_SENSITIVE = /(?:^|\/)(?:\.ssh|\.aws|\.gnupg|\.config\/opencode|\.bashrc|\.zshrc|\.profile|\.bash_profile|\.gitconfig|\.npmrc)(?:\/|$)/;
+function resourceOf(event) {
+  const i = event?.input ?? {};
+  const value = i.url ?? i.query ?? i.uri ?? i.path ?? (typeof i.code === "string" ? "code mode script" : undefined);
+  return String(value ?? "").slice(0, 200);
+}
+function recordTaint(event) {
+  const tool = String(event?.tool ?? "");
+  if (event?.status === "error")
+    return false;
+  const untrusted = UNTRUSTED_TOOLS.test(tool) || tool === "execute" && typeof event?.input?.code === "string" && CODEMODE_UNTRUSTED.test(event.input.code);
+  if (!untrusted)
+    return false;
+  const state = getSessionState(event?.sessionID);
+  state.taint.push({ tool, resource: resourceOf(event), at: new Date().toISOString() });
+  if (state.taint.length > 20)
+    state.taint.shift();
+  return true;
+}
+function clearTaint(sessionID) {
+  const state = getSessionState(sessionID);
+  const n = state.taint.length;
+  state.taint = [];
+  return n;
+}
+function taintedState(sessionID) {
+  if (sessionID) {
+    const s = getSessionState(sessionID);
+    return s.taint.length ? s : undefined;
+  }
+  return listSessionStates().find((s) => s.taint.length > 0);
+}
+function isSensitive(rootDir, raw) {
+  if (HOME_SENSITIVE.test(raw))
+    return "a credential or shell profile file";
+  const rel = normalizeResourcePath(rootDir, raw);
+  if (rel.startsWith("..") || path15.isAbsolute(rel)) {
+    if (/^\/(?:tmp|var\/tmp)\//.test(raw) || raw === "/dev/null")
+      return;
+    return "a path outside the project";
+  }
+  const hit = SENSITIVE_PATHS.find((p) => matchesPathPattern(rel, p));
+  return hit ? `harness, git or CI configuration (${rel})` : undefined;
+}
+function describe(state) {
+  const last = state.taint[state.taint.length - 1];
+  return `${last.tool}${last.resource ? ` (${last.resource})` : ""}`;
+}
+function createTaintEvaluator(rootDir) {
+  return (event) => {
+    const state = taintedState(event.sessionID);
+    if (!state)
+      return;
+    const action = (event.action ?? "").toLowerCase();
+    const resources = (event.resources ?? []).filter((r) => typeof r === "string");
+    const ask = (why) => ({
+      allowed: true,
+      ask: true,
+      reason: `SwarmOS Taint Guard: this session read untrusted external content from ${describe(state)}, and this action ${why}. Confirm it was your intent, not an instruction from that content. Use /untaint once you have reviewed the session.`
+    });
+    if (action === "external_directory")
+      return ask("reaches outside the project");
+    if (action === "edit" || action === "write" || action === "patch") {
+      for (const r of resources) {
+        const why = isSensitive(rootDir, r);
+        if (why)
+          return ask(`modifies ${why}`);
+      }
+    }
+    if (action === "shell" || action === "bash") {
+      for (const cmd of resources) {
+        const analysis = analyzeShell(cmd);
+        if (analysis.unparseable)
+          return ask("is a shell command SwarmOS could not parse");
+        if (analysis.effects.includes("network"))
+          return ask("sends or fetches data over the network");
+        for (const w of analysis.writes) {
+          const why = isSensitive(rootDir, w);
+          if (why)
+            return ask(`writes ${why}`);
+        }
+        if (analysis.effects.includes("exec") && analysis.commands.some((c) => /inline|script|sources/.test(c.note ?? ""))) {
+          return ask("runs inline or downloaded code");
+        }
+      }
+    }
+    return;
+  };
+}
+async function registerTaintHooks(ctx) {
+  if (!ctx.tool?.hook)
+    return;
+  await ctx.tool.hook("execute.after", async (event) => {
+    recordTaint(event);
+  });
+}
+async function registerUntaintCommand(ctx) {
+  if (!ctx.command?.transform)
+    return;
+  await ctx.command.transform((editor) => {
+    editor.add({
+      name: "untaint",
+      description: "Clear SwarmOS untrusted-content tracking for this session after you have reviewed what it read",
+      execute: async (input) => {
+        const n = clearTaint(input?.sessionID);
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input?.sessionID,
+            text: n ? `SwarmOS: cleared ${n} untrusted-content record(s) for this session. Saved approvals apply again.` : "SwarmOS: this session has no untrusted-content records.",
+            delivery: "steer"
+          });
+        }
+      }
+    });
+  });
+}
+
 // src/diagnostics/runner.ts
-import { execFile as execFile3 } from "child_process";
-import * as path13 from "path";
-import { promisify as promisify3 } from "util";
-var execFileAsync3 = promisify3(execFile3);
+import { execFile as execFile4 } from "child_process";
+import * as path16 from "path";
+import { promisify as promisify4 } from "util";
+var execFileAsync4 = promisify4(execFile4);
 async function runQuickDiagnostics(rootDir, filePath, options = {}) {
-  const abs = path13.resolve(rootDir, filePath);
-  const ext = path13.extname(abs).toLowerCase();
+  const abs = path16.resolve(rootDir, filePath);
+  const ext = path16.extname(abs).toLowerCase();
   const timeout = options.timeoutMs ?? 6000;
   const maxLines = options.maxLines ?? 30;
   try {
     if (ext === ".py") {
-      await execFileAsync3("python3", ["-m", "py_compile", abs], { cwd: rootDir, timeout });
+      await execFileAsync4("python3", ["-m", "py_compile", abs], { cwd: rootDir, timeout });
       return;
     }
     if (ext === ".rs") {
-      await execFileAsync3("cargo", ["check", "--message-format=short", "--quiet"], { cwd: rootDir, timeout: 12000 });
+      await execFileAsync4("cargo", ["check", "--message-format=short", "--quiet"], { cwd: rootDir, timeout: 12000 });
       return;
     }
     if (ext === ".go") {
-      await execFileAsync3("go", ["vet", abs], { cwd: rootDir, timeout: 8000 });
+      await execFileAsync4("go", ["vet", abs], { cwd: rootDir, timeout: 8000 });
       return;
     }
     if ([".js", ".cjs", ".mjs"].includes(ext)) {
-      await execFileAsync3("node", ["--check", abs], { cwd: rootDir, timeout });
+      await execFileAsync4("node", ["--check", abs], { cwd: rootDir, timeout });
       return;
     }
     if ([".ts", ".tsx", ".jsx"].includes(ext)) {
       try {
-        await execFileAsync3("oxlint", ["--quiet", abs], { cwd: rootDir, timeout });
+        await execFileAsync4("oxlint", ["--quiet", abs], { cwd: rootDir, timeout });
         return;
       } catch (oxErr) {
         if (oxErr?.code !== "ENOENT") {
@@ -3493,11 +4941,11 @@ async function registerCircuitBreakerHook(ctx) {
 }
 
 // src/omni/gui-studio.ts
-import { execFile as execFile4 } from "child_process";
-import * as fs11 from "fs/promises";
-import * as path14 from "path";
-import { promisify as promisify4 } from "util";
-var execFileAsync4 = promisify4(execFile4);
+import { execFile as execFile5 } from "child_process";
+import * as fs13 from "fs/promises";
+import * as path17 from "path";
+import { promisify as promisify5 } from "util";
+var execFileAsync5 = promisify5(execFile5);
 var VISUAL_QUALITY_CHECKLIST = {
   macroBalance: [
     "Balanced vertical & horizontal visual weight across the viewport (not top-heavy or clipped).",
@@ -3519,12 +4967,12 @@ var VISUAL_QUALITY_CHECKLIST = {
   ]
 };
 async function captureDesktopWindow(rootDir, outputName = "desktop_gui_preview.png") {
-  const previewDir = path14.join(rootDir, ".opencode", "artifacts", "previews");
-  await fs11.mkdir(previewDir, { recursive: true });
-  const outPath = path14.join(previewDir, path14.basename(outputName));
+  const previewDir = path17.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs13.mkdir(previewDir, { recursive: true });
+  const outPath = path17.join(previewDir, path17.basename(outputName));
   const platform = process.platform;
   if (platform === "darwin") {
-    await execFileAsync4("screencapture", ["-x", outPath], { cwd: rootDir, timeout: 1e4 });
+    await execFileAsync5("screencapture", ["-x", outPath], { cwd: rootDir, timeout: 1e4 });
     return { path: outPath, method: "macos-screencapture" };
   }
   const commands = [
@@ -3534,7 +4982,7 @@ async function captureDesktopWindow(rootDir, outputName = "desktop_gui_preview.p
   ];
   for (const cmd of commands) {
     try {
-      await execFileAsync4(cmd.bin, cmd.args, { cwd: rootDir, timeout: 1e4 });
+      await execFileAsync5(cmd.bin, cmd.args, { cwd: rootDir, timeout: 1e4 });
       return { path: outPath, method: cmd.method };
     } catch {}
   }
@@ -3578,8 +5026,8 @@ function registerGuiStudioTools(editor, rootDir) {
 }
 
 // src/omni/hashline.ts
-import * as fs12 from "fs/promises";
-import * as path15 from "path";
+import * as fs14 from "fs/promises";
+import * as path18 from "path";
 function computeLineHash(line) {
   const trimmed = line.trim();
   if (trimmed.length === 0)
@@ -3592,8 +5040,8 @@ function computeLineHash(line) {
   return (hash >>> 0 & 255).toString(16).padStart(2, "0");
 }
 async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
-  const abs = path15.resolve(rootDir, targetPath);
-  const raw = await fs12.readFile(abs, "utf8");
+  const abs = path18.resolve(rootDir, targetPath);
+  const raw = await fs14.readFile(abs, "utf8");
   const lines = raw.replace(/\r\n/g, `
 `).split(`
 `);
@@ -3614,8 +5062,8 @@ async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
   };
 }
 async function hashEditFile(rootDir, targetPath, hunks) {
-  const abs = path15.resolve(rootDir, targetPath);
-  const raw = await fs12.readFile(abs, "utf8");
+  const abs = path18.resolve(rootDir, targetPath);
+  const raw = await fs14.readFile(abs, "utf8");
   const hasCrlf = raw.includes(`\r
 `);
   const lines = raw.replace(/\r\n/g, `
@@ -3670,7 +5118,7 @@ async function hashEditFile(rootDir, targetPath, hunks) {
   const outputText = lines.join(hasCrlf ? `\r
 ` : `
 `);
-  await fs12.writeFile(abs, outputText, "utf8");
+  await fs14.writeFile(abs, outputText, "utf8");
   const diagnostics = await runQuickDiagnostics(rootDir, targetPath);
   return {
     path: targetPath,
@@ -3734,11 +5182,11 @@ function registerHashlineTools(editor, rootDir) {
 }
 
 // src/omni/office.ts
-import { execFile as execFile5 } from "child_process";
-import * as fs13 from "fs/promises";
-import * as path16 from "path";
-import { promisify as promisify5 } from "util";
-var execFileAsync5 = promisify5(execFile5);
+import { execFile as execFile6 } from "child_process";
+import * as fs15 from "fs/promises";
+import * as path19 from "path";
+import { promisify as promisify6 } from "util";
+var execFileAsync6 = promisify6(execFile6);
 var SUPPORTED_OFFICE_EXTENSIONS = new Set([
   ".docx",
   ".xlsx",
@@ -3844,28 +5292,28 @@ elif ext in (".sqlite", ".sqlite3", ".db"):
     print(NL.join(out))
 `;
 async function extractOfficeOrDataFile(rootDir, targetPath) {
-  const abs = path16.resolve(rootDir, targetPath);
-  const ext = path16.extname(abs).toLowerCase();
+  const abs = path19.resolve(rootDir, targetPath);
+  const ext = path19.extname(abs).toLowerCase();
   if (!SUPPORTED_OFFICE_EXTENSIONS.has(ext))
     return;
-  const { stdout } = await execFileAsync5("python3", ["-c", PYTHON_UNIVERSAL_EXTRACTOR, abs], {
+  const { stdout } = await execFileAsync6("python3", ["-c", PYTHON_UNIVERSAL_EXTRACTOR, abs], {
     cwd: rootDir,
     timeout: 15000
   });
   return stdout.trim();
 }
 async function renderDocumentPreviews(rootDir, targetPath) {
-  const abs = path16.resolve(rootDir, targetPath);
-  const ext = path16.extname(abs).toLowerCase();
-  const previewDir = path16.join(rootDir, ".opencode", "artifacts", "previews");
-  await fs13.mkdir(previewDir, { recursive: true });
+  const abs = path19.resolve(rootDir, targetPath);
+  const ext = path19.extname(abs).toLowerCase();
+  const previewDir = path19.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs15.mkdir(previewDir, { recursive: true });
   let pdfPath = abs;
   if ([".docx", ".pptx", ".xlsx"].includes(ext)) {
-    await execFileAsync5("libreoffice", ["--headless", "--nologo", "--nolockcheck", "--norestore", "--convert-to", "pdf", "--outdir", previewDir, abs], { cwd: rootDir, timeout: 30000 });
-    const stem = path16.basename(abs, ext);
-    pdfPath = path16.join(previewDir, `${stem}.pdf`);
+    await execFileAsync6("libreoffice", ["--headless", "--nologo", "--nolockcheck", "--norestore", "--convert-to", "pdf", "--outdir", previewDir, abs], { cwd: rootDir, timeout: 30000 });
+    const stem = path19.basename(abs, ext);
+    pdfPath = path19.join(previewDir, `${stem}.pdf`);
   }
-  const stem = path16.basename(pdfPath, ".pdf");
+  const stem = path19.basename(pdfPath, ".pdf");
   const pyRender = `
 import sys, os, json, pypdfium2 as pdfium
 pdf_path, out_dir, stem = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -3878,7 +5326,7 @@ for i, page in enumerate(pdf, start=1):
 pdf.close()
 print(json.dumps(paths))
 `;
-  const { stdout } = await execFileAsync5("python3", ["-c", pyRender, pdfPath, previewDir, stem], {
+  const { stdout } = await execFileAsync6("python3", ["-c", pyRender, pdfPath, previewDir, stem], {
     cwd: rootDir,
     timeout: 20000
   });
@@ -3941,7 +5389,7 @@ ${res.previewPngs.join(`
         const origExecute = tool.execute;
         tool.execute = async (input, context) => {
           if (typeof input?.path === "string") {
-            const ext = path16.extname(input.path).toLowerCase();
+            const ext = path19.extname(input.path).toLowerCase();
             if ([".docx", ".xlsx", ".xls", ".pptx", ".sqlite", ".sqlite3", ".db"].includes(ext)) {
               const extracted = await extractOfficeOrDataFile(rootDir, input.path);
               if (extracted !== undefined) {
@@ -3960,8 +5408,8 @@ ${res.previewPngs.join(`
 }
 
 // src/omni/pty-tap.ts
-import * as fs14 from "fs/promises";
-import * as path17 from "path";
+import * as fs16 from "fs/promises";
+import * as path20 from "path";
 var ERROR_LINE_RE = /\b(?:error|exception|fatal|panic|uncaught|failed|syntaxerror|typeerror|referenceerror|enoent|eaddrinuse)\b/i;
 async function readDevServerLogs(ctx, rootDir, input = {}) {
   const maxLines = Math.min(Math.max(input.lines ?? 80, 10), 500);
@@ -3976,14 +5424,14 @@ async function readDevServerLogs(ctx, rootDir, input = {}) {
   }
   if (!rawText) {
     const candidateFiles = [
-      ...input.logFile ? [path17.resolve(rootDir, input.logFile)] : [],
-      path17.join(rootDir, ".opencode", "artifacts", "devserver.log"),
-      path17.join(rootDir, "dev.log")
+      ...input.logFile ? [path20.resolve(rootDir, input.logFile)] : [],
+      path20.join(rootDir, ".opencode", "artifacts", "devserver.log"),
+      path20.join(rootDir, "dev.log")
     ];
     for (const file of candidateFiles) {
       try {
-        rawText = await fs14.readFile(file, "utf8");
-        source = path17.relative(rootDir, file).split(path17.sep).join("/");
+        rawText = await fs16.readFile(file, "utf8");
+        source = path20.relative(rootDir, file).split(path20.sep).join("/");
         break;
       } catch {}
     }
@@ -4030,8 +5478,8 @@ function registerPtyTapTools(editor, ctx, rootDir) {
 }
 
 // src/skills/ui-craft/skill.ts
-import * as fs15 from "fs/promises";
-import * as path18 from "path";
+import * as fs17 from "fs/promises";
+import * as path21 from "path";
 var UI_CRAFT_SKILL_ID = "ui-craft";
 var UI_CRAFT_SKILL_NAME = "UI Craft & Spatial Architecture";
 var EMBEDDED_UI_CRAFT_SKILL_MD = `---
@@ -4144,9 +5592,9 @@ Before handing off any UI milestone:
    - \`row-baseline-jitter\`: Align sibling card and button top edges to exact pixels.`;
 async function loadSkillContent(fallbackDir) {
   const targetDir = fallbackDir ?? process.cwd();
-  const candidate = path18.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
+  const candidate = path21.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
   try {
-    return await fs15.readFile(candidate, "utf8");
+    return await fs17.readFile(candidate, "utf8");
   } catch {
     return EMBEDDED_UI_CRAFT_SKILL_MD;
   }
@@ -4155,7 +5603,7 @@ async function registerUICraftSkill(ctx, rootDir) {
   if (!ctx.skill?.transform)
     return;
   const content = await loadSkillContent(rootDir);
-  const absoluteSkillPath = path18.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
+  const absoluteSkillPath = path21.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
   await ctx.skill.transform((editor) => {
     editor.add({
       id: UI_CRAFT_SKILL_ID,
@@ -4209,7 +5657,22 @@ function buildSetupModules(rootDir, config) {
         registerVerifyTools(editor, rootDir);
       })
     },
-    { id: "permission-guard", requires: ["permission.hook"], run: (c) => registerPermissionGuard(c, rootDir) },
+    {
+      id: "permission-guard",
+      requires: ["permission.hook"],
+      run: (c) => registerPermissionGuard(c, rootDir, config.taintTracking ? [createTaintEvaluator(rootDir)] : [])
+    },
+    ...config.autoTransactions ? [{ id: "transactions", requires: ["tool.hook"], run: (c) => registerTransactionHooks(c, rootDir) }] : [],
+    ...config.taintTracking ? [
+      {
+        id: "taint-tracking",
+        requires: ["tool.hook"],
+        run: async (c) => {
+          await registerTaintHooks(c);
+          await registerUntaintCommand(c);
+        }
+      }
+    ] : [],
     { id: "diagnostics", requires: ["tool.hook"], run: (c) => registerDiagnosticHook(c, rootDir) },
     { id: "circuit-breaker", requires: ["tool.hook"], run: (c) => registerCircuitBreakerHook(c) },
     { id: "ui-craft-skill", requires: ["skill.transform"], run: (c) => registerUICraftSkill(c, rootDir) },
@@ -4278,25 +5741,33 @@ export {
   UI_CRAFT_SKILL_NAME,
   VISUAL_QUALITY_CHECKLIST,
   analyzeBlastRadius,
+  analyzeShell,
   appendTelemetry,
   auditMarkdownCitations,
+  beginTransaction,
   buildDoctorText,
   buildRepoMap,
   buildSetupModules,
   captureDesktopWindow,
+  cleanupTournamentWorktrees,
+  clearTaint,
+  commitWorktree,
   computeLineHash,
   computeTreeFingerprint,
   createCheckpoint,
   createEmptyBoard,
+  createTaintEvaluator,
   createTask,
   src_default as default,
   discoverChecks,
   evaluateBoardGuard,
+  evaluateFileMutation,
   evaluatePermissionGuard,
   extractFailures,
   extractMutatedPaths,
   extractOfficeOrDataFile,
   extractOutline,
+  finishTransaction,
   formatDoctorReport,
   formatVerifyRun,
   getArtifactsDir,
@@ -4314,7 +5785,10 @@ export {
   hashReadFile,
   initProject,
   instrumentHost,
+  isGitRepo,
+  isReadOnly,
   isTestFile,
+  isTestPath,
   listArtifacts,
   listChangedFiles,
   listCheckpoints,
@@ -4329,18 +5803,23 @@ export {
   loadVerifyRun,
   lockContract,
   matchesPathPattern,
+  mergeTournamentWinner,
   missingRequired,
+  mutationTargets,
   normalizeResourcePath,
   parseCounts,
+  parseShell,
   planTournament,
   plugin,
   probeHost,
+  provisionWorktree,
   readArtifact,
   readDevServerLogs,
   readTelemetryFile,
   recordAndEvaluateCircuitBreaker,
   recordLesson,
   recordResearchSource,
+  recordTaint,
   registerArtifactContextHook,
   registerArtifactTools,
   registerCheckpointTools,
@@ -4358,23 +5837,29 @@ export {
   registerPtyTapTools,
   registerRepoMapTools,
   registerResearchTools,
+  registerTaintHooks,
   registerTelemetryHooks,
+  registerTransactionHooks,
+  registerUntaintCommand,
   registerVerifyTools,
   renderDocumentPreviews,
   resetCircuitBreaker,
   resetSessionStates,
+  resetTransactions,
   resolveTournament,
   rollbackCheckpoint,
   runQuickDiagnostics,
   runSetupModules,
   runVerify,
   saveBoard,
+  scoreTournament,
   setup,
   storeSetupReport,
   stripAnsi,
   submitQAReceipt,
   summarizeTelemetry,
   taskWorkdir,
+  transactionStats,
   updateTaskStatus,
   verifyReleaseReady,
   withBoardLock,

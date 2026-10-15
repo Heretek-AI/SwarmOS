@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { computeTreeFingerprint, loadLatestVerifyRun, loadVerifyRun } from "../omni/verify.js"
+import { git, isGitRepo, mergeTournamentWinner, provisionWorktree, type MergeResult } from "./worktrees.js"
 import type {
   Contract,
   CreateTaskInput,
@@ -237,9 +238,42 @@ export async function submitQAReceipt(rootDir: string, input: SubmitQAReceiptInp
 }
 
 /**
- * Provisions a Best-of-N Worktree Tournament with isolated candidate tasks and worktree paths.
+ * Provisions a Best-of-N Worktree Tournament: candidate tasks on the board plus, in a git
+ * repository, a real `git worktree` per candidate on branch `swarmos/<taskId>`.
  */
 export async function planTournament(rootDir: string, input: PlanTournamentInput): Promise<Tournament> {
+  const planned = await recordTournamentPlan(rootDir, input)
+  if (!(await isGitRepo(rootDir))) {
+    return markProvisioning(rootDir, planned.id, undefined, planned.candidates.map(() => ({ provisioned: false, reason: "not a git repository" })))
+  }
+  const baseRef = (await git(rootDir, ["rev-parse", "HEAD"])).stdout.trim() || "HEAD"
+  const results = []
+  for (const c of planned.candidates) {
+    results.push(await provisionWorktree(rootDir, c.taskId, c.worktree, baseRef))
+  }
+  return markProvisioning(rootDir, planned.id, baseRef, results)
+}
+
+async function markProvisioning(
+  rootDir: string,
+  tournamentId: string,
+  baseRef: string | undefined,
+  results: Array<{ provisioned: boolean; reason?: string; branch?: string }>,
+): Promise<Tournament> {
+  return withBoardLock(rootDir, (board) => {
+    const tournament = board.tournaments!.find((t) => t.id === tournamentId)!
+    if (baseRef) tournament.baseRef = baseRef
+    tournament.candidates.forEach((c, i) => {
+      c.provisioned = results[i].provisioned
+      if (results[i].branch) c.branch = results[i].branch
+      if (results[i].reason) c.provisionNote = results[i].reason
+      else delete c.provisionNote
+    })
+    return tournament
+  })
+}
+
+async function recordTournamentPlan(rootDir: string, input: PlanTournamentInput): Promise<Tournament> {
   return withBoardLock(rootDir, (board) => {
     if (!Array.isArray(board.tournaments)) {
       board.tournaments = []
@@ -303,30 +337,15 @@ export async function planTournament(rootDir: string, input: PlanTournamentInput
  * and marking all competing candidate tasks as `superseded`.
  */
 export async function resolveTournament(rootDir: string, input: ResolveTournamentInput): Promise<Tournament> {
+  const snapshot = await loadBoard(rootDir)
+  const planned = assertResolvable(snapshot, input)
+  let merge: MergeResult | undefined
+  if (input.merge !== false && planned.candidates.some((c) => c.provisioned)) {
+    merge = await mergeTournamentWinner(rootDir, planned, input.winningTaskId)
+  }
+
   return withBoardLock(rootDir, (board) => {
-    if (!Array.isArray(board.tournaments)) {
-      board.tournaments = []
-    }
-    const tournament = board.tournaments.find((t) => t.id === input.tournamentId)
-    if (!tournament) {
-      throw new Error(`SwarmOS Tournament not found: ${input.tournamentId}`)
-    }
-
-    const isCandidate = tournament.candidates.some((c) => c.taskId === input.winningTaskId)
-    if (!isCandidate) {
-      throw new Error(
-        `SwarmOS Tournament Guard: Task "${input.winningTaskId}" is not a registered candidate of tournament "${input.tournamentId}".`,
-      )
-    }
-
-    const winningTask = board.tasks.find((t) => t.id === input.winningTaskId)
-    const latestReceipt = winningTask?.qaReceipts[winningTask.qaReceipts.length - 1]
-    if (!winningTask || winningTask.status !== "verified" || latestReceipt?.verdict !== "PASS") {
-      throw new Error(
-        `SwarmOS Tournament Guard: Winning candidate task [${input.winningTaskId}] must have a verified PASS QA receipt before resolving the tournament.`,
-      )
-    }
-
+    const tournament = assertResolvable(board, input)
     const now = new Date().toISOString()
     for (const candidate of tournament.candidates) {
       if (candidate.taskId === input.winningTaskId) continue
@@ -341,9 +360,43 @@ export async function resolveTournament(rootDir: string, input: ResolveTournamen
     tournament.winningTaskId = input.winningTaskId
     tournament.resolutionSummary = input.summary
     tournament.updatedAt = now
+    if (merge?.commit) {
+      tournament.mergeCommit = merge.commit
+      // The winner's code now lives in the main tree; its worktree is gone.
+      const winnerTask = board.tasks.find((t) => t.id === input.winningTaskId)
+      if (winnerTask) delete winnerTask.worktree
+      for (const c of tournament.candidates) c.provisioned = false
+    }
 
     return tournament
   })
+}
+
+function assertResolvable(board: OrgBoard, input: ResolveTournamentInput): Tournament {
+  const tournament = (board.tournaments ?? []).find((t) => t.id === input.tournamentId)
+  if (!tournament) {
+    throw new Error(`SwarmOS Tournament not found: ${input.tournamentId}`)
+  }
+
+  const isCandidate = tournament.candidates.some((c) => c.taskId === input.winningTaskId)
+  if (!isCandidate) {
+    throw new Error(
+      `SwarmOS Tournament Guard: Task "${input.winningTaskId}" is not a registered candidate of tournament "${input.tournamentId}".`,
+    )
+  }
+
+  const winningTask = board.tasks.find((t) => t.id === input.winningTaskId)
+  const latestReceipt = winningTask?.qaReceipts[winningTask.qaReceipts.length - 1]
+  if (!winningTask || winningTask.status !== "verified" || latestReceipt?.verdict !== "PASS") {
+    throw new Error(
+      `SwarmOS Tournament Guard: Winning candidate task [${input.winningTaskId}] must have a verified PASS QA receipt before resolving the tournament.`,
+    )
+  }
+
+  if (tournament.status === "resolved") {
+    throw new Error(`SwarmOS Tournament Guard: Tournament "${input.tournamentId}" is already resolved.`)
+  }
+  return tournament
 }
 
 /**

@@ -5,6 +5,9 @@ import {
   matchesPathPattern,
   normalizeResourcePath,
   registerPermissionGuard,
+  evaluateFileMutation,
+  isTestPath,
+  type GuardEvaluator,
   type GuardDecision,
   type PermissionEvaluationEvent,
 } from "./agents/guard.js"
@@ -87,6 +90,26 @@ import {
   type TelemetrySummary,
 } from "./host/telemetry.js"
 import { SWARMOS_VERSION } from "./version.js"
+import { analyzeShell, isReadOnly, parseShell, type CommandAnalysis, type ShellAnalysis, type ShellEffect } from "./agents/shell-parse.js"
+import {
+  beginTransaction,
+  finishTransaction,
+  mutationTargets,
+  registerTransactionHooks,
+  resetTransactions,
+  transactionStats,
+} from "./omni/transactions.js"
+import { clearTaint, createTaintEvaluator, recordTaint, registerTaintHooks, registerUntaintCommand } from "./omni/taint.js"
+import {
+  cleanupTournamentWorktrees,
+  commitWorktree,
+  isGitRepo,
+  mergeTournamentWinner,
+  provisionWorktree,
+  scoreTournament,
+  type CandidateScore,
+  type MergeResult,
+} from "./board/worktrees.js"
 import {
   computeTreeFingerprint,
   discoverChecks,
@@ -347,6 +370,30 @@ export {
   getVerifyDir,
   registerVerifyTools,
   taskWorkdir,
+
+  // v0.7.0: shell parser, file guard, worktree tournaments, transactions & taint tracking
+  parseShell,
+  analyzeShell,
+  isReadOnly,
+  evaluateFileMutation,
+  isTestPath,
+  provisionWorktree,
+  commitWorktree,
+  isGitRepo,
+  scoreTournament,
+  mergeTournamentWinner,
+  cleanupTournamentWorktrees,
+  mutationTargets,
+  beginTransaction,
+  finishTransaction,
+  registerTransactionHooks,
+  resetTransactions,
+  transactionStats,
+  recordTaint,
+  clearTaint,
+  createTaintEvaluator,
+  registerTaintHooks,
+  registerUntaintCommand,
 }
 
 export type {
@@ -367,6 +414,12 @@ export type {
   VerifyRun,
   VerifyRunInput,
   BoardPolicy,
+  CommandAnalysis,
+  ShellAnalysis,
+  ShellEffect,
+  CandidateScore,
+  MergeResult,
+  GuardEvaluator,
   AestheticArchetype,
   OrgBoard,
   ProjectCharter,
@@ -450,7 +503,26 @@ export function buildSetupModules(rootDir: string, config: SwarmOSConfig): Setup
           registerVerifyTools(editor, rootDir)
         }),
     },
-    { id: "permission-guard", requires: ["permission.hook"], run: (c) => registerPermissionGuard(c, rootDir) },
+    {
+      id: "permission-guard",
+      requires: ["permission.hook"],
+      run: (c) => registerPermissionGuard(c, rootDir, config.taintTracking ? [createTaintEvaluator(rootDir)] : []),
+    },
+    ...(config.autoTransactions
+      ? [{ id: "transactions", requires: ["tool.hook"], run: (c: any) => registerTransactionHooks(c, rootDir) }]
+      : []),
+    ...(config.taintTracking
+      ? [
+          {
+            id: "taint-tracking",
+            requires: ["tool.hook"],
+            run: async (c: any) => {
+              await registerTaintHooks(c)
+              await registerUntaintCommand(c)
+            },
+          },
+        ]
+      : []),
     { id: "diagnostics", requires: ["tool.hook"], run: (c) => registerDiagnosticHook(c, rootDir) },
     { id: "circuit-breaker", requires: ["tool.hook"], run: (c) => registerCircuitBreakerHook(c) },
     { id: "ui-craft-skill", requires: ["skill.transform"], run: (c) => registerUICraftSkill(c, rootDir) },
