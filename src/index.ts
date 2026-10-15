@@ -74,6 +74,21 @@ import {
   type ArtifactName,
 } from "./omni/artifacts.js"
 import {
+  createCheckpoint,
+  getCheckpointsDir,
+  listCheckpoints,
+  registerCheckpointTools,
+  rollbackCheckpoint,
+  type CheckpointFileEntry,
+  type CheckpointManifest,
+} from "./omni/checkpoints.js"
+import {
+  recordAndEvaluateCircuitBreaker,
+  registerCircuitBreakerHook,
+  resetCircuitBreaker,
+  type ToolAttemptRecord,
+} from "./omni/circuit-breaker.js"
+import {
   captureDesktopWindow,
   registerGuiStudioTools,
   VISUAL_QUALITY_CHECKLIST,
@@ -88,11 +103,32 @@ import {
   type HashReadResult,
 } from "./omni/hashline.js"
 import {
+  getMemoryFilePath,
+  loadLessons,
+  recordLesson,
+  registerMemoryContextHook,
+  registerMemoryTools,
+  type EpisodicLesson,
+} from "./omni/memory.js"
+import {
   extractOfficeOrDataFile,
   registerOfficeTools,
   renderDocumentPreviews,
   SUPPORTED_OFFICE_EXTENSIONS,
 } from "./omni/office.js"
+import {
+  readDevServerLogs,
+  registerPtyTapTools,
+  type PtyLogReadInput,
+} from "./omni/pty-tap.js"
+import {
+  analyzeBlastRadius,
+  buildRepoMap,
+  registerRepoMapTools,
+  type BlastRadiusReport,
+  type RepoMapNode,
+  type RepoMapReport,
+} from "./omni/repomap.js"
 import {
   auditMarkdownCitations,
   getResearchLedgerPath,
@@ -180,6 +216,34 @@ export {
   STANDARD_VIEWPORTS,
   extractOutline,
 
+  // v0.5.0: PageRank RepoMap & Reverse-Import Blast-Radius Analyzer
+  buildRepoMap,
+  analyzeBlastRadius,
+  registerRepoMapTools,
+
+  // v0.5.0: Doom-Loop Circuit Breaker
+  resetCircuitBreaker,
+  recordAndEvaluateCircuitBreaker,
+  registerCircuitBreakerHook,
+
+  // v0.5.0: Zero-Git-Noise Time-Travel Checkpoints
+  getCheckpointsDir,
+  createCheckpoint,
+  rollbackCheckpoint,
+  listCheckpoints,
+  registerCheckpointTools,
+
+  // v0.5.0: Cross-Session Episodic Memory
+  getMemoryFilePath,
+  loadLessons,
+  recordLesson,
+  registerMemoryTools,
+  registerMemoryContextHook,
+
+  // v0.5.0: Live Persistent Terminal & Dev-Server Log Tap
+  readDevServerLogs,
+  registerPtyTapTools,
+
   // Diagnostics & Muse overlay
   runQuickDiagnostics,
   extractMutatedPaths,
@@ -222,15 +286,20 @@ export type {
   ArtifactName,
   ResearchSource,
   CitationAuditReport,
+  RepoMapNode,
+  RepoMapReport,
+  BlastRadiusReport,
+  ToolAttemptRecord,
+  CheckpointFileEntry,
+  CheckpointManifest,
+  EpisodicLesson,
+  PtyLogReadInput,
 }
 
 export const SWARMOS_PLUGIN_ID = "heretek.swarmos"
 
 /**
- * OpenCode SwarmOS Omni-Harness Plugin Setup Function (v0.4.0).
- *
- * Turns OpenCode V2 into an autonomous multi-agent software company,
- * Web/Desktop GUI Studio, Deep Research Analyst, and Office Document Suite.
+ * OpenCode SwarmOS Omni-Harness Plugin Setup Function (v0.5.0).
  */
 export async function setup(ctx: any): Promise<void> {
   const rootDir = ctx.location?.directory ?? process.cwd()
@@ -253,23 +322,29 @@ export async function setup(ctx: any): Promise<void> {
       registerOfficeTools(editor, rootDir)
       registerResearchTools(editor, rootDir)
       registerGuiStudioTools(editor, rootDir)
+      registerRepoMapTools(editor, rootDir)
+      registerCheckpointTools(editor, rootDir)
+      registerMemoryTools(editor, rootDir)
+      registerPtyTapTools(editor, ctx, rootDir)
     })
   }
 
   // 3. Register runtime Contract Lock, Disjoint OwnedPaths & Shell Mutation Guard
   await registerPermissionGuard(ctx, rootDir)
 
-  // 4. Register live post-mutation compiler & linter diagnostic feedback loop
+  // 4. Register live post-mutation compiler & linter diagnostic feedback loop + Doom-Loop Circuit Breaker
   await registerDiagnosticHook(ctx, rootDir)
+  await registerCircuitBreakerHook(ctx)
 
   // 5. Register Anti-Slop UI Craft & Spatial Architecture Skill
   await registerUICraftSkill(ctx, rootDir)
 
-  // 6. Register Muse 1.3 Overlay & Antigravity Persistent Artifact Context Sync
+  // 6. Register Muse 1.3 Overlay, Antigravity Artifact Sync & Episodic Memory Recall
   await registerMuseOverlay(ctx)
   await registerArtifactContextHook(ctx, rootDir)
+  await registerMemoryContextHook(ctx, rootDir)
 
-  // 7. Register Slash Commands: /ship, /swarm, /gui, /research, /office, /artifacts
+  // 7. Register Slash Commands: /ship, /swarm, /gui, /research, /office, /artifacts, /map
   await registerShipCommand(ctx)
   await registerSwarmCommand(ctx, rootDir)
   await registerOmniCommands(ctx, rootDir)

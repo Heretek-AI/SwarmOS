@@ -1356,15 +1356,427 @@ ${sections.join(`
   await ctx.session.hook("context", injectArtifacts);
 }
 
-// src/omni/research.ts
+// src/omni/checkpoints.ts
 import * as fs4 from "fs/promises";
 import * as path5 from "path";
+function getCheckpointsDir(rootDir) {
+  return path5.join(rootDir, ".opencode", "checkpoints");
+}
+async function createCheckpoint(rootDir, input) {
+  const id = input.id ?? `chk-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const dir = getCheckpointsDir(rootDir);
+  await fs4.mkdir(dir, { recursive: true });
+  const files = [];
+  for (const rawPath of input.paths) {
+    const abs = path5.resolve(rootDir, rawPath);
+    const rel = path5.relative(rootDir, abs).split(path5.sep).join("/");
+    try {
+      const buf = await fs4.readFile(abs);
+      files.push({
+        path: rel,
+        exists: true,
+        contentBase64: buf.toString("base64")
+      });
+    } catch {
+      files.push({
+        path: rel,
+        exists: false
+      });
+    }
+  }
+  const manifest = {
+    id,
+    label: input.label,
+    createdAt: new Date().toISOString(),
+    files
+  };
+  await fs4.writeFile(path5.join(dir, `${id}.json`), JSON.stringify(manifest, null, 2), "utf8");
+  return {
+    id: manifest.id,
+    label: manifest.label,
+    createdAt: manifest.createdAt,
+    fileCount: files.length
+  };
+}
+async function rollbackCheckpoint(rootDir, checkpointId) {
+  const file = path5.join(getCheckpointsDir(rootDir), `${path5.basename(checkpointId)}.json`);
+  const raw = await fs4.readFile(file, "utf8");
+  const manifest = JSON.parse(raw);
+  const restoredFiles = [];
+  const removedFiles = [];
+  for (const entry of manifest.files) {
+    const abs = path5.resolve(rootDir, entry.path);
+    if (entry.exists && typeof entry.contentBase64 === "string") {
+      await fs4.mkdir(path5.dirname(abs), { recursive: true });
+      await fs4.writeFile(abs, Buffer.from(entry.contentBase64, "base64"));
+      restoredFiles.push(entry.path);
+    } else if (!entry.exists) {
+      await fs4.rm(abs, { force: true });
+      removedFiles.push(entry.path);
+    }
+  }
+  return { id: manifest.id, restoredFiles, removedFiles };
+}
+async function listCheckpoints(rootDir) {
+  try {
+    const dir = getCheckpointsDir(rootDir);
+    const entries = await fs4.readdir(dir);
+    const results = [];
+    for (const name of entries) {
+      if (!name.endsWith(".json"))
+        continue;
+      try {
+        const raw = await fs4.readFile(path5.join(dir, name), "utf8");
+        const parsed = JSON.parse(raw);
+        results.push({
+          id: parsed.id,
+          label: parsed.label,
+          createdAt: parsed.createdAt,
+          fileCount: parsed.files.length
+        });
+      } catch {}
+    }
+    return results.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  } catch {
+    return [];
+  }
+}
+function registerCheckpointTools(editor, rootDir) {
+  editor.namespace({
+    name: "checkpoints",
+    description: "Zero-Git-Noise Time-Travel Checkpoints for snapshotting and rolling back file sets before risky refactors."
+  });
+  editor.add({
+    name: "create",
+    description: "Capture a time-travel snapshot of the specified file paths before a risky multi-file edit or refactor.",
+    options: { namespace: "checkpoints", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Optional checkpoint ID" },
+        label: { type: "string", description: "Human-readable description of the checkpoint" },
+        paths: { type: "array", items: { type: "string" }, description: "File paths to snapshot" }
+      },
+      required: ["label", "paths"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await createCheckpoint(rootDir, input);
+      return { output: res, content: `Created checkpoint [${res.id}] (${res.fileCount} files): ${res.label}` };
+    }
+  });
+  editor.add({
+    name: "rollback",
+    description: "Restore all files in a checkpoint to their exact pre-refactor state.",
+    options: { namespace: "checkpoints", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        checkpointId: { type: "string", description: "Checkpoint ID to restore" }
+      },
+      required: ["checkpointId"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await rollbackCheckpoint(rootDir, input.checkpointId);
+      return {
+        output: res,
+        content: `Rolled back to checkpoint [${res.id}]: restored ${res.restoredFiles.length} file(s), removed ${res.removedFiles.length} file(s).`
+      };
+    }
+  });
+  editor.add({
+    name: "list",
+    description: "List all available time-travel checkpoints in `.opencode/checkpoints/`.",
+    options: { namespace: "checkpoints", codemode: true, pinned: true },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const list = await listCheckpoints(rootDir);
+      return { output: { checkpoints: list }, content: JSON.stringify(list, null, 2) };
+    }
+  });
+}
+
+// src/omni/memory.ts
+import * as fs5 from "fs/promises";
+import * as path6 from "path";
+function getMemoryFilePath(rootDir) {
+  return path6.join(rootDir, ".opencode", "memory", "lessons.json");
+}
+async function loadLessons(rootDir) {
+  try {
+    const raw = await fs5.readFile(getMemoryFilePath(rootDir), "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+async function recordLesson(rootDir, input) {
+  const lessons = await loadLessons(rootDir);
+  const entry = {
+    ...input,
+    createdAt: new Date().toISOString()
+  };
+  const idx = lessons.findIndex((l) => l.id === input.id);
+  if (idx >= 0)
+    lessons[idx] = entry;
+  else
+    lessons.push(entry);
+  const file = getMemoryFilePath(rootDir);
+  await fs5.mkdir(path6.dirname(file), { recursive: true });
+  await fs5.writeFile(file, JSON.stringify(lessons, null, 2), "utf8");
+  return entry;
+}
+function registerMemoryTools(editor, rootDir) {
+  editor.namespace({
+    name: "memory",
+    description: "Cross-Session Episodic Memory for recording repository quirks, build/test gotchas, and architectural lessons that auto-inject into future sessions."
+  });
+  editor.add({
+    name: "record_lesson",
+    description: "Record a permanent repository lesson or non-obvious gotcha in `.opencode/memory/lessons.json` so future sessions never repeat the same mistake.",
+    options: { namespace: "memory", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Short lesson ID (e.g. 'sqlite-wal-test-env')" },
+        trigger: { type: "string", description: "When this lesson applies (e.g. 'Running bun test on database modules')" },
+        lesson: { type: "string", description: "The exact actionable rule or fix" },
+        scopePaths: { type: "array", items: { type: "string" }, description: "Optional file globs this applies to" }
+      },
+      required: ["id", "trigger", "lesson"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const entry = await recordLesson(rootDir, input);
+      return { output: entry, content: `Recorded episodic lesson [${entry.id}]` };
+    }
+  });
+  editor.add({
+    name: "recall",
+    description: "Retrieve all recorded episodic lessons for this repository.",
+    options: { namespace: "memory", codemode: true, pinned: true },
+    input: { type: "object", properties: {} },
+    output: { type: "object" },
+    execute: async () => {
+      const lessons = await loadLessons(rootDir);
+      return { output: { lessons }, content: JSON.stringify(lessons, null, 2) };
+    }
+  });
+}
+async function registerMemoryContextHook(ctx, rootDir) {
+  if (!ctx.session?.hook)
+    return;
+  const injectMemory = async (event) => {
+    if (event.agent === "compaction" || event.kind === "compaction")
+      return;
+    if (!Array.isArray(event.system) || event.system.length === 0)
+      return;
+    const lessons = await loadLessons(rootDir);
+    if (lessons.length === 0)
+      return;
+    const formatted = lessons.slice(-20).map((l) => `- **[${l.id}]** (${l.trigger}): ${l.lesson}`).join(`
+`);
+    const block = `<episodic-repository-memory>
+## Learned Repository Rules & Gotchas
+${formatted}
+</episodic-repository-memory>`;
+    const lastIdx = event.system.length - 1;
+    const lastPart = event.system[lastIdx];
+    if (lastPart && typeof lastPart.text === "string" && !lastPart.text.includes("<episodic-repository-memory>")) {
+      event.system[lastIdx] = {
+        ...lastPart,
+        text: `${lastPart.text}
+
+${block}`
+      };
+    }
+  };
+  await ctx.session.hook("context", injectMemory);
+}
+
+// src/omni/repomap.ts
+import * as fs6 from "fs/promises";
+import * as path7 from "path";
+var SOURCE_EXTS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".py", ".rs", ".go"]);
+var IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", ".opencode", ".worktrees", "target", "__pycache__"]);
+async function walkSourceFiles(dir, rootDir, maxFiles = 400, acc = []) {
+  if (acc.length >= maxFiles)
+    return acc;
+  let entries = [];
+  try {
+    entries = await fs6.readdir(dir, { withFileTypes: true });
+  } catch {
+    return acc;
+  }
+  for (const entry of entries) {
+    if (acc.length >= maxFiles)
+      break;
+    if (entry.name.startsWith(".") && entry.name !== ".github")
+      continue;
+    if (entry.isDirectory()) {
+      if (IGNORED_DIRS.has(entry.name))
+        continue;
+      await walkSourceFiles(path7.join(dir, entry.name), rootDir, maxFiles, acc);
+    } else if (entry.isFile()) {
+      const ext = path7.extname(entry.name).toLowerCase();
+      if (SOURCE_EXTS.has(ext)) {
+        const rel = path7.relative(rootDir, path7.join(dir, entry.name)).split(path7.sep).join("/");
+        acc.push(rel);
+      }
+    }
+  }
+  return acc;
+}
+function resolveRelativeImport(fromFile, spec, knownSet) {
+  if (!spec.startsWith("."))
+    return;
+  const fromDir = path7.posix.dirname(fromFile);
+  const base = path7.posix.normalize(path7.posix.join(fromDir, spec));
+  const candidates = [
+    base,
+    base.replace(/\.js$/, ".ts"),
+    base.replace(/\.js$/, ".tsx"),
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.js`,
+    `${base}/index.ts`,
+    `${base}/index.js`
+  ];
+  return candidates.find((c) => knownSet.has(c));
+}
+async function buildRepoMap(rootDir, topN = 25) {
+  const files = await walkSourceFiles(rootDir, rootDir, 400);
+  const knownSet = new Set(files);
+  const nodes = new Map;
+  for (const f of files) {
+    nodes.set(f, { path: f, imports: [], importedBy: [], centralityScore: 1, symbols: [] });
+  }
+  const importRe = /(?:import\s+[^'"]*from\s+|import\s*\(|export\s+[^'"]*from\s+)['"]([^'"]+)['"]/g;
+  const declRe = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|const|enum|struct|fn|def)\s+([A-Za-z0-9_$]+)/;
+  for (const f of files) {
+    const node = nodes.get(f);
+    try {
+      const raw = await fs6.readFile(path7.resolve(rootDir, f), "utf8");
+      let match;
+      importRe.lastIndex = 0;
+      while ((match = importRe.exec(raw)) !== null) {
+        const resolved = resolveRelativeImport(f, match[1], knownSet);
+        if (resolved && resolved !== f && !node.imports.includes(resolved)) {
+          node.imports.push(resolved);
+          const targetNode = nodes.get(resolved);
+          if (targetNode && !targetNode.importedBy.includes(f)) {
+            targetNode.importedBy.push(f);
+          }
+        }
+      }
+      for (const line of raw.split(`
+`).slice(0, 300)) {
+        const m = declRe.exec(line);
+        if (m && node.symbols.length < 12 && !node.symbols.includes(m[1])) {
+          node.symbols.push(m[1]);
+        }
+      }
+    } catch {}
+  }
+  const damping = 0.85;
+  for (let iter = 0;iter < 3; iter++) {
+    const nextScores = new Map;
+    for (const [f, node] of nodes.entries()) {
+      let sum = 0;
+      for (const caller of node.importedBy) {
+        const callerNode = nodes.get(caller);
+        const outDegree = Math.max(1, callerNode.imports.length);
+        sum += callerNode.centralityScore / outDegree;
+      }
+      nextScores.set(f, +(1 - damping + damping * (sum + node.importedBy.length)).toFixed(3));
+    }
+    for (const [f, score] of nextScores.entries()) {
+      nodes.get(f).centralityScore = score;
+    }
+  }
+  const sorted = Array.from(nodes.values()).sort((a, b) => b.centralityScore - a.centralityScore || b.importedBy.length - a.importedBy.length);
+  return {
+    totalFilesScanned: files.length,
+    topFiles: sorted.slice(0, topN)
+  };
+}
+async function analyzeBlastRadius(rootDir, targetFile) {
+  const relTarget = path7.relative(rootDir, path7.resolve(rootDir, targetFile)).split(path7.sep).join("/");
+  const fullMap = await buildRepoMap(rootDir, 400);
+  const byPath = new Map(fullMap.topFiles.map((n) => [n.path, n]));
+  const direct = byPath.get(relTarget)?.importedBy ?? [];
+  const visited = new Set(direct);
+  const queue = [...direct];
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    const callers = byPath.get(cur)?.importedBy ?? [];
+    for (const c of callers) {
+      if (c !== relTarget && !visited.has(c)) {
+        visited.add(c);
+        queue.push(c);
+      }
+    }
+  }
+  const transitive = Array.from(visited);
+  return {
+    targetFile: relTarget,
+    directDependents: direct,
+    transitiveDependents: transitive,
+    impactScore: direct.length * 2 + transitive.length
+  };
+}
+function registerRepoMapTools(editor, rootDir) {
+  editor.namespace({
+    name: "repo",
+    description: "Aider-style PageRank Repository Map & Reverse-Import Blast-Radius Analyzer for instant architectural orientation."
+  });
+  editor.add({
+    name: "map",
+    description: "Build a PageRank-weighted repository dependency map showing the highest-centrality files, their exported symbols, and their importers/dependents.",
+    options: { namespace: "repo", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        topN: { type: "number", description: "Number of top-ranked files to return (default 25)" }
+      }
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const report = await buildRepoMap(rootDir, input?.topN ?? 25);
+      return { output: report, content: JSON.stringify(report, null, 2) };
+    }
+  });
+  editor.add({
+    name: "blast_radius",
+    description: "Compute the direct and transitive reverse-import blast radius (all files that directly or indirectly import `targetFile`) before or after modifying an interface.",
+    options: { namespace: "repo", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Target file path to analyze" }
+      },
+      required: ["path"]
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const report = await analyzeBlastRadius(rootDir, input.path);
+      return { output: report, content: JSON.stringify(report, null, 2) };
+    }
+  });
+}
+
+// src/omni/research.ts
+import * as fs7 from "fs/promises";
+import * as path8 from "path";
 function getResearchLedgerPath(rootDir) {
-  return path5.join(rootDir, ".opencode", "artifacts", "research_sources.json");
+  return path8.join(rootDir, ".opencode", "artifacts", "research_sources.json");
 }
 async function loadResearchSources(rootDir) {
   try {
-    const raw = await fs4.readFile(getResearchLedgerPath(rootDir), "utf8");
+    const raw = await fs7.readFile(getResearchLedgerPath(rootDir), "utf8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -1384,8 +1796,8 @@ async function recordResearchSource(rootDir, input) {
     sources.push(entry);
   }
   const file = getResearchLedgerPath(rootDir);
-  await fs4.mkdir(path5.dirname(file), { recursive: true });
-  await fs4.writeFile(file, JSON.stringify(sources, null, 2), "utf8");
+  await fs7.mkdir(path8.dirname(file), { recursive: true });
+  await fs7.writeFile(file, JSON.stringify(sources, null, 2), "utf8");
   return entry;
 }
 async function auditMarkdownCitations(rootDir, markdownText) {
@@ -1550,21 +1962,46 @@ ${input.prompt?.text ?? input.prompt ?? ""}`,
     });
     editor.add({
       name: "artifacts",
-      description: "Inspect active Antigravity-style workspace artifacts (`task.md`, `plan.md`, `walkthrough.md`) and recorded research sources",
+      description: "Inspect active Antigravity-style workspace artifacts (`task.md`, `plan.md`), checkpoints, episodic memory, and research sources",
       execute: async (input) => {
-        const [files, taskArt, planArt, sources] = await Promise.all([
+        const [files, taskArt, planArt, sources, lessons, checkpoints] = await Promise.all([
           listArtifacts(rootDir),
           readArtifact(rootDir, "task.md"),
           readArtifact(rootDir, "plan.md"),
-          loadResearchSources(rootDir)
+          loadResearchSources(rootDir),
+          loadLessons(rootDir),
+          listCheckpoints(rootDir)
         ]);
         const summary = [
-          "# SwarmOS Omni-Harness Artifacts & Research Ledger",
+          "# SwarmOS Omni-Harness Artifacts, Memory & Checkpoints (v0.5.0)",
           "",
           `**Files in \`.opencode/artifacts/\` (${files.length})**: ${files.length ? files.join(", ") : "_none_"}`,
+          `**Episodic Memory Lessons (${lessons.length})**: ${lessons.length ? lessons.map((l) => `\`${l.id}\``).join(", ") : "_none_"}`,
+          `**Time-Travel Checkpoints (${checkpoints.length})**: ${checkpoints.length ? checkpoints.map((c) => `\`${c.id}\` (${c.label})`).join(", ") : "_none_"}`,
           `**Recorded Research Sources (${sources.length})**: ${sources.length ? sources.map((s) => `[${s.id}](${s.url})`).join(", ") : "_none_"}`,
           ...taskArt.exists ? ["", "### Active Task Checklist (`task.md`)", taskArt.content.trim()] : [],
           ...planArt.exists ? ["", "### Active Implementation Plan (`plan.md`)", planArt.content.trim()] : []
+        ].join(`
+`);
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input.sessionID,
+            text: summary,
+            delivery: "steer"
+          });
+        }
+      }
+    });
+    editor.add({
+      name: "map",
+      description: "Generate a PageRank-weighted Repository Architecture Map showing the highest-centrality files, exported symbols, and dependency edges",
+      execute: async (input) => {
+        const report = await buildRepoMap(rootDir, 20);
+        const rows = report.topFiles.map((n, idx) => `${idx + 1}. **\`${n.path}\`** (score: \`${n.centralityScore}\`, imported by ${n.importedBy.length} file(s)) \u2014 symbols: \`${n.symbols.join(", ") || "none"}\``);
+        const summary = [
+          `# PageRank Repository Map (${report.totalFilesScanned} files scanned)`,
+          "",
+          ...rows.length ? rows : ["_No source files found._"]
         ].join(`
 `);
         if (ctx.session?.prompt) {
@@ -1659,12 +2096,12 @@ async function registerSwarmCommand(ctx, rootDir) {
 
 // src/diagnostics/runner.ts
 import { execFile } from "child_process";
-import * as path6 from "path";
+import * as path9 from "path";
 import { promisify } from "util";
 var execFileAsync = promisify(execFile);
 async function runQuickDiagnostics(rootDir, filePath, options = {}) {
-  const abs = path6.resolve(rootDir, filePath);
-  const ext = path6.extname(abs).toLowerCase();
+  const abs = path9.resolve(rootDir, filePath);
+  const ext = path9.extname(abs).toLowerCase();
   const timeout = options.timeoutMs ?? 6000;
   const maxLines = options.maxLines ?? 30;
   try {
@@ -1829,10 +2266,87 @@ async function registerMuseOverlay(ctx) {
   await ctx.session.hook("generate", upgradePrompt);
 }
 
+// src/omni/circuit-breaker.ts
+var sessionAttempts = new Map;
+function resetCircuitBreaker(sessionID) {
+  if (sessionID)
+    sessionAttempts.delete(sessionID);
+  else
+    sessionAttempts.clear();
+}
+function recordAndEvaluateCircuitBreaker(event) {
+  const sid = event.sessionID ?? "default";
+  const history = sessionAttempts.get(sid) ?? [];
+  const target = typeof event.input?.path === "string" ? event.input.path : typeof event.input?.command === "string" ? event.input.command.slice(0, 80) : "global";
+  const errText = event.status === "error" ? String(event.error?.message ?? event.error ?? "error").slice(0, 120) : typeof event.result?.content === "string" && event.result.content.includes("<diagnostics") ? "diagnostics-error" : "ok";
+  const effectiveStatus = event.status === "error" || errText === "diagnostics-error" ? "error" : "completed";
+  const record = {
+    tool: event.tool,
+    target,
+    status: effectiveStatus,
+    signature: `${event.tool}:${target}:${errText}`,
+    timestamp: Date.now()
+  };
+  history.push(record);
+  if (history.length > 20)
+    history.shift();
+  sessionAttempts.set(sid, history);
+  if (effectiveStatus === "completed")
+    return;
+  const recentSameTarget = history.filter((r) => r.tool === event.tool && r.target === target);
+  const consecutiveErrors = (() => {
+    let count = 0;
+    for (let i = recentSameTarget.length - 1;i >= 0; i--) {
+      if (recentSameTarget[i].status === "error")
+        count++;
+      else
+        break;
+    }
+    return count;
+  })();
+  if ((event.tool === "edit" || event.tool === "patch") && consecutiveErrors >= 2) {
+    return `
+
+<circuit-breaker-intervention severity="high">
+` + `DOOM-LOOP CIRCUIT BREAKER: \`${event.tool}\` has failed or produced syntax errors ${consecutiveErrors} consecutive times on "${target}".
+` + `MANDATORY ACTION: Stop calling \`${event.tool}\` on "${target}". Immediately switch to \`execute\` -> \`tools.fs.hash_read({ path: "${target}" })\` and \`tools.fs.hash_edit\` to apply hash-anchored line replacements cleanly.
+` + `</circuit-breaker-intervention>`;
+  }
+  if (event.tool === "shell" && consecutiveErrors >= 3) {
+    return `
+
+<circuit-breaker-intervention severity="high">
+` + `DOOM-LOOP CIRCUIT BREAKER: Shell command "${target}" has failed ${consecutiveErrors} times in a row.
+` + `MANDATORY ACTION: Stop re-running the failing command blindly. Inspect the upstream caller/types using \`tools.repo.blast_radius\` or \`read\`, and record a root-cause hypothesis in \`tools.artifacts.write({ name: "notes.md", ... })\` before making another edit.
+` + `</circuit-breaker-intervention>`;
+  }
+  return;
+}
+async function registerCircuitBreakerHook(ctx) {
+  if (!ctx.tool?.hook)
+    return;
+  await ctx.tool.hook("execute.after", async (event) => {
+    const intervention = recordAndEvaluateCircuitBreaker(event);
+    if (!intervention)
+      return;
+    if (event.status === "completed" && event.result) {
+      if (Array.isArray(event.result.content)) {
+        event.result.content = [...event.result.content, { type: "text", text: intervention }];
+      } else if (typeof event.result.content === "string") {
+        event.result.content += intervention;
+      }
+    } else if (event.status === "error" && event.error && typeof event.error === "object") {
+      if (typeof event.error.message === "string" && !event.error.message.includes("DOOM-LOOP CIRCUIT BREAKER")) {
+        event.error.message += intervention;
+      }
+    }
+  });
+}
+
 // src/omni/gui-studio.ts
 import { execFile as execFile2 } from "child_process";
-import * as fs5 from "fs/promises";
-import * as path7 from "path";
+import * as fs8 from "fs/promises";
+import * as path10 from "path";
 import { promisify as promisify2 } from "util";
 var execFileAsync2 = promisify2(execFile2);
 var VISUAL_QUALITY_CHECKLIST = {
@@ -1856,9 +2370,9 @@ var VISUAL_QUALITY_CHECKLIST = {
   ]
 };
 async function captureDesktopWindow(rootDir, outputName = "desktop_gui_preview.png") {
-  const previewDir = path7.join(rootDir, ".opencode", "artifacts", "previews");
-  await fs5.mkdir(previewDir, { recursive: true });
-  const outPath = path7.join(previewDir, path7.basename(outputName));
+  const previewDir = path10.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs8.mkdir(previewDir, { recursive: true });
+  const outPath = path10.join(previewDir, path10.basename(outputName));
   const platform = process.platform;
   if (platform === "darwin") {
     await execFileAsync2("screencapture", ["-x", outPath], { cwd: rootDir, timeout: 1e4 });
@@ -1915,8 +2429,8 @@ function registerGuiStudioTools(editor, rootDir) {
 }
 
 // src/omni/hashline.ts
-import * as fs6 from "fs/promises";
-import * as path8 from "path";
+import * as fs9 from "fs/promises";
+import * as path11 from "path";
 function computeLineHash(line) {
   const trimmed = line.trim();
   if (trimmed.length === 0)
@@ -1929,8 +2443,8 @@ function computeLineHash(line) {
   return (hash >>> 0 & 255).toString(16).padStart(2, "0");
 }
 async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
-  const abs = path8.resolve(rootDir, targetPath);
-  const raw = await fs6.readFile(abs, "utf8");
+  const abs = path11.resolve(rootDir, targetPath);
+  const raw = await fs9.readFile(abs, "utf8");
   const lines = raw.replace(/\r\n/g, `
 `).split(`
 `);
@@ -1951,8 +2465,8 @@ async function hashReadFile(rootDir, targetPath, offset = 1, limit = 400) {
   };
 }
 async function hashEditFile(rootDir, targetPath, hunks) {
-  const abs = path8.resolve(rootDir, targetPath);
-  const raw = await fs6.readFile(abs, "utf8");
+  const abs = path11.resolve(rootDir, targetPath);
+  const raw = await fs9.readFile(abs, "utf8");
   const hasCrlf = raw.includes(`\r
 `);
   const lines = raw.replace(/\r\n/g, `
@@ -2007,7 +2521,7 @@ async function hashEditFile(rootDir, targetPath, hunks) {
   const outputText = lines.join(hasCrlf ? `\r
 ` : `
 `);
-  await fs6.writeFile(abs, outputText, "utf8");
+  await fs9.writeFile(abs, outputText, "utf8");
   const diagnostics = await runQuickDiagnostics(rootDir, targetPath);
   return {
     path: targetPath,
@@ -2072,8 +2586,8 @@ function registerHashlineTools(editor, rootDir) {
 
 // src/omni/office.ts
 import { execFile as execFile3 } from "child_process";
-import * as fs7 from "fs/promises";
-import * as path9 from "path";
+import * as fs10 from "fs/promises";
+import * as path12 from "path";
 import { promisify as promisify3 } from "util";
 var execFileAsync3 = promisify3(execFile3);
 var SUPPORTED_OFFICE_EXTENSIONS = new Set([
@@ -2181,8 +2695,8 @@ elif ext in (".sqlite", ".sqlite3", ".db"):
     print(NL.join(out))
 `;
 async function extractOfficeOrDataFile(rootDir, targetPath) {
-  const abs = path9.resolve(rootDir, targetPath);
-  const ext = path9.extname(abs).toLowerCase();
+  const abs = path12.resolve(rootDir, targetPath);
+  const ext = path12.extname(abs).toLowerCase();
   if (!SUPPORTED_OFFICE_EXTENSIONS.has(ext))
     return;
   const { stdout } = await execFileAsync3("python3", ["-c", PYTHON_UNIVERSAL_EXTRACTOR, abs], {
@@ -2192,17 +2706,17 @@ async function extractOfficeOrDataFile(rootDir, targetPath) {
   return stdout.trim();
 }
 async function renderDocumentPreviews(rootDir, targetPath) {
-  const abs = path9.resolve(rootDir, targetPath);
-  const ext = path9.extname(abs).toLowerCase();
-  const previewDir = path9.join(rootDir, ".opencode", "artifacts", "previews");
-  await fs7.mkdir(previewDir, { recursive: true });
+  const abs = path12.resolve(rootDir, targetPath);
+  const ext = path12.extname(abs).toLowerCase();
+  const previewDir = path12.join(rootDir, ".opencode", "artifacts", "previews");
+  await fs10.mkdir(previewDir, { recursive: true });
   let pdfPath = abs;
   if ([".docx", ".pptx", ".xlsx"].includes(ext)) {
     await execFileAsync3("libreoffice", ["--headless", "--nologo", "--nolockcheck", "--norestore", "--convert-to", "pdf", "--outdir", previewDir, abs], { cwd: rootDir, timeout: 30000 });
-    const stem = path9.basename(abs, ext);
-    pdfPath = path9.join(previewDir, `${stem}.pdf`);
+    const stem = path12.basename(abs, ext);
+    pdfPath = path12.join(previewDir, `${stem}.pdf`);
   }
-  const stem = path9.basename(pdfPath, ".pdf");
+  const stem = path12.basename(pdfPath, ".pdf");
   const pyRender = `
 import sys, os, json, pypdfium2 as pdfium
 pdf_path, out_dir, stem = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -2278,7 +2792,7 @@ ${res.previewPngs.join(`
         const origExecute = tool.execute;
         tool.execute = async (input, context) => {
           if (typeof input?.path === "string") {
-            const ext = path9.extname(input.path).toLowerCase();
+            const ext = path12.extname(input.path).toLowerCase();
             if ([".docx", ".xlsx", ".xls", ".pptx", ".sqlite", ".sqlite3", ".db"].includes(ext)) {
               const extracted = await extractOfficeOrDataFile(rootDir, input.path);
               if (extracted !== undefined) {
@@ -2296,9 +2810,79 @@ ${res.previewPngs.join(`
   }
 }
 
+// src/omni/pty-tap.ts
+import * as fs11 from "fs/promises";
+import * as path13 from "path";
+var ERROR_LINE_RE = /\b(?:error|exception|fatal|panic|uncaught|failed|syntaxerror|typeerror|referenceerror|enoent|eaddrinuse)\b/i;
+async function readDevServerLogs(ctx, rootDir, input = {}) {
+  const maxLines = Math.min(Math.max(input.lines ?? 80, 10), 500);
+  let rawText = "";
+  let source = "none";
+  if (input.ptyID && ctx.experimental?.terminal?.read) {
+    try {
+      const res = await ctx.experimental.terminal.read({ id: input.ptyID });
+      rawText = typeof res?.data === "string" ? res.data : JSON.stringify(res?.data ?? res ?? "");
+      source = `pty:${input.ptyID}`;
+    } catch {}
+  }
+  if (!rawText) {
+    const candidateFiles = [
+      ...input.logFile ? [path13.resolve(rootDir, input.logFile)] : [],
+      path13.join(rootDir, ".opencode", "artifacts", "devserver.log"),
+      path13.join(rootDir, "dev.log")
+    ];
+    for (const file of candidateFiles) {
+      try {
+        rawText = await fs11.readFile(file, "utf8");
+        source = path13.relative(rootDir, file).split(path13.sep).join("/");
+        break;
+      } catch {}
+    }
+  }
+  if (!rawText) {
+    return { source: "empty", totalLines: 0, lines: [] };
+  }
+  const allLines = rawText.replace(/\r\n/g, `
+`).split(`
+`);
+  const filtered = input.filterErrorsOnly ? allLines.filter((l) => ERROR_LINE_RE.test(l)) : allLines;
+  const tail = filtered.slice(-maxLines);
+  return {
+    source,
+    totalLines: allLines.length,
+    lines: tail
+  };
+}
+function registerPtyTapTools(editor, ctx, rootDir) {
+  editor.namespace({
+    name: "pty",
+    description: "Live Persistent Terminal & Dev-Server Log Tap (`ctx.experimental.terminal.read` + `.opencode/artifacts/devserver.log`) for catching runtime and HMR crashes."
+  });
+  editor.add({
+    name: "read_logs",
+    description: "Read recent stdout/stderr lines from an active OpenCode persistent PTY session (`ptyID`) or `.opencode/artifacts/devserver.log`, optionally filtering for errors/stack traces.",
+    options: { namespace: "pty", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        ptyID: { type: "string", description: "Optional OpenCode PersistentPty ID" },
+        logFile: { type: "string", description: "Optional log file path (defaults to .opencode/artifacts/devserver.log)" },
+        lines: { type: "number", description: "Number of tail lines to return (default 80)" },
+        filterErrorsOnly: { type: "boolean", description: "If true, only return lines matching error/exception/stack-trace keywords" }
+      }
+    },
+    output: { type: "object" },
+    execute: async (input) => {
+      const res = await readDevServerLogs(ctx, rootDir, input ?? {});
+      return { output: res, content: res.lines.join(`
+`) || `No log lines found (${res.source}).` };
+    }
+  });
+}
+
 // src/skills/ui-craft/skill.ts
-import * as fs8 from "fs/promises";
-import * as path10 from "path";
+import * as fs12 from "fs/promises";
+import * as path14 from "path";
 var UI_CRAFT_SKILL_ID = "ui-craft";
 var UI_CRAFT_SKILL_NAME = "UI Craft & Spatial Architecture";
 var EMBEDDED_UI_CRAFT_SKILL_MD = `---
@@ -2411,9 +2995,9 @@ Before handing off any UI milestone:
    - \`row-baseline-jitter\`: Align sibling card and button top edges to exact pixels.`;
 async function loadSkillContent(fallbackDir) {
   const targetDir = fallbackDir ?? process.cwd();
-  const candidate = path10.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
+  const candidate = path14.resolve(targetDir, "src", "skills", "ui-craft", "SKILL.md");
   try {
-    return await fs8.readFile(candidate, "utf8");
+    return await fs12.readFile(candidate, "utf8");
   } catch {
     return EMBEDDED_UI_CRAFT_SKILL_MD;
   }
@@ -2422,7 +3006,7 @@ async function registerUICraftSkill(ctx, rootDir) {
   if (!ctx.skill?.transform)
     return;
   const content = await loadSkillContent(rootDir);
-  const absoluteSkillPath = path10.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
+  const absoluteSkillPath = path14.resolve(rootDir, ".opencode", "skills", "ui-craft", "SKILL.md");
   await ctx.skill.transform((editor) => {
     editor.add({
       id: UI_CRAFT_SKILL_ID,
@@ -2454,13 +3038,19 @@ async function setup(ctx) {
       registerOfficeTools(editor, rootDir);
       registerResearchTools(editor, rootDir);
       registerGuiStudioTools(editor, rootDir);
+      registerRepoMapTools(editor, rootDir);
+      registerCheckpointTools(editor, rootDir);
+      registerMemoryTools(editor, rootDir);
+      registerPtyTapTools(editor, ctx, rootDir);
     });
   }
   await registerPermissionGuard(ctx, rootDir);
   await registerDiagnosticHook(ctx, rootDir);
+  await registerCircuitBreakerHook(ctx);
   await registerUICraftSkill(ctx, rootDir);
   await registerMuseOverlay(ctx);
   await registerArtifactContextHook(ctx, rootDir);
+  await registerMemoryContextHook(ctx, rootDir);
   await registerShipCommand(ctx);
   await registerSwarmCommand(ctx, rootDir);
   await registerOmniCommands(ctx, rootDir);
@@ -2496,9 +3086,12 @@ export {
   UI_CRAFT_SKILL_ID,
   UI_CRAFT_SKILL_NAME,
   VISUAL_QUALITY_CHECKLIST,
+  analyzeBlastRadius,
   auditMarkdownCitations,
+  buildRepoMap,
   captureDesktopWindow,
   computeLineHash,
+  createCheckpoint,
   createEmptyBoard,
   createTask,
   src_default as default,
@@ -2509,12 +3102,16 @@ export {
   extractOutline,
   getArtifactsDir,
   getBoardPath,
+  getCheckpointsDir,
+  getMemoryFilePath,
   getResearchLedgerPath,
   hashEditFile,
   hashReadFile,
   initProject,
   listArtifacts,
+  listCheckpoints,
   loadBoard,
+  loadLessons,
   loadResearchSources,
   loadSkillContent,
   lockContract,
@@ -2523,18 +3120,29 @@ export {
   planTournament,
   plugin,
   readArtifact,
+  readDevServerLogs,
+  recordAndEvaluateCircuitBreaker,
+  recordLesson,
   recordResearchSource,
   registerArtifactContextHook,
   registerArtifactTools,
+  registerCheckpointTools,
+  registerCircuitBreakerHook,
   registerGuiStudioTools,
   registerHashlineTools,
+  registerMemoryContextHook,
+  registerMemoryTools,
   registerMuseOverlay,
   registerOfficeTools,
   registerOmniCommands,
   registerPermissionGuard,
+  registerPtyTapTools,
+  registerRepoMapTools,
   registerResearchTools,
   renderDocumentPreviews,
+  resetCircuitBreaker,
   resolveTournament,
+  rollbackCheckpoint,
   runQuickDiagnostics,
   saveBoard,
   setup,

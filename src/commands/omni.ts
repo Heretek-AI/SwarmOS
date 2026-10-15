@@ -1,4 +1,7 @@
 import { listArtifacts, readArtifact } from "../omni/artifacts.js"
+import { listCheckpoints } from "../omni/checkpoints.js"
+import { loadLessons } from "../omni/memory.js"
+import { buildRepoMap } from "../omni/repomap.js"
 import { loadResearchSources } from "../omni/research.js"
 
 export async function registerOmniCommands(ctx: any, rootDir: string): Promise<void> {
@@ -65,22 +68,52 @@ export async function registerOmniCommands(ctx: any, rootDir: string): Promise<v
     editor.add({
       name: "artifacts",
       description:
-        "Inspect active Antigravity-style workspace artifacts (`task.md`, `plan.md`, `walkthrough.md`) and recorded research sources",
+        "Inspect active Antigravity-style workspace artifacts (`task.md`, `plan.md`), checkpoints, episodic memory, and research sources",
       execute: async (input: any) => {
-        const [files, taskArt, planArt, sources] = await Promise.all([
+        const [files, taskArt, planArt, sources, lessons, checkpoints] = await Promise.all([
           listArtifacts(rootDir),
           readArtifact(rootDir, "task.md"),
           readArtifact(rootDir, "plan.md"),
           loadResearchSources(rootDir),
+          loadLessons(rootDir),
+          listCheckpoints(rootDir),
         ])
 
         const summary = [
-          "# SwarmOS Omni-Harness Artifacts & Research Ledger",
+          "# SwarmOS Omni-Harness Artifacts, Memory & Checkpoints (v0.5.0)",
           "",
           `**Files in \`.opencode/artifacts/\` (${files.length})**: ${files.length ? files.join(", ") : "_none_"}`,
+          `**Episodic Memory Lessons (${lessons.length})**: ${lessons.length ? lessons.map((l) => `\`${l.id}\``).join(", ") : "_none_"}`,
+          `**Time-Travel Checkpoints (${checkpoints.length})**: ${checkpoints.length ? checkpoints.map((c) => `\`${c.id}\` (${c.label})`).join(", ") : "_none_"}`,
           `**Recorded Research Sources (${sources.length})**: ${sources.length ? sources.map((s) => `[${s.id}](${s.url})`).join(", ") : "_none_"}`,
           ...(taskArt.exists ? ["", "### Active Task Checklist (`task.md`)", taskArt.content.trim()] : []),
           ...(planArt.exists ? ["", "### Active Implementation Plan (`plan.md`)", planArt.content.trim()] : []),
+        ].join("\n")
+
+        if (ctx.session?.prompt) {
+          await ctx.session.prompt({
+            sessionID: input.sessionID,
+            text: summary,
+            delivery: "steer",
+          })
+        }
+      },
+    })
+
+    editor.add({
+      name: "map",
+      description:
+        "Generate a PageRank-weighted Repository Architecture Map showing the highest-centrality files, exported symbols, and dependency edges",
+      execute: async (input: any) => {
+        const report = await buildRepoMap(rootDir, 20)
+        const rows = report.topFiles.map(
+          (n, idx) =>
+            `${idx + 1}. **\`${n.path}\`** (score: \`${n.centralityScore}\`, imported by ${n.importedBy.length} file(s)) — symbols: \`${n.symbols.join(", ") || "none"}\``,
+        )
+        const summary = [
+          `# PageRank Repository Map (${report.totalFilesScanned} files scanned)`,
+          "",
+          ...(rows.length ? rows : ["_No source files found._"]),
         ].join("\n")
 
         if (ctx.session?.prompt) {
