@@ -90,6 +90,19 @@ import {
   type TelemetrySummary,
 } from "./host/telemetry.js"
 import { SWARMOS_VERSION } from "./version.js"
+import {
+  ROLE_NAMESPACES,
+  buildContextBlocks,
+  estimateTokens,
+  getContextBudgetReport,
+  packBlocks,
+  registerContextBudgetHook,
+  scoreLesson,
+  withPinningProfile,
+  type ContextBlock,
+  type ContextBudgetReport,
+} from "./omni/context-budget.js"
+import { buildRepoGraph, parseSourceFacts, stripCommentsAndStrings, type ImportEdge, type RepoGraph, type RepoLanguage } from "./omni/repomap.js"
 import { analyzeShell, isReadOnly, parseShell, type CommandAnalysis, type ShellAnalysis, type ShellEffect } from "./agents/shell-parse.js"
 import {
   beginTransaction,
@@ -174,12 +187,25 @@ import {
   type HashReadResult,
 } from "./omni/hashline.js"
 import {
+  acceptProposal,
+  evaluateNeedsReview,
+  forgetLesson,
   getMemoryFilePath,
+  getProposalsFilePath,
+  lessonMatchesFile,
   loadLessons,
+  loadProposals,
+  proposeLesson,
   recordLesson,
+  recordLessonOutcome,
   registerMemoryContextHook,
   registerMemoryTools,
+  registerMemoryUpkeepHooks,
+  rejectProposal,
+  saveLessons,
   type EpisodicLesson,
+  type LessonProposal,
+  type LessonStats,
 } from "./omni/memory.js"
 import {
   extractOfficeOrDataFile,
@@ -394,6 +420,30 @@ export {
   createTaintEvaluator,
   registerTaintHooks,
   registerUntaintCommand,
+
+  // v0.8.0: context budget, memory upkeep, multi-language RepoMap & pinning profile
+  ROLE_NAMESPACES,
+  buildContextBlocks,
+  estimateTokens,
+  getContextBudgetReport,
+  packBlocks,
+  registerContextBudgetHook,
+  scoreLesson,
+  withPinningProfile,
+  buildRepoGraph,
+  parseSourceFacts,
+  stripCommentsAndStrings,
+  acceptProposal,
+  evaluateNeedsReview,
+  forgetLesson,
+  getProposalsFilePath,
+  lessonMatchesFile,
+  loadProposals,
+  proposeLesson,
+  recordLessonOutcome,
+  registerMemoryUpkeepHooks,
+  rejectProposal,
+  saveLessons,
 }
 
 export type {
@@ -413,6 +463,13 @@ export type {
   VerifyKind,
   VerifyRun,
   VerifyRunInput,
+  ContextBlock,
+  ContextBudgetReport,
+  ImportEdge,
+  RepoGraph,
+  RepoLanguage,
+  LessonProposal,
+  LessonStats,
   BoardPolicy,
   CommandAnalysis,
   ShellAnalysis,
@@ -487,7 +544,8 @@ export function buildSetupModules(rootDir: string, config: SwarmOSConfig): Setup
       id: "codemode-tools",
       requires: ["tool.transform"],
       run: (c) =>
-        c.tool.transform((editor: any) => {
+        c.tool.transform((rawEditor: any) => {
+          const editor = withPinningProfile(rawEditor, config.pinnedNamespaces)
           registerOrgTools(editor, rootDir)
           registerUITools(editor)
           registerFSTools(editor, rootDir)
@@ -525,10 +583,15 @@ export function buildSetupModules(rootDir: string, config: SwarmOSConfig): Setup
       : []),
     { id: "diagnostics", requires: ["tool.hook"], run: (c) => registerDiagnosticHook(c, rootDir) },
     { id: "circuit-breaker", requires: ["tool.hook"], run: (c) => registerCircuitBreakerHook(c) },
+    // Runs after the circuit breaker so it sees interventions and can draft lesson proposals.
+    { id: "memory-upkeep", requires: ["tool.hook"], run: (c) => registerMemoryUpkeepHooks(c, rootDir) },
     { id: "ui-craft-skill", requires: ["skill.transform"], run: (c) => registerUICraftSkill(c, rootDir) },
     { id: "muse-overlay", requires: ["session.hook"], run: (c) => registerMuseOverlay(c) },
-    { id: "artifact-context", requires: ["session.hook"], run: (c) => registerArtifactContextHook(c, rootDir) },
-    { id: "memory-context", requires: ["session.hook"], run: (c) => registerMemoryContextHook(c, rootDir) },
+    {
+      id: "context-budget",
+      requires: ["session.hook"],
+      run: (c) => registerContextBudgetHook(c, rootDir, config.contextBudgetTokens),
+    },
     {
       id: "commands",
       requires: ["command.transform"],

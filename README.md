@@ -210,6 +210,14 @@ SwarmOS v0.6.0 makes it possible to check that SwarmOS is actually running and a
 - **Untrusted-content tracking**: after a session reads `webfetch`, `websearch`, browser, or third-party MCP output (including Code Mode scripts that call them), saved approvals no longer cover risky actions. Network commands, writes outside the project, edits to `.opencode/`, `.git/`, CI workflows, `package.json`, `.env` or shell profiles, and inline or downloaded code need approval again until the user runs `/untaint`.
 - `/doctor` now also shows how many times the host invoked each hook, so a hook stuck at 0 after real use (for example `tool.execute.before`) shows the host doesn't fire it.
 
+### Context Efficiency (v0.8.0+): budgeted context, self-maintaining memory, multi-language RepoMap & tool profiles
+
+- **One context budget**: a single injector replaces the separate artifact and memory hooks. Each turn it collects candidate blocks (an untrusted-content notice when relevant, a short per-role toolbox hint, `task.md`, `plan.md`, and lessons), ranks them, and packs them into `contextBudgetTokens` (default 6000). One artifact may take at most 40% of the budget and is truncated beyond that, so it can't crowd out lessons. `/doctor` shows how much of the budget each session used and what was dropped.
+- **Relevant lessons, not all lessons**: lessons are scored by `scopePaths` matches against the files this session has read or edited, by keyword overlap with those paths and the agent's role, by their track record, and by age (half-life of 90 days since last use). Lessons flagged `needsReview` are never injected.
+- **Memory that maintains itself**: when the circuit breaker fires and a later call on the same file or command succeeds, SwarmOS saves a lesson proposal with the evidence (`tools.memory.proposals`). Proposals are never injected until a human or agent accepts them, ideally with the real root cause written in (`tools.memory.accept_proposal` / `reject_proposal`). Injected lessons gain a success when `tools.verify.run` passes in that session and a failure when it fails or the breaker fires on a file in their scope. Two or more failures that outnumber the successes set `needsReview`; `tools.memory.forget` deletes a lesson.
+- **Multi-language RepoMap**: the repo map now parses TypeScript/JavaScript, Python, Go (module path from `go.mod`, used `pkg.Symbol` selectors) and Rust (`mod`, `use crate::`/`super::`/`self::`) after stripping comments and strings, so commented-out imports no longer count. Parsing is lexer-based, not tree-sitter, so the drop-in bundle stays a single file with no WASM grammars. Edges record which symbols each importer takes, so `tools.repo.blast_radius({ path, symbol })` lists only the files that use that symbol, following re-exports and renames. PageRank now iterates to convergence, and parsed files are cached by mtime.
+- **Smaller always-on tool list**: only `pinnedNamespaces` (default `org`, `fs`, `repo`, `verify`, `artifacts`) stay pinned in Code Mode; other namespaces stay registered and discoverable via search, and each role gets a one-line hint naming the namespaces it is most likely to need.
+
 #### Configuration (`.opencode/swarmos.json`)
 
 ```jsonc
@@ -218,6 +226,8 @@ SwarmOS v0.6.0 makes it possible to check that SwarmOS is actually running and a
   "telemetry": true,              // env: SWARMOS_TELEMETRY
   "autoTransactions": true,       // env: SWARMOS_AUTO_TRANSACTIONS
   "taintTracking": true,          // env: SWARMOS_TAINT_TRACKING
+  "contextBudgetTokens": 6000,    // env: SWARMOS_CONTEXT_BUDGET
+  "pinnedNamespaces": ["org", "fs", "repo", "verify", "artifacts"], // env: SWARMOS_PINNED=org,fs
   "verifier": { "typecheck": "bun run typecheck", "test": "bun test" }
 }
 ```

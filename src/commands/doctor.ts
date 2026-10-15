@@ -1,19 +1,26 @@
 import { listSessionStates } from "../host/session-state.js"
 import { formatDoctorReport, getSetupReport } from "../host/setup-report.js"
+import { getContextBudgetReport } from "../omni/context-budget.js"
 import { transactionStats } from "../omni/transactions.js"
+
+function contextCell(sessionID: string): string {
+  const r = getContextBudgetReport(sessionID)
+  if (!r) return "-"
+  return `${r.usedTokens}/${r.budgetTokens} tok${r.dropped.length ? `, dropped ${r.dropped.length}` : ""}`
+}
 
 function sessionLines(): string[] {
   const states = listSessionStates()
   if (states.length === 0) return []
   return [
     "## Live sessions",
-    "| Session | Agent | Turns | Tool calls | Failures | Breaker fires | Untrusted content | Task |",
-    "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    "| Session | Agent | Turns | Tool calls | Failures | Breaker fires | Untrusted content | Task | Context used |",
+    "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ...states.map(
       (s) =>
         `| \`${s.sessionID}\` | ${s.agent ?? "-"} | ${s.turns} | ${s.toolCalls} | ${s.toolFailures} | ${s.breakerFires} | ${
           s.taint.length ? s.taint.map((t) => `${t.tool}`).join(", ") : "none"
-        } | ${s.taskId ?? "-"} |`,
+        } | ${s.taskId ?? "-"} | ${contextCell(s.sessionID)} |`,
     ),
   ]
 }
