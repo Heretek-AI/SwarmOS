@@ -218,6 +218,27 @@ SwarmOS v0.6.0 makes it possible to check that SwarmOS is actually running and a
 - **Multi-language RepoMap**: the repo map now parses TypeScript/JavaScript, Python, Go (module path from `go.mod`, used `pkg.Symbol` selectors) and Rust (`mod`, `use crate::`/`super::`/`self::`) after stripping comments and strings, so commented-out imports no longer count. Parsing is lexer-based, not tree-sitter, so the drop-in bundle stays a single file with no WASM grammars. Edges record which symbols each importer takes, so `tools.repo.blast_radius({ path, symbol })` lists only the files that use that symbol, following re-exports and renames. PageRank now iterates to convergence, and parsed files are cached by mtime.
 - **Smaller always-on tool list**: only `pinnedNamespaces` (default `org`, `fs`, `repo`, `verify`, `artifacts`) stay pinned in Code Mode; other namespaces stay registered and discoverable via search, and each role gets a one-line hint naming the namespaces it is most likely to need.
 
+### Unified Heretek Platform (v1.0.0): 7 Repositories Consolidated into 1 Omni-Harness
+
+`SwarmOS v1.0.0` consolidates the entire Heretek-AI OpenCode ecosystem (`SwarmOS`, `The-Agency`, `claude-4-opencode`, `IUMBTEMS`, `opencode-rea`, `godot-opencode`, and `GDevelop-Unlocked`) into a single zero-fork architecture:
+
+1. **Pillar 1 — IUMBTEMS Epistemic & Dialectic Engine (`tools.epistemic.*`, `/grill`)**:
+   - SHA-256 content-addressed source cache (`.opencode/epistemic/sources/<shortHash>.md`) with SPDX license contamination classification (`permissive`, `weak-copyleft`, `copyleft-contaminating`, `unknown`).
+   - Deterministic quote verifier (`tools.epistemic.verify_claims`) that parses `[VERIFIED: <shortHash> | "exact verbatim quote"]` tags and confirms every quote exists verbatim in the cached source.
+   - Socratic stress-tester (`tools.epistemic.grill_spec` & `/grill`) that challenges architecture specs before locking contracts.
+2. **Pillar 2 — `claude-4-opencode` Zero-Config Compatibility Bridge (`tools.claude.*`)**:
+   - Automatically discovers `.claude/commands/*.md`, `.claude/agents/*.md`, and `.claude/skills/*/SKILL.md` in the workspace or `~/.claude` and registers them as native OpenCode V2 slash commands, subagents, and skills.
+3. **Pillar 3 — Quantitative 100-Point Visual Quality & UI/UX Judge (`tools.ui.score_ux`, `tools.ui.get_ux_scorecard_script`)**:
+   - Deterministic 6-axis UI/UX scorecard across **Spatial & Viewport Integrity (25 pts)**, **Alignment & Grid Harmony (20 pts)**, **Typography & WCAG Contrast (20 pts)**, **Interactive & Accessibility Completeness (15 pts)**, **Design Token Discipline (10 pts)**, and **Runtime Health (10 pts)**.
+   - Produces a `0..100` score, letter grade (`S`/`A`/`B`/`C`/`F`), and exact remediation checklist saved to `.opencode/artifacts/ux-scorecard.json` (passing requires `score >= 85` and `0` horizontal overflow).
+4. **Pillar 4 — On-Demand Domain Packs (`tools.packs.*`, `/pack`)**:
+   - Zero-overhead domain packs that stay dormant on standard software repos and auto-activate when domain markers are detected:
+     - **Godot 4.x Pack (`godot-opencode`)**: `tools.packs.godot_inspect_scene` parses `.tscn`/`.tres` scene trees, node hierarchies, attached `.gd` scripts, and signal connections; registers `specialist-godot`.
+     - **GDevelop 5 Pack (`GDevelop-Unlocked`)**: `tools.packs.gdevelop_inspect_game` and `tools.packs.gdevelop_unlock_ai_config` inspect `game.json` layouts/events and generate local custom AI endpoint configuration; registers `specialist-gdevelop`.
+     - **Reverse Engineering Pack (`opencode-rea`)**: `tools.packs.re_inspect_binary` performs safe static triage on ELF/PE/Mach-O/WASM binaries (magic header, SHA-256, byte entropy, suspicious URLs/paths/crypto constants); registers `specialist-re`.
+5. **Pillar 5 — `The-Agency` Live Swarm Command Center WebUI (`tools.org.render_dashboard`, `/dashboard`)**:
+   - Generates a self-contained High-Craft Technical Dark HTML5 dashboard (`.opencode/artifacts/swarm-dashboard.html`) displaying the 5-Gate Kanban Board, Locked Contracts, Worktree Tournaments, 100-Point UI/UX Scorecards, Epistemic Cache, and Active Domain Packs.
+
 ### Complete Roadmap Edition (v0.9.0+): Task Spend Budgets, Session Replay -> Benchmarks, Warm Parallel LSP & Pinned Host Fixture
 
 - **Per-Task Spend & Step Budgets (`tools.org.claim_task`, `tools.org.set_task_budget`)**: Tasks on `.opencode/org/board.json` now accept `budget: { maxTokens?, maxTurns?, maxToolCalls? }`. When a subagent claims a task via `tools.org.claim_task`, SwarmOS accumulates token, turn, and tool-call usage on `task.usage`. If a subagent exceeds any budget ceiling, `createTaskBudgetEvaluator` locks further file mutations, shell commands, and subagent spawns, appends a `<task-budget-exceeded>` notice, and returns control to `manager` to either raise the budget (`tools.org.set_task_budget`) or re-scope the task.

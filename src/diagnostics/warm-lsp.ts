@@ -144,7 +144,7 @@ async function walkWorkspaceFiles(dir: string, rootDir: string, acc: string[] = 
   }
   for (const e of entries) {
     if (acc.length >= max) break
-    if (e.name.startsWith(".") || ["node_modules", "dist", "build", ".opencode", ".worktrees", "target"].includes(e.name)) continue
+    if (e.name.startsWith(".") || ["node_modules", "dist", "build", ".opencode", ".worktrees", "target", "bench"].includes(e.name)) continue
     const full = path.join(dir, e.name)
     if (e.isDirectory()) await walkWorkspaceFiles(full, rootDir, acc, max)
     else if (e.isFile() && /\.(?:[cm]?[jt]sx?|py|go|rs)$/.test(e.name)) {

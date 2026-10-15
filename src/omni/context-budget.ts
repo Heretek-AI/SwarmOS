@@ -27,15 +27,15 @@ export interface ContextBudgetReport {
 
 /** Code Mode namespaces each role is most likely to need. */
 export const ROLE_NAMESPACES: Record<string, string[]> = {
-  director: ["org", "repo", "memory", "artifacts", "swarmos"],
-  architect: ["org", "repo", "fs", "checkpoints"],
+  director: ["org", "repo", "memory", "artifacts", "epistemic", "claude", "packs", "swarmos"],
+  architect: ["org", "repo", "fs", "epistemic", "checkpoints"],
   manager: ["org", "repo", "verify", "artifacts", "replay"],
   "staff-backend": ["fs", "repo", "lsp", "verify", "checkpoints", "memory", "artifacts"],
   "staff-ui": ["fs", "ui", "verify", "checkpoints", "artifacts", "gui"],
   "qa-adversary": ["verify", "org", "repo", "ui", "fs"],
   "release-ops": ["verify", "org", "repo"],
   "studio-gui": ["gui", "ui", "fs", "artifacts", "verify"],
-  researcher: ["research", "artifacts", "office"],
+  researcher: ["research", "epistemic", "artifacts", "office"],
   "office-analyst": ["office", "artifacts", "fs"],
 }
 const DEFAULT_ROLE_NAMESPACES = ["fs", "repo", "verify", "checkpoints", "artifacts", "memory"]
