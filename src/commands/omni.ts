@@ -1,3 +1,4 @@
+import { SWARMOS_VERSION } from "../version.js"
 import { listArtifacts, readArtifact } from "../omni/artifacts.js"
 import { listCheckpoints } from "../omni/checkpoints.js"
 import { loadLessons } from "../omni/memory.js"
@@ -80,7 +81,7 @@ export async function registerOmniCommands(ctx: any, rootDir: string): Promise<v
         ])
 
         const summary = [
-          "# SwarmOS Omni-Harness Artifacts, Memory & Checkpoints (v0.5.0)",
+          `# SwarmOS Omni-Harness Artifacts, Memory & Checkpoints (v${SWARMOS_VERSION})`,
           "",
           `**Files in \`.opencode/artifacts/\` (${files.length})**: ${files.length ? files.join(", ") : "_none_"}`,
           `**Episodic Memory Lessons (${lessons.length})**: ${lessons.length ? lessons.map((l) => `\`${l.id}\``).join(", ") : "_none_"}`,

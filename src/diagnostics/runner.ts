@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process"
 import * as path from "node:path"
 import { promisify } from "node:util"
+import { runParallelDiagnostics } from "./warm-lsp.js"
 
 const execFileAsync = promisify(execFile)
 
@@ -114,8 +115,8 @@ export async function registerDiagnosticHook(ctx: any, rootDir: string): Promise
     const targetPaths = extractMutatedPaths(event)
     if (targetPaths.length === 0) return
 
-    const results = await Promise.all(targetPaths.map((p) => runQuickDiagnostics(rootDir, p)))
-    const diag = results.filter(Boolean).join("")
+    const results = await runParallelDiagnostics(rootDir, targetPaths, (r, p) => runQuickDiagnostics(r, p))
+    const diag = results.join("")
     if (!diag) return
 
     if (Array.isArray(event.result?.content)) {

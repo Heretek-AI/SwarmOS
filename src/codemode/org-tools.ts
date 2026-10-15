@@ -1,23 +1,28 @@
 import {
+  claimTask,
   createTask,
   initProject,
   loadBoard,
   lockContract,
   planTournament,
   resolveTournament,
+  setTaskBudget,
   submitQAReceipt,
   updateTaskStatus,
   verifyReleaseReady,
 } from "../board/board.js"
 import type {
+  ClaimTaskInput,
   CreateTaskInput,
   InitProjectInput,
   LockContractInput,
   PlanTournamentInput,
   ResolveTournamentInput,
+  SetTaskBudgetInput,
   SubmitQAReceiptInput,
   TaskStatus,
 } from "../board/types.js"
+import { scoreTournament } from "../board/worktrees.js"
 
 export function registerOrgTools(editor: any, rootDir: string): void {
   editor.namespace({
@@ -96,6 +101,15 @@ export function registerOrgTools(editor: any, rootDir: string): void {
         owner: { type: "string", description: "Responsible role: 'staff-backend' | 'staff-ui' | 'architect'" },
         ownedPaths: { type: "array", items: { type: "string" }, description: "Disjoint file paths owned by this task" },
         worktree: { type: "string", description: "Optional isolated Git worktree path" },
+        budget: {
+          type: "object",
+          description: "Optional spend/step budget ceiling for this task",
+          properties: {
+            maxTokens: { type: "number" },
+            maxTurns: { type: "number" },
+            maxToolCalls: { type: "number" },
+          },
+        },
       },
       required: ["id", "title", "owner", "ownedPaths"],
     },
@@ -103,6 +117,58 @@ export function registerOrgTools(editor: any, rootDir: string): void {
     execute: async (input: CreateTaskInput) => {
       const task = await createTask(rootDir, input)
       return { output: task, content: `Registered task [${task.id}] assigned to ${task.owner}` }
+    },
+  })
+
+
+  editor.add({
+    name: "claim_task",
+    description:
+      "Bind the current subagent session to a board task (`taskId`) and transition it to `in_progress` so per-task spend limits and `/doctor` track it.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task ID being claimed by this session" },
+        sessionID: { type: "string", description: "Optional session ID (defaults to active session)" },
+      },
+      required: ["taskId"],
+    },
+    output: { type: "object" },
+    execute: async (input: ClaimTaskInput, context?: any) => {
+      const task = await claimTask(rootDir, {
+        taskId: input.taskId,
+        sessionID: input.sessionID ?? context?.sessionID,
+      })
+      return { output: task, content: `Claimed task [${task.id}] for session ${task.claimedBySessionID}` }
+    },
+  })
+
+  editor.add({
+    name: "set_task_budget",
+    description:
+      "Set or raise the spend/step budget (`maxTokens`, `maxTurns`, `maxToolCalls`) for a board task, optionally resetting accumulated usage counters.",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task ID to configure" },
+        budget: {
+          type: "object",
+          properties: {
+            maxTokens: { type: "number" },
+            maxTurns: { type: "number" },
+            maxToolCalls: { type: "number" },
+          },
+        },
+        resetUsage: { type: "boolean", description: "Reset accumulated usage counters to 0" },
+      },
+      required: ["taskId", "budget"],
+    },
+    output: { type: "object" },
+    execute: async (input: SetTaskBudgetInput) => {
+      const task = await setTaskBudget(rootDir, input)
+      return { output: task, content: `Updated budget for task [${task.id}]: ${JSON.stringify(task.budget)}` }
     },
   })
 
@@ -132,7 +198,8 @@ export function registerOrgTools(editor: any, rootDir: string): void {
 
   editor.add({
     name: "submit_qa_receipt",
-    description: "Record an adversarial QA PASS or REJECT receipt for a task. Only tasks with a PASS receipt can be released.",
+    description:
+      "Record an adversarial QA PASS or REJECT receipt for a task. PASS must cite a passing `tools.verify.run` (verifyRunId) taken on the task's current code. Only tasks with a PASS receipt can be released.",
     options: { namespace: "org", codemode: true, pinned: true },
     input: {
       type: "object",
@@ -142,6 +209,10 @@ export function registerOrgTools(editor: any, rootDir: string): void {
         summary: { type: "string", description: "Executive summary of verification findings" },
         defects: { type: "array", items: { type: "string" }, description: "List of defects or regressions found (must be empty for PASS)" },
         testCommand: { type: "string", description: "Exact command executed to verify" },
+        verifyRunId: {
+          type: "string",
+          description: "ID of a passing `tools.verify.run` taken on the task's current tree (required for PASS when the board policy demands it)",
+        },
       },
       required: ["taskId", "verdict", "summary", "defects"],
     },
@@ -155,7 +226,7 @@ export function registerOrgTools(editor: any, rootDir: string): void {
   editor.add({
     name: "plan_tournament",
     description:
-      "Provision a Best-of-N Worktree Tournament that creates competing candidate tasks (e.g. candidate-a, candidate-b) with isolated Git worktree paths.",
+      "Provision a Best-of-N Worktree Tournament: competing candidate tasks (candidate-a, candidate-b, ...) each get a real git worktree at .worktrees/<taskId> on branch swarmos/<taskId>. Candidates must edit only inside their worktree.",
     options: { namespace: "org", codemode: true, pinned: true },
     input: {
       type: "object",
@@ -173,7 +244,37 @@ export function registerOrgTools(editor: any, rootDir: string): void {
       const tournament = await planTournament(rootDir, input)
       return {
         output: tournament,
-        content: `Planned Best-of-${tournament.candidates.length} tournament [${tournament.id}] (${tournament.candidates.map((c) => c.taskId).join(", ")})`,
+        content: `Planned Best-of-${tournament.candidates.length} tournament [${tournament.id}]:\n${tournament.candidates
+          .map((c) => `- ${c.taskId}: ${c.provisioned ? `worktree ${c.worktree} on ${c.branch}` : `NOT provisioned (${c.provisionNote ?? "unknown"})`}`)
+          .join("\n")}`,
+      }
+    },
+  })
+
+  editor.add({
+    name: "score_tournament",
+    description:
+      "Run a full tools.verify.run inside every candidate worktree and rank candidates (passing first, then fewest failures, then smallest diff).",
+    options: { namespace: "org", codemode: true, pinned: true },
+    input: {
+      type: "object",
+      properties: { tournamentId: { type: "string", description: "Tournament ID to score" } },
+      required: ["tournamentId"],
+    },
+    output: { type: "object" },
+    execute: async (input: { tournamentId: string }) => {
+      const board = await loadBoard(rootDir)
+      const tournament = (board.tournaments ?? []).find((t) => t.id === input.tournamentId)
+      if (!tournament) throw new Error(`SwarmOS Tournament not found: ${input.tournamentId}`)
+      const scores = await scoreTournament(rootDir, tournament)
+      return {
+        output: { scores },
+        content: scores
+          .map(
+            (sc, i) =>
+              `${i + 1}. ${sc.taskId}: ${sc.provisioned ? (sc.passed ? "PASS" : "FAIL") : "no worktree"}${sc.verifyRunId ? ` [${sc.verifyRunId}]` : ""} — ${sc.failedChecks} failed check(s), ${sc.failedTests} failed test(s), +${sc.diff.insertions}/-${sc.diff.deletions} in ${sc.diff.files} file(s)`,
+          )
+          .join("\n"),
       }
     },
   })
@@ -181,7 +282,7 @@ export function registerOrgTools(editor: any, rootDir: string): void {
   editor.add({
     name: "resolve_tournament",
     description:
-      "Resolve a Best-of-N Worktree Tournament by selecting a QA-verified winning candidate task and marking competing candidate tasks as superseded.",
+      "Resolve a Best-of-N Worktree Tournament: the QA-verified winner's branch is merged into the main tree (--no-ff), all candidate worktrees and branches are removed, and competing tasks are marked superseded.",
     options: { namespace: "org", codemode: true, pinned: true },
     input: {
       type: "object",
@@ -189,6 +290,10 @@ export function registerOrgTools(editor: any, rootDir: string): void {
         tournamentId: { type: "string", description: "Tournament ID to resolve" },
         winningTaskId: { type: "string", description: "Winning candidate task ID (must have a PASS QA receipt)" },
         summary: { type: "string", description: "Rationale for selecting the winning implementation" },
+        merge: {
+          type: "boolean",
+          description: "Merge the winner's branch into the main tree and remove all candidate worktrees (default true when worktrees exist)",
+        },
       },
       required: ["tournamentId", "winningTaskId", "summary"],
     },
@@ -197,7 +302,7 @@ export function registerOrgTools(editor: any, rootDir: string): void {
       const tournament = await resolveTournament(rootDir, input)
       return {
         output: tournament,
-        content: `Resolved tournament [${tournament.id}] -> winner: ${tournament.winningTaskId}`,
+        content: `Resolved tournament [${tournament.id}] -> winner: ${tournament.winningTaskId}${tournament.mergeCommit ? ` (merged as ${tournament.mergeCommit.slice(0, 10)})` : ""}`,
       }
     },
   })
